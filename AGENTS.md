@@ -10,7 +10,7 @@ Guidance for AI coding agents working in this repository. Human contributors sho
 - API group `extensions.agents.x-k8s.io/v1alpha1`: `SandboxClaim`, `SandboxTemplate`, `SandboxWarmPool` (opt-in extensions).
 - Go module: `sigs.k8s.io/agent-sandbox` (Go 1.26.x, see [go.mod](go.mod)).
 
-## Repository layout
+## Repository layout 
 
 | Path | What lives there |
 | --- | --- |
