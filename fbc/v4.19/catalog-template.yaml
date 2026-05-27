@@ -1,0 +1,17 @@
+---
+entries:
+  - defaultChannel: preview-0.9
+    icon:
+      base64data: ""
+      mediatype: image/png
+    name: agent-sandbox-operator
+    schema: olm.package
+  - entries:
+      - name: agent-sandbox-operator.v0.9.0
+        skipRange: <0.9.0
+    name: preview-0.9
+    package: agent-sandbox-operator
+    schema: olm.channel
+  - image: quay.io/redhat-user-workloads/ose-osc-tenant/agent-sandbox-bundle@sha256:83e4ad73b3562760485ce2d4ea9deb0ba9dcb9c9af2f3900003597090251f51c
+    schema: olm.bundle
+schema: olm.template.basic
