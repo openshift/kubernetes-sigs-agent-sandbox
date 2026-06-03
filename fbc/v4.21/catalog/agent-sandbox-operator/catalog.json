@@ -22,7 +22,7 @@
     "schema": "olm.bundle",
     "name": "agent-sandbox-operator.v0.0.1",
     "package": "agent-sandbox-operator",
-    "image": "registry.redhat.io/agent-sandbox/agent-sandbox-bundle@sha256:83e4ad73b3562760485ce2d4ea9deb0ba9dcb9c9af2f3900003597090251f51c",
+    "image": "registry.redhat.io/agent-sandbox/agent-sandbox-bundle@sha256:f59651c355aad77767b7ea8b510b3dba2708886581b120f1143e66f7d5a9f4e9",
     "properties": [
         {
             "type": "olm.gvk",
@@ -146,11 +146,11 @@
     "relatedImages": [
         {
             "name": "",
-            "image": "registry.redhat.io/agent-sandbox/agent-sandbox-bundle@sha256:83e4ad73b3562760485ce2d4ea9deb0ba9dcb9c9af2f3900003597090251f51c"
+            "image": "registry.redhat.io/agent-sandbox/agent-sandbox-bundle@sha256:f59651c355aad77767b7ea8b510b3dba2708886581b120f1143e66f7d5a9f4e9"
         },
         {
             "name": "",
-            "image": "quay.io/redhat-user-workloads/ose-osc-tenant/agent-sandbox-operator@sha256:95c1ef44d6016b91ae6cc86bd6af1775dc15b3a66ddec652895f50821597530a"
+            "image": "registry.redhat.io/agent-sandbox/agent-sandbox-rhel9-operator@sha256:95c1ef44d6016b91ae6cc86bd6af1775dc15b3a66ddec652895f50821597530a"
         }
     ]
 }
