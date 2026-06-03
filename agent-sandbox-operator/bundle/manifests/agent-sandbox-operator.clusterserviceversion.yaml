@@ -198,7 +198,7 @@ spec:
               - args:
                 - --leader-elect=true
                 - --extensions
-                image: quay.io/redhat-user-workloads/ose-osc-tenant/agent-sandbox-operator@sha256:95c1ef44d6016b91ae6cc86bd6af1775dc15b3a66ddec652895f50821597530a
+                image: registry.redhat.io/agent-sandbox/agent-sandbox-rhel9-operator@sha256:95c1ef44d6016b91ae6cc86bd6af1775dc15b3a66ddec652895f50821597530a
                 name: agent-sandbox-controller
                 ports:
                 - containerPort: 8080
