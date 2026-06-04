@@ -1,0 +1,25 @@
+apiVersion: config.openshift.io/v1
+kind: ImageTagMirrorSet
+metadata:
+  name: agent-sandbox-registry
+spec:
+  imageTagMirrors:
+    - mirrors:
+        - quay.io/redhat-user-workloads/ose-osc-tenant/agent-sandbox-operator
+      source: registry.redhat.io/agent-sandbox/agent-sandbox-rhel9-operator
+    - mirrors:
+        - quay.io/redhat-user-workloads/ose-osc-tenant/agent-sandbox-bundle
+      source: registry.redhat.io/agent-sandbox/agent-sandbox-operator-bundle
+---
+apiVersion: config.openshift.io/v1
+kind: ImageDigestMirrorSet
+metadata:
+  name: agent-sandbox-registry
+spec:
+  imageDigestMirrors:
+    - mirrors:
+        - quay.io/redhat-user-workloads/ose-osc-tenant/agent-sandbox-operator
+      source: registry.redhat.io/agent-sandbox/agent-sandbox-rhel9-operator
+    - mirrors:
+        - quay.io/redhat-user-workloads/ose-osc-tenant/agent-sandbox-bundle
+      source: registry.redhat.io/agent-sandbox/agent-sandbox-operator-bundle
