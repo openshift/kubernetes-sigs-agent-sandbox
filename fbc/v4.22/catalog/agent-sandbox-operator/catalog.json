@@ -22,7 +22,7 @@
     "schema": "olm.bundle",
     "name": "agent-sandbox-operator.v0.0.1",
     "package": "agent-sandbox-operator",
-    "image": "registry.redhat.io/agent-sandbox/agent-sandbox-bundle@sha256:f59651c355aad77767b7ea8b510b3dba2708886581b120f1143e66f7d5a9f4e9",
+    "image": "registry.redhat.io/agent-sandbox/agent-sandbox-operator-bundle@sha256:f59651c355aad77767b7ea8b510b3dba2708886581b120f1143e66f7d5a9f4e9",
     "properties": [
         {
             "type": "olm.gvk",
@@ -146,7 +146,7 @@
     "relatedImages": [
         {
             "name": "",
-            "image": "registry.redhat.io/agent-sandbox/agent-sandbox-bundle@sha256:f59651c355aad77767b7ea8b510b3dba2708886581b120f1143e66f7d5a9f4e9"
+            "image": "registry.redhat.io/agent-sandbox/agent-sandbox-operator-bundle@sha256:f59651c355aad77767b7ea8b510b3dba2708886581b120f1143e66f7d5a9f4e9"
         },
         {
             "name": "",
