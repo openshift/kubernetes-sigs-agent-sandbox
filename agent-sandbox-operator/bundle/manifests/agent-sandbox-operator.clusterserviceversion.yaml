@@ -16,7 +16,7 @@ metadata:
       Platform Plus"]'
     operators.operatorframework.io/builder: operator-sdk-v1.42.2
     operators.operatorframework.io/project_layout: go.kubebuilder.io/v4
-  name: agent-sandbox-operator.v0.4.6
+  name: agent-sandbox-operator.v0.9.0
   namespace: placeholder
 spec:
   apiservicedefinitions: {}
@@ -295,4 +295,4 @@ spec:
   provider:
     name: kubernetes-sigs
     url: https://agent-sandbox.sigs.k8s.io/
-  version: 0.4.6
+  version: 0.9.0
