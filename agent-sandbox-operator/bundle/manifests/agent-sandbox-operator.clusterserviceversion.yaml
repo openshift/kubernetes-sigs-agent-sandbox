@@ -18,12 +18,7 @@ metadata:
       Platform Plus"]'
     operators.operatorframework.io/builder: operator-sdk-v1.42.2
     operators.operatorframework.io/project_layout: go.kubebuilder.io/v4
-    repository: https://github.com/kubernetes-sigs/agent-sandbox
-    support: Agent Sandbox Community
-  labels:
-    operatorframework.io/arch.amd64: supported
-    operatorframework.io/os.linux: supported
-  name: agent-sandbox-operator.v0.5.0
+  name: agent-sandbox-operator.v0.9.0
   namespace: placeholder
 spec:
   apiservicedefinitions: {}
@@ -313,4 +308,4 @@ spec:
   provider:
     name: kubernetes-sigs
     url: https://agent-sandbox.sigs.k8s.io/
-  version: 0.5.0
+  version: 0.9.0
