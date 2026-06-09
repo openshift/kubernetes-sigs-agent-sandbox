@@ -18,7 +18,7 @@ from unittest.mock import AsyncMock, patch
 
 import httpx
 import pytest
-from fastapi.testclient import TestClient
+from starlette.testclient import TestClient
 
 os.environ["ALLOW_UNAUTHENTICATED_ROUTER"] = "true"
 import sandbox_router
