@@ -25,7 +25,7 @@ The request flow is as follows:
 
 ## Building the Docker Image
 
-The router is a Python application built with FastAPI and Uvicorn.
+The router is a Python application built with Starlette and Uvicorn.
 
 ### Prerequisites
 
@@ -80,7 +80,7 @@ kubectl apply -f gateway.yaml
 
 ### `test_sandbox_router.py`
 
-This file contains unit tests for the Sandbox Router. The tests use `pytest` with FastAPI's
+This file contains unit tests for the Sandbox Router. The tests use `pytest` with Starlette's
 `TestClient` and mock the underlying `httpx` transport so that no live cluster is required.
 
 #### Test Classes:
