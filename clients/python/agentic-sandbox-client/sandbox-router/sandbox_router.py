@@ -16,11 +16,11 @@
 import os
 
 import httpx
-from fastapi import FastAPI, Request, HTTPException
-from fastapi.responses import StreamingResponse
-
-# Initialize the FastAPI application
-app = FastAPI()
+from starlette.applications import Starlette
+from starlette.exceptions import HTTPException
+from starlette.requests import Request
+from starlette.responses import JSONResponse, StreamingResponse
+from starlette.routing import Route
 
 # Configuration
 DEFAULT_SANDBOX_PORT = 8888
@@ -51,14 +51,12 @@ client = httpx.AsyncClient(timeout=proxy_timeout)
 print(f"Sandbox router configured with proxy timeout: {proxy_timeout}s")
 
 
-@app.get("/healthz")
-async def health_check():
+async def health_check(request: Request):
     """A simple health check endpoint that always returns 200 OK."""
-    return {"status": "ok"}
+    return JSONResponse({"status": "ok"})
 
 
-@app.api_route("/{full_path:path}", methods=['GET', 'POST', 'PUT', 'DELETE', 'PATCH'])
-async def proxy_request(request: Request, full_path: str):
+async def proxy_request(request: Request):
     """
     Receives all incoming requests, determines the target sandbox from headers,
     and asynchronously proxies the request to it.
@@ -70,7 +68,7 @@ async def proxy_request(request: Request, full_path: str):
 
     # Dynamic discovery via headers
     namespace = request.headers.get("X-Sandbox-Namespace", DEFAULT_NAMESPACE)
-    
+
     # Sanitize namespace to prevent DNS injection
     if not namespace.replace("-", "").isalnum():
         raise HTTPException(status_code=400, detail="Invalid namespace format.")
@@ -120,3 +118,23 @@ async def proxy_request(request: Request, full_path: str):
         print(f"An unexpected error occurred: {e}")
         raise HTTPException(
             status_code=500, detail="An internal error occurred in the proxy.")
+
+
+routes = [
+    Route("/healthz", health_check, methods=["GET"]),
+    Route(
+        "/{full_path:path}",
+        proxy_request,
+        methods=["GET", "POST", "PUT", "DELETE", "PATCH"],
+    ),
+]
+
+
+async def http_exception_handler(request: Request, exc: HTTPException):
+    return JSONResponse({"detail": exc.detail}, status_code=exc.status_code)
+
+
+app = Starlette(
+    routes=routes,
+    exception_handlers={HTTPException: http_exception_handler},
+)

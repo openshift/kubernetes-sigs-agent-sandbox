@@ -1,4 +1,4 @@
-fastapi
+starlette
 uvicorn
 httpx
 pytest
