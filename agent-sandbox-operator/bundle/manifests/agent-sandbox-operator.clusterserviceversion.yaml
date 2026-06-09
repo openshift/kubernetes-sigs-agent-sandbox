@@ -228,7 +228,7 @@ spec:
               - env:
                 - name: PROXY_TIMEOUT_SECONDS
                   value: "180"
-                image: quay.io/redhat-user-workloads/ose-osc-tenant/agent-sandbox-router:latest
+                image: registry.redhat.io/agent-sandbox/agent-sandbox-router@sha256:37d93c36310e6dad0eea7fab995998ab44e970026f84a7de9d2bb037b1296887
                 livenessProbe:
                   httpGet:
                     path: /healthz
