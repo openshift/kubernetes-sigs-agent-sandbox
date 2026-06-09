@@ -25,7 +25,7 @@ spec:
   - name: build-source-image
     value: "true"
   - name: prefetch-input
-    value: '{"type": "pip", "path": "clients/python/agentic-sandbox-client/sandbox-router"}'
+    value: '{"type": "pip", "path": "clients/python/agentic-sandbox-client/sandbox-router", "binary": {"packages": "pydantic-core", "platform": "manylinux.*_(x86_64|s390x)"}}'
   - name: hermetic
     value: "true"
   - name: revision
