@@ -52,6 +52,9 @@ OPERATOR_SDK_VERSION ?= v1.42.2
 # Image URL to use all building/pushing image targets
 IMG ?= controller:latest
 
+# Image URL for the sandbox router deployed alongside the controller.
+ROUTER_IMG ?= sandbox-router:latest
+
 # Get the currently used golang install path (in GOPATH/bin, unless GOBIN is set)
 ifeq (,$(shell go env GOBIN))
 GOBIN=$(shell go env GOPATH)/bin
@@ -94,16 +97,18 @@ help: ## Display this help.
 
 # Parent k8s/ tree (repo root, one level above this module).
 K8S_ROOT ?= ../k8s
+ROUTER_ROOT ?= ../clients/python/agentic-sandbox-client/sandbox-router
 
 .PHONY: copy-k8s-config
-copy-k8s-config: ## Copy ../k8s into config/ (CRDs, RBAC .generated.yaml → role names, extensions binding, support/manager).
+copy-k8s-config: ## Copy ../k8s and sandbox-router manifests into config/ (CRDs, RBAC, support/manager, router).
 	mkdir -p config/crd/bases
 	rm -rf config/crd/bases/*
 	cp $(K8S_ROOT)/crds/*.yaml config/crd/bases/
 	cp $(K8S_ROOT)/rbac.generated.yaml config/rbac/role.yaml
 	cp $(K8S_ROOT)/extensions-rbac.generated.yaml config/rbac/extensions_role.yaml
 	cp $(K8S_ROOT)/extensions.yaml config/rbac/extensions_role_binding.yaml
-	go run ./hack/sync-k8s-manifests -controller $(K8S_ROOT)/controller.yaml -extensions $(K8S_ROOT)/extensions.controller.yaml -support-out config/rbac/support.yaml -manager-out config/manager/manager.yaml
+	mkdir -p config/router
+	go run ./hack/sync-k8s-manifests -controller $(K8S_ROOT)/controller.yaml -extensions $(K8S_ROOT)/extensions.controller.yaml -support-out config/rbac/support.yaml -manager-out config/manager/manager.yaml -router $(ROUTER_ROOT)/sandbox_router.yaml -router-out config/router/router.yaml
 
 .PHONY: manifests
 manifests: copy-k8s-config ## Refresh config/ YAML from $(K8S_ROOT) (same layout as manual copy from k8s/).
@@ -207,6 +212,7 @@ docker-buildx: ## Build and push docker image for the manager for cross-platform
 build-installer: manifests generate kustomize ## Generate a consolidated YAML with CRDs and deployment.
 	mkdir -p dist
 	cd config/manager && $(KUSTOMIZE) edit set image controller=${IMG}
+	cd config/router && $(KUSTOMIZE) edit set image router=${ROUTER_IMG}
 	$(KUSTOMIZE) build config/default > dist/install.yaml
 
 ##@ Deployment
@@ -226,6 +232,7 @@ uninstall: manifests kustomize ## Uninstall CRDs from the K8s cluster specified 
 .PHONY: deploy
 deploy: manifests kustomize ## Deploy controller to the K8s cluster specified in ~/.kube/config.
 	cd config/manager && $(KUSTOMIZE) edit set image controller=${IMG}
+	cd config/router && $(KUSTOMIZE) edit set image router=${ROUTER_IMG}
 	$(KUSTOMIZE) build config/default | $(KUBECTL) apply -f -
 
 .PHONY: undeploy
@@ -321,6 +328,7 @@ endif
 bundle: manifests kustomize operator-sdk ## Generate bundle manifests and metadata, then validate generated files.
 	$(OPERATOR_SDK) generate kustomize manifests -q
 	cd config/manager && $(KUSTOMIZE) edit set image controller=$(IMG)
+	cd config/router && $(KUSTOMIZE) edit set image router=$(ROUTER_IMG)
 	$(KUSTOMIZE) build config/manifests | $(OPERATOR_SDK) generate bundle $(BUNDLE_GEN_FLAGS)
 	$(OPERATOR_SDK) bundle validate ./bundle
 
