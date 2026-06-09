@@ -238,7 +238,7 @@ spec:
                   value: "180"
                 - name: ALLOW_UNAUTHENTICATED_ROUTER
                   value: "false"
-                image: registry.redhat.io/agent-sandbox/agent-sandbox-router@sha256:37d93c36310e6dad0eea7fab995998ab44e970026f84a7de9d2bb037b1296887
+                image: registry.redhat.io/agent-sandbox/agent-sandbox-router@sha256:22a4c9e1e71521015a2a17b00e2aae9796688bbae184f54f06c54412abd1ecca
                 livenessProbe:
                   httpGet:
                     path: /healthz
