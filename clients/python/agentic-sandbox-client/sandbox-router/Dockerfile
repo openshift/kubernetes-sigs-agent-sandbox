@@ -1,5 +1,7 @@
 # Use the official Python image from the Docker Hub as the base image.
-FROM python:3.14-slim
+FROM registry.access.redhat.com/ubi9/python-314
+
+USER root
 
 WORKDIR /app
 
