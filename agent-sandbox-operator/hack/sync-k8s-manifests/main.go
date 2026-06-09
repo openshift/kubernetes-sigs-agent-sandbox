@@ -28,6 +28,11 @@ import (
 	"sigs.k8s.io/yaml"
 )
 
+const (
+	operatorNamespace = "agent-sandbox-system"
+	routerAppLabel    = "sandbox-router"
+)
+
 func main() {
 	controllerPath := flag.String(
 		"controller",
@@ -46,15 +51,18 @@ func main() {
 		"write Namespace from controller + Deployment from extensions",
 	)
 	image := flag.String("image", "controller:latest", "container image for the extensions Deployment")
+	routerPath := flag.String("router", "../clients/python/agentic-sandbox-client/sandbox-router/sandbox_router.yaml", "sandbox router Service + Deployment")
+	routerOut := flag.String("router-out", "config/router/router.yaml", "write sandbox router manifests for OLM/kustomize")
+	routerImage := flag.String("router-image", "router:latest", "container image placeholder for the sandbox router Deployment")
 	flag.Parse()
 
-	if err := run(*controllerPath, *extensionsPath, *supportOut, *managerOut, *image); err != nil {
+	if err := run(*controllerPath, *extensionsPath, *supportOut, *managerOut, *image, *routerPath, *routerOut, *routerImage); err != nil {
 		fmt.Fprintf(os.Stderr, "sync-k8s-manifests: %v\n", err)
 		os.Exit(1)
 	}
 }
 
-func run(controllerPath, extensionsPath, supportOut, managerOut, image string) error {
+func run(controllerPath, extensionsPath, supportOut, managerOut, image, routerPath, routerOut, routerImage string) error {
 	controllerDocs, err := readDocuments(controllerPath)
 	if err != nil {
 		return fmt.Errorf("read controller: %w", err)
@@ -111,6 +119,42 @@ func run(controllerPath, extensionsPath, supportOut, managerOut, image string) e
 	}
 	if err := writeMultiDoc(managerOut, []map[string]interface{}{ns, dep}); err != nil {
 		return fmt.Errorf("write manager: %w", err)
+	}
+	if err := syncRouter(routerPath, routerOut, routerImage); err != nil {
+		return err
+	}
+	return nil
+}
+
+func syncRouter(routerPath, routerOut, image string) error {
+	docs, err := readDocuments(routerPath)
+	if err != nil {
+		return fmt.Errorf("read router: %w", err)
+	}
+	if len(docs) == 0 {
+		return fmt.Errorf("%s: no documents", routerPath)
+	}
+	for _, doc := range docs {
+		kind, _ := doc["kind"].(string)
+		meta, ok := doc["metadata"].(map[string]interface{})
+		if !ok {
+			return fmt.Errorf("%s: %s missing metadata", routerPath, kind)
+		}
+		meta["namespace"] = operatorNamespace
+		labels, ok := meta["labels"].(map[string]interface{})
+		if !ok {
+			labels = make(map[string]interface{})
+			meta["labels"] = labels
+		}
+		labels["app"] = routerAppLabel
+		if kind == "Deployment" {
+			if err := replaceRouterImage(doc, image); err != nil {
+				return err
+			}
+		}
+	}
+	if err := writeMultiDoc(routerOut, docs); err != nil {
+		return fmt.Errorf("write router: %w", err)
 	}
 	return nil
 }
@@ -174,6 +218,42 @@ func replaceControllerImage(dep map[string]interface{}, replacement string) erro
 		}
 	}
 	return fmt.Errorf("extensions deployment: no container image matching %q", koControllerImage)
+}
+
+const routerImagePlaceholder = "${ROUTER_IMAGE}"
+
+func replaceRouterImage(dep map[string]interface{}, replacement string) error {
+	spec, ok := dep["spec"].(map[string]interface{})
+	if !ok {
+		return fmt.Errorf("router deployment: missing spec")
+	}
+	tpl, ok := spec["template"].(map[string]interface{})
+	if !ok {
+		return fmt.Errorf("router deployment: missing spec.template")
+	}
+	pod, ok := tpl["spec"].(map[string]interface{})
+	if !ok {
+		return fmt.Errorf("router deployment: missing spec.template.spec")
+	}
+	raw, ok := pod["containers"].([]interface{})
+	if !ok || len(raw) == 0 {
+		return fmt.Errorf("router deployment: missing or empty spec.template.spec.containers")
+	}
+	for _, c := range raw {
+		cm, ok := c.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		img, ok := cm["image"].(string)
+		if !ok {
+			continue
+		}
+		if img == routerImagePlaceholder {
+			cm["image"] = replacement
+			return nil
+		}
+	}
+	return fmt.Errorf("router deployment: no container image matching %q", routerImagePlaceholder)
 }
 
 func writeMultiDoc(path string, docs []map[string]interface{}) error {
