@@ -20,5 +20,5 @@ USER 1000
 # This must match the port in the CMD instruction below.
 EXPOSE 8080
 
-# Use Uvicorn as a production-ready web server to run the Flask app
+# Use Uvicorn as a production-ready web server to run the Starlette app
 CMD ["uvicorn", "sandbox_router:app", "--host", "0.0.0.0", "--port", "8080"]
