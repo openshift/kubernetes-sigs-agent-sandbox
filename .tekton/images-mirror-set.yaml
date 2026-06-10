@@ -4,12 +4,18 @@ metadata:
   name: agent-sandbox-registry
 spec:
   imageTagMirrors:
-    - mirrors:
+    - mirrorSourcePolicy: NeverContactSource
+      mirrors:
         - quay.io/redhat-user-workloads/ose-osc-tenant/agent-sandbox-operator
       source: registry.redhat.io/agent-sandbox/agent-sandbox-rhel9-operator
-    - mirrors:
+    - mirrorSourcePolicy: NeverContactSource
+      mirrors:
         - quay.io/redhat-user-workloads/ose-osc-tenant/agent-sandbox-bundle
       source: registry.redhat.io/agent-sandbox/agent-sandbox-operator-bundle
+    - mirrorSourcePolicy: NeverContactSource
+      mirrors:
+        - quay.io/redhat-user-workloads/ose-osc-tenant/agent-sandbox-router
+      source: registry.redhat.io/agent-sandbox/agent-sandbox-router
 ---
 apiVersion: config.openshift.io/v1
 kind: ImageDigestMirrorSet
@@ -17,9 +23,15 @@ metadata:
   name: agent-sandbox-registry
 spec:
   imageDigestMirrors:
-    - mirrors:
+    - mirrorSourcePolicy: NeverContactSource
+      mirrors:
         - quay.io/redhat-user-workloads/ose-osc-tenant/agent-sandbox-operator
       source: registry.redhat.io/agent-sandbox/agent-sandbox-rhel9-operator
-    - mirrors:
+    - mirrorSourcePolicy: NeverContactSource
+      mirrors:
         - quay.io/redhat-user-workloads/ose-osc-tenant/agent-sandbox-bundle
       source: registry.redhat.io/agent-sandbox/agent-sandbox-operator-bundle
+    - mirrorSourcePolicy: NeverContactSource
+      mirrors:
+        - quay.io/redhat-user-workloads/ose-osc-tenant/agent-sandbox-router
+      source: registry.redhat.io/agent-sandbox/agent-sandbox-router
