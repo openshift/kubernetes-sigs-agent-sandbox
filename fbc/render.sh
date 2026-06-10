@@ -22,7 +22,7 @@ do
     pushd "$OCP_VERSION"
 
     RELEASE_IMAGE=$(yq '.entries[] | select(.schema == "olm.bundle") | .image' "$TEMPLATE_NAME" | tail -n1)
-    BUILD_IMAGE=$(echo $RELEASE_IMAGE | sed "s|$RELEASE_REGISTRY|$BUILD_REGISTRY|")
+    BUILD_IMAGE=$(echo $RELEASE_IMAGE | sed "s|$RELEASE_REGISTRY|$BUILD_REGISTRY|" | sed "s|agent-sandbox-operator-bundle|agent-sandbox-bundle|")
 
     # Switch to the build registry, so `opm` can pull freely.
     sed -i "s|$RELEASE_IMAGE|$BUILD_IMAGE|" "$TEMPLATE_NAME"
