@@ -4,5 +4,5 @@ resources:
 - router.yaml
 images:
 - name: router
-  newName: router
+  newName: sandbox-router
   newTag: latest
