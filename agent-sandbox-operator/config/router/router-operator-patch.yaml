@@ -1,0 +1,14 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sandbox-router-deployment
+  namespace: agent-sandbox-system
+spec:
+  replicas: 1
+  template:
+    spec:
+      containers:
+      - name: router
+        env:
+        - name: ALLOW_UNAUTHENTICATED_ROUTER
+          value: "true"
