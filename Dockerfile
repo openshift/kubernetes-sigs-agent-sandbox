@@ -33,6 +33,21 @@ RUN CGO_ENABLED=1 GOOS=linux GOARCH=${TARGETARCH} go build \
 # The controller image
 FROM registry.access.redhat.com/ubi9/ubi-minimal:9.7-1778072020
 
+LABEL name="agent-sandbox/agent-sandbox-rhel9-operator"
+LABEL com.redhat.component="agent-sandbox-operator-container"
+LABEL io.k8s.display-name="Agent Sandbox operator"
+LABEL io.k8s.description="This operator manages agent sandbox workloads"
+LABEL description="This operator manages agent sandbox workloads"
+LABEL summary="This operator manages agent sandbox workloads"
+LABEL maintainer="Red Hat"
+LABEL version="0.9.0"
+LABEL release="1"
+LABEL vendor="Red Hat, Inc."
+LABEL url="https://access.redhat.com/"
+LABEL distribution-scope=public
+LABEL io.openshift.tags=""
+LABEL cpe="cpe:/a:redhat:confidential_compute_attestation:1.130::el9"
+
 COPY --from=builder /workspace/agent-sandbox-controller /agent-sandbox-controller
 
 ENTRYPOINT ["/agent-sandbox-controller"]
