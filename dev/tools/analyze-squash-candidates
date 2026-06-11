@@ -1,0 +1,263 @@
+#!/usr/bin/env python3
+# Copyright 2026 The Kubernetes Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Find chore commits that bump the same single line and could be squashed."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import re
+import subprocess
+import sys
+from dataclasses import dataclass
+from typing import Iterable
+
+CHORE_RE = re.compile(r"^chore(\([^)]+\))?:", re.IGNORECASE)
+HUNK_RE = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@")
+DIFF_FILE_RE = re.compile(r"^diff --git a/(.+?) b/")
+
+
+@dataclass(frozen=True)
+class LineTouch:
+    file: str
+    line: str  # normalized content of the line being updated
+
+    @property
+    def label(self) -> str:
+        return f"{self.file}: {self.line}"
+
+
+@dataclass
+class CommitInfo:
+    sha: str
+    short: str
+    subject: str
+    touch: LineTouch
+
+
+@dataclass
+class SquashGroup:
+    touch: LineTouch
+    commits: list[CommitInfo]
+
+
+def run_git(args: list[str]) -> str:
+    result = subprocess.run(
+        ["git", *args],
+        check=True,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    return result.stdout
+
+
+def die(message: str) -> None:
+    print(f"error: {message}", file=sys.stderr)
+    sys.exit(1)
+
+
+def resolve_ref(ref: str) -> str:
+    try:
+        return run_git(["rev-parse", "--verify", f"{ref}^{{commit}}"]).strip()
+    except subprocess.CalledProcessError as exc:
+        die(f"cannot resolve ref '{ref}': {exc.stderr.strip()}")
+
+
+def parse_range(from_ref: str, to_ref: str) -> tuple[str, str]:
+    from_sha = resolve_ref(from_ref)
+    to_sha = resolve_ref(to_ref)
+    try:
+        run_git(["merge-base", "--is-ancestor", from_sha, to_sha])
+    except subprocess.CalledProcessError:
+        die(f"'{from_ref}' is not an ancestor of '{to_ref}'")
+    return from_sha, to_sha
+
+
+def is_chore(subject: str) -> bool:
+    return bool(CHORE_RE.match(subject))
+
+
+def normalize_line(text: str) -> str:
+    line = text.strip()
+    line = re.sub(r"@sha256:[0-9a-f]+", "@sha256:*", line)
+    line = re.sub(r"\b[0-9a-f]{7,40}\b", "*", line)
+    line = re.sub(r"\s+", " ", line)
+    return line
+
+
+def single_line_touch(sha: str) -> LineTouch | None:
+    patch = run_git(["show", "--format=", "--unified=0", sha])
+    current_file: str | None = None
+    hunk_count = 0
+    removed_line: str | None = None
+    added = removed = 0
+
+    for line in patch.splitlines():
+        file_match = DIFF_FILE_RE.match(line)
+        if file_match:
+            if hunk_count > 1:
+                return None
+            current_file = file_match.group(1)
+            continue
+        if current_file is None:
+            continue
+        hunk_match = HUNK_RE.match(line)
+        if hunk_match:
+            hunk_count += 1
+            count = int(hunk_match.group(2) or "1")
+            if count != 1:
+                return None
+            continue
+        if line.startswith("+") and not line.startswith("+++"):
+            added += 1
+        elif line.startswith("-") and not line.startswith("---"):
+            removed += 1
+            if removed_line is None:
+                removed_line = line[1:]
+
+    if added != 1 or removed != 1 or hunk_count != 1 or not current_file or not removed_line:
+        return None
+
+    return LineTouch(file=current_file, line=normalize_line(removed_line))
+
+
+def load_chore_touches(from_sha: str, to_sha: str) -> list[CommitInfo]:
+    output = run_git(
+        ["log", "--reverse", f"{from_sha}..{to_sha}", "--format=%H%x1f%h%x1f%s"]
+    )
+    touches: list[CommitInfo] = []
+    for row in output.splitlines():
+        if not row.strip():
+            continue
+        sha, short, subject = row.split("\x1f", 2)
+        if not is_chore(subject):
+            continue
+        touch = single_line_touch(sha)
+        if touch is None:
+            continue
+        touches.append(CommitInfo(sha=sha, short=short, subject=subject, touch=touch))
+    return touches
+
+
+def build_groups(commits: list[CommitInfo]) -> list[SquashGroup]:
+    groups: list[SquashGroup] = []
+    current: SquashGroup | None = None
+
+    for commit in commits:
+        if current and commit.touch == current.touch:
+            current.commits.append(commit)
+            continue
+        if current and len(current.commits) > 1:
+            groups.append(current)
+        current = SquashGroup(touch=commit.touch, commits=[commit])
+
+    if current and len(current.commits) > 1:
+        groups.append(current)
+
+    return groups
+
+
+def print_human(groups: list[SquashGroup], from_ref: str, to_ref: str) -> None:
+    print(f"Range: {from_ref}..{to_ref}")
+    print()
+
+    if not groups:
+        print("No squash groups found.")
+        print()
+        print("Looks for chore(*) commits that each change exactly one line (+1/-1)")
+        print("in one file, repeatedly updating the same logical line.")
+        return
+
+    print(f"Found {len(groups)} group(s) to squash:\n")
+    for idx, group in enumerate(groups, start=1):
+        first, last = group.commits[0], group.commits[-1]
+        print(
+            f"Group {idx}: {len(group.commits)} chore commits "
+            f"({first.short} .. {last.short})"
+        )
+        print(f"  same line: {group.touch.label}")
+        for commit in group.commits:
+            print(f"    {commit.short} {commit.subject}")
+        print(
+            "  why: repeated one-line chore bumps to the same field "
+            "(e.g. image digest updates)"
+        )
+        print()
+
+
+def print_json(groups: list[SquashGroup], from_ref: str, to_ref: str) -> None:
+    print(
+        json.dumps(
+            {
+                "from": from_ref,
+                "to": to_ref,
+                "groups": [
+                    {
+                        "file": g.touch.file,
+                        "line": g.touch.line,
+                        "commits": [
+                            {"sha": c.sha, "short": c.short, "subject": c.subject}
+                            for c in g.commits
+                        ],
+                    }
+                    for g in groups
+                ],
+            },
+            indent=2,
+        )
+    )
+
+
+def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Find chore commits that each change the same single line and "
+            "could be squashed together."
+        )
+    )
+    parser.add_argument("range", nargs="?", help="Revision range as FROM..TO")
+    parser.add_argument("--from", dest="from_ref", help="Start ref (exclusive)")
+    parser.add_argument("--to", dest="to_ref", help="End ref (inclusive)")
+    parser.add_argument("--json", action="store_true", help="Emit JSON")
+    return parser.parse_args(list(argv) if argv is not None else None)
+
+
+def main(argv: Iterable[str] | None = None) -> None:
+    args = parse_args(argv)
+    from_ref = args.from_ref
+    to_ref = args.to_ref
+    if args.range:
+        if ".." not in args.range:
+            die("range must look like FROM..TO")
+        range_from, range_to = args.range.split("..", 1)
+        from_ref = from_ref or range_from
+        to_ref = to_ref or range_to
+    if not from_ref or not to_ref:
+        die("provide --from and --to, or a FROM..TO range argument")
+
+    from_sha, to_sha = parse_range(from_ref, to_ref)
+    commits = load_chore_touches(from_sha, to_sha)
+    groups = build_groups(commits)
+
+    if args.json:
+        print_json(groups, from_ref, to_ref)
+    else:
+        print_human(groups, from_ref, to_ref)
+
+
+if __name__ == "__main__":
+    main()
