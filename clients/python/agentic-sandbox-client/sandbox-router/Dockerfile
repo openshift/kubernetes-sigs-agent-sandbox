@@ -27,9 +27,10 @@ RUN pip install --no-cache-dir --require-hashes -r requirements.txt
 
 COPY sandbox_router.py .
 
-# Change ownership of the /app directory to the non-root user 1000.
-RUN chown -R 1000:1000 /app
-USER 1000
+# OpenShift runs containers as an arbitrary UID from the namespace range with GID 0.
+RUN chown -R 1001:0 /app && \
+    chmod -R g+rwX /app
+USER 1001
 
 # Expose the port that the Uvicorn server will run on.
 # This must match the port in the CMD instruction below.
