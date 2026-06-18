@@ -61,9 +61,17 @@ spec:
           requests:
             cpu: 250m
             memory: 512Mi
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop:
+            - ALL
+          runAsNonRoot: true
+      hostUsers: false
       securityContext:
-        runAsGroup: 1000
-        runAsUser: 1000
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
       topologySpreadConstraints:
       - labelSelector:
           matchLabels:
