@@ -28,6 +28,7 @@ spec:
       labels:
         app: sandbox-router
     spec:
+      hostUsers: false
       # Ensure pods are spread across different zones for HA
       topologySpreadConstraints:
         - maxSkew: 1
@@ -71,6 +72,13 @@ spec:
           limits:
             cpu: "1000m"
             memory: "1Gi"
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop:
+            - ALL
+          runAsNonRoot: true
       securityContext:
-        runAsUser: 1000
-        runAsGroup: 1000
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
