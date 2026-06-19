@@ -216,7 +216,7 @@ spec:
               - args:
                 - --leader-elect=true
                 - --extensions
-                image: registry.redhat.io/agent-sandbox/agent-sandbox-rhel9-operator@sha256:ed3571bb79967d8f8e50334f00e474890a222214a6785dfbd1e5ce93214c5f58
+                image: registry.redhat.io/agent-sandbox/agent-sandbox-rhel9-operator@sha256:ff8e6ea732021d676a8571ecb2316cb4a2e872c4e3090de7be20e87666137262
                 name: agent-sandbox-controller
                 ports:
                 - containerPort: 8080
