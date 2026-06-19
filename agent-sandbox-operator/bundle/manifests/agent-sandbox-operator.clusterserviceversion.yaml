@@ -256,7 +256,7 @@ spec:
                   value: "true"
                 - name: PROXY_TIMEOUT_SECONDS
                   value: "180"
-                image: registry.redhat.io/agent-sandbox/agent-sandbox-router@sha256:5e5e35309f282d82e1aff2a25d481a1cc57b004c3f0f2def3d6138f5bc2e85b2
+                image: registry.redhat.io/agent-sandbox/agent-sandbox-router@sha256:5fe4ba9cc2dfd527ebdbbdff2ccfa39d2d3ad8444b26297220872a64a994635f
                 livenessProbe:
                   httpGet:
                     path: /healthz
