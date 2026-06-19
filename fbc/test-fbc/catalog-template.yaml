@@ -12,6 +12,6 @@ entries:
     name: preview-0.9
     package: agent-sandbox-operator
     schema: olm.channel
-  - image: registry.redhat.io/agent-sandbox/agent-sandbox-operator-bundle@sha256:db8379c4ebe5d2b49b14fa261491a7be70d6dfc5bc133a111f32698d98c4b681
+  - image: registry.redhat.io/agent-sandbox/agent-sandbox-operator-bundle@sha256:773ab9e6b12df170f478897c88095c884b56135ad844550ff5219e0e39f5fc08
     schema: olm.bundle
 schema: olm.template.basic
