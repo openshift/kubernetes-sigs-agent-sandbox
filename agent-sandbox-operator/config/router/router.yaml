@@ -36,6 +36,8 @@ spec:
       - env:
         - name: PROXY_TIMEOUT_SECONDS
           value: "180"
+        - name: ALLOW_UNAUTHENTICATED_ROUTER
+          value: "false"
         image: router:latest
         livenessProbe:
           httpGet:
