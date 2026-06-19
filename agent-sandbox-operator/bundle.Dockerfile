@@ -17,7 +17,7 @@ LABEL operators.operatorframework.io.test.config.v1=tests/scorecard/
 # Required Red Hat container labels.
 LABEL name="agent-sandbox/agent-sandbox-operator-bundle"
 LABEL com.redhat.component="agent-sandbox-operator-bundle-container"
-LABEL io.k8s.display-name="Agent Sandbox operator"
+LABEL io.k8s.display-name="Red Hat build of Agent Sandbox"
 LABEL io.k8s.description="This operator manages agent sandbox workloads"
 LABEL description="This operator manages agent sandbox workloads"
 LABEL summary="This operator manages agent sandbox workloads"
