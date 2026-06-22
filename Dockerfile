@@ -1,6 +1,6 @@
 # Build go binaries
 # See https://github.com/golang/go/issues/69255#issuecomment-2523276831
-FROM --platform=$BUILDPLATFORM registry.access.redhat.com/ubi9/go-toolset:9.8-1781757851 AS builder
+FROM --platform=$BUILDPLATFORM registry.access.redhat.com/ubi9/go-toolset:1.26.3-1781757851 AS builder
 
 # Declare TARGETARCH to make it available in this build stage
 ARG TARGETARCH
