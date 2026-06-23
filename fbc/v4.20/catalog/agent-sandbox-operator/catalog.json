@@ -22,14 +22,14 @@
     "schema": "olm.bundle",
     "name": "agent-sandbox-operator.v0.9.0",
     "package": "agent-sandbox-operator",
-    "image": "registry.redhat.io/agent-sandbox/agent-sandbox-operator-bundle@sha256:9d7b0849f225e1740551c8318301d2dd2d058a25e6537e7bd2edd3ea33481864",
+    "image": "registry.redhat.io/agent-sandbox/agent-sandbox-operator-bundle@sha256:01f8fbf2cda6e5cbac5c53f9037a8142a1139000f947627404d4c95ee2a2fe2d",
     "properties": [
         {
             "type": "olm.gvk",
             "value": {
                 "group": "agents.x-k8s.io",
                 "kind": "Sandbox",
-                "version": "v1alpha1"
+                "version": "v1beta1"
             }
         },
         {
@@ -37,7 +37,7 @@
             "value": {
                 "group": "extensions.agents.x-k8s.io",
                 "kind": "SandboxClaim",
-                "version": "v1alpha1"
+                "version": "v1beta1"
             }
         },
         {
@@ -45,7 +45,7 @@
             "value": {
                 "group": "extensions.agents.x-k8s.io",
                 "kind": "SandboxTemplate",
-                "version": "v1alpha1"
+                "version": "v1beta1"
             }
         },
         {
@@ -53,14 +53,14 @@
             "value": {
                 "group": "extensions.agents.x-k8s.io",
                 "kind": "SandboxWarmPool",
-                "version": "v1alpha1"
+                "version": "v1beta1"
             }
         },
         {
             "type": "olm.package",
             "value": {
                 "packageName": "agent-sandbox-operator",
-                "version": "0.0.1"
+                "version": "0.9.0"
             }
         },
         {
@@ -69,37 +69,57 @@
                 "annotations": {
                     "alm-examples": "[]",
                     "capabilities": "Basic Install",
-                    "createdAt": "2026-05-20T08:10:47Z",
+                    "categories": "AI/Machine Learning",
+                    "createdAt": "2026-06-18T14:34:08Z",
+                    "features.operators.openshift.io/disconnected": "true",
+                    "features.operators.openshift.io/fips-compliant": "false",
+                    "features.operators.openshift.io/proxy-aware": "false",
+                    "features.operators.openshift.io/tls-profiles": "false",
+                    "features.operators.openshift.io/token-auth-aws": "false",
+                    "features.operators.openshift.io/token-auth-azure": "false",
+                    "features.operators.openshift.io/token-auth-gcp": "false",
+                    "operatorframework.io/suggested-namespace": "agent-sandbox-system",
+                    "operators.openshift.io/valid-subscription": "[\"OpenShift Container Platform\", \"OpenShift Platform Plus\"]",
                     "operators.operatorframework.io/builder": "operator-sdk-v1.42.2",
-                    "operators.operatorframework.io/project_layout": "go.kubebuilder.io/v4"
+                    "operators.operatorframework.io/project_layout": "go.kubebuilder.io/v4",
+                    "repository": "https://github.com/openshift/kubernetes-sigs-agent-sandbox/",
+                    "support": "Agent Sandbox Community"
                 },
                 "apiServiceDefinitions": {},
                 "crdDescriptions": {
                     "owned": [
                         {
                             "name": "sandboxclaims.extensions.agents.x-k8s.io",
-                            "version": "v1alpha1",
-                            "kind": "SandboxClaim"
+                            "version": "v1beta1",
+                            "kind": "SandboxClaim",
+                            "displayName": "Sandbox Claim",
+                            "description": "SandboxClaim requests a Sandbox from a warm pool for use by an AI agent."
                         },
                         {
                             "name": "sandboxes.agents.x-k8s.io",
-                            "version": "v1alpha1",
-                            "kind": "Sandbox"
+                            "version": "v1beta1",
+                            "kind": "Sandbox",
+                            "displayName": "Sandbox",
+                            "description": "Sandbox provides an isolated, stateful runtime environment for AI agent workloads."
                         },
                         {
                             "name": "sandboxtemplates.extensions.agents.x-k8s.io",
-                            "version": "v1alpha1",
-                            "kind": "SandboxTemplate"
+                            "version": "v1beta1",
+                            "kind": "SandboxTemplate",
+                            "displayName": "Sandbox Template",
+                            "description": "SandboxTemplate defines a reusable specification for creating Sandboxes."
                         },
                         {
                             "name": "sandboxwarmpools.extensions.agents.x-k8s.io",
-                            "version": "v1alpha1",
-                            "kind": "SandboxWarmPool"
+                            "version": "v1beta1",
+                            "kind": "SandboxWarmPool",
+                            "displayName": "Sandbox Warm Pool",
+                            "description": "SandboxWarmPool maintains a pool of pre-provisioned Sandboxes for fast allocation."
                         }
                     ]
                 },
                 "description": "Agent-sandbox enables easy management of isolated, stateful, singleton workloads, ideal for use cases like AI agent runtimes.",
-                "displayName": "Agent Sandbox Operator",
+                "displayName": "Red Hat build of Agent Sandbox",
                 "installModes": [
                     {
                         "type": "OwnNamespace",
@@ -123,10 +143,14 @@
                     "sandbox",
                     "kubernetes"
                 ],
+                "labels": {
+                    "operatorframework.io/arch.amd64": "supported",
+                    "operatorframework.io/os.linux": "supported"
+                },
                 "links": [
                     {
-                        "name": "Agent Sandbox Operator",
-                        "url": "https://agent-sandbox-operator.domain"
+                        "name": "Agent Sandbox",
+                        "url": "https://agent-sandbox.sigs.k8s.io/"
                     }
                 ],
                 "maintainers": [
@@ -137,8 +161,8 @@
                 ],
                 "maturity": "alpha",
                 "provider": {
-                    "name": "kubernetes-sigs",
-                    "url": "https://agent-sandbox.sigs.k8s.io/"
+                    "name": "Red Hat",
+                    "url": "https://github.com/openshift/kubernetes-sigs-agent-sandbox/"
                 }
             }
         }
@@ -146,11 +170,15 @@
     "relatedImages": [
         {
             "name": "",
-            "image": "registry.redhat.io/agent-sandbox/agent-sandbox-operator-bundle@sha256:9d7b0849f225e1740551c8318301d2dd2d058a25e6537e7bd2edd3ea33481864"
+            "image": "registry.redhat.io/agent-sandbox/agent-sandbox-operator-bundle@sha256:01f8fbf2cda6e5cbac5c53f9037a8142a1139000f947627404d4c95ee2a2fe2d"
         },
         {
             "name": "",
-            "image": "registry.redhat.io/agent-sandbox/agent-sandbox-rhel9-operator@sha256:3509e4d5e13a4660a2202bf473f853a14520d806005872839db00b73d6e9efc7"
+            "image": "registry.redhat.io/agent-sandbox/agent-sandbox-rhel9-operator@sha256:554102df4c721bd27be7129c910c206ed1329be14df68906a588959b0e7d9309"
+        },
+        {
+            "name": "",
+            "image": "registry.redhat.io/agent-sandbox/agent-sandbox-router@sha256:d7d745b9ad8143282a1356d13a9b351faf6aa1955ee6b02f100fc282dbbd91d3"
         }
     ]
 }
