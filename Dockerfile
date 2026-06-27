@@ -31,7 +31,7 @@ RUN CGO_ENABLED=1 GOOS=linux GOARCH=${TARGETARCH} go build \
 
 
 # The controller image
-FROM registry.access.redhat.com/ubi9/ubi-minimal:9.8-1781496742
+FROM registry.access.redhat.com/ubi9/ubi-minimal:9.8-1782366411
 
 LABEL name="agent-sandbox/agent-sandbox-rhel9-operator"
 LABEL com.redhat.component="agent-sandbox-operator-container"
