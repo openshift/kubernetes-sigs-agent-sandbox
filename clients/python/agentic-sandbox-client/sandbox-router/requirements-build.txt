@@ -96,9 +96,9 @@ trove-classifiers==2026.6.1.19 \
     --hash=sha256:ab4c4ec93cc4a4e7815fa759906e05e6bb3f2fbd92ea0f897288c6a43efd15b3 \
     --hash=sha256:c5132b4b61a829d11cfbd2d72e97f20a45ed6edb95e45c5efdeb5e00836b2745
     # via hatchling
-vcs-versioning==1.1.1 \
-    --hash=sha256:b541e2ba79fc6aaa3850f8a7f88af43d97c1c80649c01142ee4146eddbc599e4 \
-    --hash=sha256:fabd75a3cab7dd8ac02fe24a3a9ba936bf258667b5a62ed468c9a1da0f5775bc
+vcs-versioning==2.2.0 \
+    --hash=sha256:532dd99dd85e6f17667d5ca9a028b494a6e0d65dbc9d92716f1d0401078be6a0 \
+    --hash=sha256:69a649bfbbe9f8134e8b15cddc7b27daa00e5eccbcb5128e060a87e94bad8255
     # via setuptools-scm
 
 # The following packages are considered to be unsafe in a requirements file:
