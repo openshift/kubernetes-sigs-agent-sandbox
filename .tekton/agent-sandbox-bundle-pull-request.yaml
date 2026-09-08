@@ -9,7 +9,7 @@ metadata:
     pipelinesascode.tekton.dev/cancel-in-progress: "true"
     pipelinesascode.tekton.dev/max-keep-runs: "3"
     pipelinesascode.tekton.dev/on-cel-expression: event == "pull_request" && target_branch
-      == "main" && ( "agent-sandbox-operator/***".pathChanged() || ".tekton/agent-sandbox-bundle-pull-request.yaml".pathChanged()
+      == "main" && ( "olm/***".pathChanged() || ".tekton/agent-sandbox-bundle-pull-request.yaml".pathChanged()
       )
   labels:
     appstudio.openshift.io/application: agent-sandbox
@@ -34,7 +34,7 @@ spec:
   - name: dockerfile
     value: bundle.Dockerfile
   - name: path-context
-    value: agent-sandbox-operator
+    value: olm
   pipelineSpec:
     description: |
       This pipeline is ideal for building container images from a Containerfile while maintaining trust after pipeline customization.
