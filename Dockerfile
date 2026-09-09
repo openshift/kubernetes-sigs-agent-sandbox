@@ -1,6 +1,6 @@
 # Build go binaries
 # See https://github.com/golang/go/issues/69255#issuecomment-2523276831
-FROM --platform=$BUILDPLATFORM registry.access.redhat.com/ubi9/go-toolset:1.26.7-1788409979 AS builder
+FROM --platform=$BUILDPLATFORM registry.access.redhat.com/ubi9/go-toolset:9.8-1788409979 AS builder
 
 # Declare TARGETARCH to make it available in this build stage
 ARG TARGETARCH
@@ -31,7 +31,7 @@ RUN CGO_ENABLED=1 GOOS=linux GOARCH=${TARGETARCH} go build \
 
 
 # The controller image
-FROM registry.access.redhat.com/ubi9/ubi-minimal:9.8-1781496742
+FROM registry.access.redhat.com/ubi9/ubi-minimal:9.8-1788166357
 
 LABEL name="agent-sandbox/agent-sandbox-rhel9-operator"
 LABEL com.redhat.component="agent-sandbox-operator-container"
