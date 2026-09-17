@@ -48,12 +48,12 @@ RUN CGO_ENABLED=0 GOOS=linux GOARCH=${TARGETARCH} go build \
         -X sigs.k8s.io/agent-sandbox/internal/version.gitVersion=${GIT_VERSION} \
         -X sigs.k8s.io/agent-sandbox/internal/version.gitSHA=${GIT_SHA} \
         -X sigs.k8s.io/agent-sandbox/internal/version.buildDate=${BUILD_DATE}" \
-    -o /sandbox-router ./sandbox-router/cmd
+    -o /tmp/sandbox-router ./sandbox-router/cmd
 
 # Final image: distroless static so we ship only the binary plus minimal runtime.
 FROM gcr.io/distroless/static:nonroot
 
-COPY --from=builder /sandbox-router /sandbox-router
+COPY --from=builder /tmp/sandbox-router /sandbox-router
 
 # Document the default ports the binary listens on. Operators can override
 # via --http-bind-address / --https-bind-address / --metrics-bind-address /
