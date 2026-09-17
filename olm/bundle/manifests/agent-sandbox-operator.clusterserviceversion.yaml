@@ -296,8 +296,24 @@ spec:
           - patch
           - update
           - watch
+        - apiGroups:
+          - config.openshift.io
+          resources:
+          - apiservers
+          verbs:
+          - get
+          - list
+          - watch
         serviceAccountName: agent-sandbox-controller
       - rules:
+        - apiGroups:
+          - config.openshift.io
+          resources:
+          - apiservers
+          verbs:
+          - get
+          - list
+          - watch
         - apiGroups:
           - ""
           resources:
@@ -326,10 +342,13 @@ spec:
               - args:
                 - --leader-elect=true
                 - --extensions
+                - --metrics-secure-serving
+                - --metrics-bind-address=:8443
+                - --metrics-cert-dir=/etc/metrics-certs
                 image: registry.k8s.io/agent-sandbox/agent-sandbox-controller:v1.0.5
                 name: agent-sandbox-controller
                 ports:
-                - containerPort: 8080
+                - containerPort: 8443
                   name: metrics
                   protocol: TCP
                 - containerPort: 8081
@@ -340,12 +359,18 @@ spec:
                 - mountPath: /etc/sandbox-config
                   name: config-volume
                   readOnly: true
+                - mountPath: /etc/metrics-certs
+                  name: metrics-certs
+                  readOnly: true
               serviceAccountName: agent-sandbox-controller
               volumes:
               - configMap:
                   name: agent-sandbox-config
                   optional: true
                 name: config-volume
+              - name: metrics-certs
+                secret:
+                  secretName: agent-sandbox-metrics-tls
       - label:
           app: sandbox-router
           app.kubernetes.io/component: sandbox-router
@@ -372,7 +397,11 @@ spec:
               automountServiceAccountToken: false
               containers:
               - args:
-                - --http-bind-address=:8080
+                - --http-bind-address=
+                - --https-bind-address=:8443
+                - --tls-cert-file=/etc/tls/tls.crt
+                - --tls-key-file=/etc/tls/tls.key
+                - --metrics-secure-serving
                 - --metrics-bind-address=:9090
                 - --health-probe-bind-address=:8081
                 - --cluster-domain=cluster.local
@@ -390,8 +419,8 @@ spec:
                   periodSeconds: 10
                 name: sandbox-router
                 ports:
-                - containerPort: 8080
-                  name: proxy
+                - containerPort: 8443
+                  name: proxy-tls
                   protocol: TCP
                 - containerPort: 9090
                   name: metrics
@@ -460,6 +489,9 @@ spec:
                           apiVersion: v1
                           fieldPath: metadata.namespace
                         path: namespace
+              - name: tls-certs
+                secret:
+                  secretName: sandbox-router-tls
     strategy: deployment
   installModes:
   - supported: false

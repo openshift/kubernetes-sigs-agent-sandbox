@@ -1,6 +1,8 @@
 apiVersion: v1
 kind: Service
 metadata:
+  annotations:
+    service.beta.openshift.io/serving-cert-secret-name: agent-sandbox-metrics-tls
   creationTimestamp: null
   labels:
     app: agent-sandbox-controller
@@ -8,7 +10,7 @@ metadata:
 spec:
   ports:
   - name: metrics
-    port: 8080
+    port: 8443
     protocol: TCP
     targetPort: metrics
   selector:

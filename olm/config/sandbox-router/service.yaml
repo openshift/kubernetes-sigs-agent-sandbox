@@ -10,6 +10,8 @@ metadata:
   labels:
     app.kubernetes.io/name: sandbox-router
     app.kubernetes.io/component: sandbox-router
+  annotations:
+    service.beta.openshift.io/serving-cert-secret-name: sandbox-router-tls
 spec:
   type: ClusterIP
   selector:
@@ -20,8 +22,7 @@ spec:
     port: 8080
     targetPort: proxy
     protocol: TCP
-  # Uncomment when --https-bind-address=:8443 is set on the router.
-  # - name: proxy-tls
-  #   port: 8443
-  #   targetPort: 8443
-  #   protocol: TCP
+  - name: proxy-tls
+    port: 8443
+    targetPort: proxy-tls
+    protocol: TCP
