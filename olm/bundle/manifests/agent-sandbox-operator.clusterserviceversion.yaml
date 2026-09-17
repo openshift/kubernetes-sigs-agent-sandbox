@@ -77,7 +77,7 @@ metadata:
     capabilities: Basic Install
     categories: AI/Machine Learning
     containerImage: registry.k8s.io/agent-sandbox/agent-sandbox-controller:v1.0.5
-    createdAt: "2026-10-08T11:52:20Z"
+    createdAt: "2026-10-13T11:52:03Z"
     operatorframework.io/suggested-namespace: agent-sandbox-system
     operators.operatorframework.io/builder: operator-sdk-v1.42.2
     operators.operatorframework.io/project_layout: go.kubebuilder.io/v4
@@ -293,6 +293,14 @@ spec:
           - patch
           - update
           - watch
+        - apiGroups:
+          - config.openshift.io
+          resources:
+          - apiservers
+          verbs:
+          - get
+          - list
+          - watch
         serviceAccountName: agent-sandbox-controller
       - rules:
         - apiGroups:
@@ -323,10 +331,13 @@ spec:
               - args:
                 - --leader-elect=true
                 - --extensions
+                - --metrics-secure-serving
+                - --metrics-bind-address=:8443
+                - --metrics-cert-dir=/etc/metrics-certs
                 image: registry.k8s.io/agent-sandbox/agent-sandbox-controller:v1.0.5
                 name: agent-sandbox-controller
                 ports:
-                - containerPort: 8080
+                - containerPort: 8443
                   name: metrics
                   protocol: TCP
                 - containerPort: 8081
@@ -337,12 +348,18 @@ spec:
                 - mountPath: /etc/sandbox-config
                   name: config-volume
                   readOnly: true
+                - mountPath: /etc/metrics-certs
+                  name: metrics-certs
+                  readOnly: true
               serviceAccountName: agent-sandbox-controller
               volumes:
               - configMap:
                   name: agent-sandbox-config
                   optional: true
                 name: config-volume
+              - name: metrics-certs
+                secret:
+                  secretName: agent-sandbox-metrics-tls
       - label:
           app: sandbox-router
           app.kubernetes.io/component: sandbox-router
@@ -368,7 +385,10 @@ spec:
             spec:
               containers:
               - args:
-                - --http-bind-address=:8080
+                - --http-bind-address=
+                - --https-bind-address=:8443
+                - --tls-cert-file=/etc/tls/tls.crt
+                - --tls-key-file=/etc/tls/tls.key
                 - --metrics-bind-address=:9090
                 - --health-probe-bind-address=:8081
                 - --cluster-domain=cluster.local
@@ -386,8 +406,8 @@ spec:
                   periodSeconds: 10
                 name: sandbox-router
                 ports:
-                - containerPort: 8080
-                  name: proxy
+                - containerPort: 8443
+                  name: proxy-tls
                   protocol: TCP
                 - containerPort: 9090
                   name: metrics
@@ -418,6 +438,10 @@ spec:
                   runAsNonRoot: true
                   seccompProfile:
                     type: RuntimeDefault
+                volumeMounts:
+                - mountPath: /etc/tls
+                  name: tls-certs
+                  readOnly: true
               serviceAccountName: sandbox-router
               terminationGracePeriodSeconds: 45
               topologySpreadConstraints:
@@ -433,6 +457,10 @@ spec:
                 maxSkew: 1
                 topologyKey: kubernetes.io/hostname
                 whenUnsatisfiable: ScheduleAnyway
+              volumes:
+              - name: tls-certs
+                secret:
+                  secretName: sandbox-router-tls
     strategy: deployment
   installModes:
   - supported: false

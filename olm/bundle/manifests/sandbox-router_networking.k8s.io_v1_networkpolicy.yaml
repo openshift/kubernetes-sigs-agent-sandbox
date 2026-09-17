@@ -12,6 +12,17 @@ spec:
       protocol: UDP
     - port: 53
       protocol: TCP
+    - port: 5353
+      protocol: UDP
+    - port: 5353
+      protocol: TCP
+    to:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: kube-system
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: openshift-dns
   - ports:
     - protocol: TCP
     to:
@@ -34,12 +45,15 @@ spec:
   - from:
     - namespaceSelector: {}
     ports:
-    - port: 8080
+    - port: 8443
       protocol: TCP
   - from:
     - namespaceSelector:
         matchLabels:
           kubernetes.io/metadata.name: monitoring
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: openshift-monitoring
     ports:
     - port: 9090
       protocol: TCP
