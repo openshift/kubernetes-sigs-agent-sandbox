@@ -32,6 +32,8 @@ import (
 	// to ensure that exec-entrypoint and run can make use of them.
 	_ "k8s.io/client-go/plugin/pkg/client/auth"
 
+	configv1 "github.com/openshift/api/config/v1"
+
 	"github.com/felixge/fgprof"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/client-go/tools/events"
@@ -301,7 +303,8 @@ func main() {
 		setupLog.V(1).Info("leader election is enabled (--leader-elect=true), but --leader-election-namespace is empty; attempting auto-detection")
 	}
 
-	ctx := ctrl.SetupSignalHandler()
+	ctx, cancel := context.WithCancel(ctrl.SetupSignalHandler())
+	defer cancel()
 
 	// Initialize Tracing Provider
 	var instrumenter = asmetrics.NewNoOp()
@@ -344,6 +347,7 @@ func main() {
 	if extensions {
 		utilruntime.Must(extensionsv1beta1.AddToScheme(scheme))
 	}
+	utilruntime.Must(configv1.Install(scheme))
 
 	metricsOpts := metricsserver.Options{
 		BindAddress: metricsAddr,
@@ -453,6 +457,23 @@ func main() {
 			"connections", apiConnections)
 	}
 
+	// When secure serving is enabled without explicit TLS flags, try to read
+	// the cluster TLS profile from the OpenShift APIServer CR. On non-OpenShift
+	// clusters, the fetch fails and we fall back to Go defaults.
+	var initialTLSProfile configv1.TLSProfileSpec
+	var hasTLSProfile bool
+	if metricsSecureServing && tlsMinVersion == "" && tlsCipherSuites == "" {
+		tlsOpt, profile, err := fetchOpenShiftTLSProfile(ctx, restConfig)
+		if err != nil {
+			setupLog.Info("OpenShift TLS profile not available, using Go defaults", "reason", err.Error())
+		} else {
+			metricsOpts.TLSOpts = append(metricsOpts.TLSOpts, tlsOpt)
+			initialTLSProfile = profile
+			hasTLSProfile = true
+			setupLog.Info("OpenShift cluster TLS profile applied to metrics server")
+		}
+	}
+
 	mgrOpts := buildManagerOptions(scheme, metricsOpts, probeAddr, enableLeaderElection, leaderElectionNamespace)
 	// managedFields stripping, the Pod spec diet, and (optionally) the
 	// tracking-label scoping; see buildCacheOptions for the rationale.
@@ -477,6 +498,14 @@ func main() {
 	if err != nil {
 		setupLog.Error(err, "unable to start manager")
 		os.Exit(1)
+	}
+
+	if hasTLSProfile {
+		if err := setupSecurityProfileWatcher(mgr, initialTLSProfile, cancel); err != nil {
+			setupLog.Error(err, "unable to set up TLS profile watcher")
+			os.Exit(1)
+		}
+		setupLog.Info("watching for cluster TLS profile changes (graceful restart on change)")
 	}
 
 	// Register the custom Sandbox metric collector globally.

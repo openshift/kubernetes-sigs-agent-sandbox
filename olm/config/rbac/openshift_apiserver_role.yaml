@@ -1,0 +1,29 @@
+# RBAC for reading the OpenShift APIServer CR to fetch the cluster TLS
+# profile. Only needed on OpenShift; on vanilla Kubernetes the controller
+# gracefully falls back to Go defaults when the CRD is absent.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: agent-sandbox-controller-openshift-tls
+rules:
+- apiGroups:
+  - config.openshift.io
+  resources:
+  - apiservers
+  verbs:
+  - get
+  - list
+  - watch
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: agent-sandbox-controller-openshift-tls
+subjects:
+- kind: ServiceAccount
+  name: agent-sandbox-controller
+  namespace: agent-sandbox-system
+roleRef:
+  kind: ClusterRole
+  name: agent-sandbox-controller-openshift-tls
+  apiGroup: rbac.authorization.k8s.io
