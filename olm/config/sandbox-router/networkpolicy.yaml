@@ -48,15 +48,15 @@ spec:
     - namespaceSelector: {}
     ports:
     - protocol: TCP
-      port: 8080
-    # Uncomment when TLS is enabled:
-    # - protocol: TCP
-    #   port: 8443
+      port: 8443
   # Metrics scrape — restrict to your monitoring namespace.
   - from:
     - namespaceSelector:
         matchLabels:
           kubernetes.io/metadata.name: monitoring
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: openshift-monitoring
     ports:
     - protocol: TCP
       port: 9090
@@ -65,13 +65,26 @@ spec:
     - protocol: TCP
       port: 8081
   egress:
-  # DNS for resolving sandbox FQDNs. Port-only (no namespace restriction)
-  # because DNS services may run outside kube-system on some distributions.
-  - ports:
+  # DNS for resolving sandbox FQDNs. kube-system covers vanilla Kubernetes;
+  # openshift-dns covers OpenShift, where DNS services may run outside
+  # kube-system on some distributions.
+  - to:
+    - namespaceSelector:
+        matchExpressions:
+        - key: kubernetes.io/metadata.name
+          operator: In
+          values:
+          - kube-system
+          - openshift-dns
+    ports:
     - protocol: UDP
       port: 53
     - protocol: TCP
       port: 53
+    - protocol: UDP
+      port: 5353
+    - protocol: TCP
+      port: 5353
   # Forward traffic to sandbox pods. The upstream port is caller-specified
   # (X-Sandbox-Port header, default 8888; sandboxd gRPC listens on 9090) so
   # the port is unrestricted. Destinations are limited to pods that carry

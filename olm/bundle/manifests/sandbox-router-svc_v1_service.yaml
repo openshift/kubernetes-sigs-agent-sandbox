@@ -1,6 +1,8 @@
 apiVersion: v1
 kind: Service
 metadata:
+  annotations:
+    service.beta.openshift.io/serving-cert-secret-name: sandbox-router-tls
   creationTimestamp: null
   labels:
     app.kubernetes.io/component: sandbox-router
@@ -12,6 +14,10 @@ spec:
     port: 8080
     protocol: TCP
     targetPort: proxy
+  - name: proxy-tls
+    port: 8443
+    protocol: TCP
+    targetPort: proxy-tls
   selector:
     app.kubernetes.io/component: sandbox-router
     app.kubernetes.io/name: sandbox-router

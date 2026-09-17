@@ -32,7 +32,10 @@ import (
 	// to ensure that exec-entrypoint and run can make use of them.
 	_ "k8s.io/client-go/plugin/pkg/client/auth"
 
+	configv1 "github.com/openshift/api/config/v1"
+
 	"github.com/felixge/fgprof"
+	"k8s.io/apimachinery/pkg/api/meta"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/client-go/tools/events"
 	sandboxv1beta1 "sigs.k8s.io/agent-sandbox/api/v1beta1"
@@ -42,6 +45,7 @@ import (
 	"sigs.k8s.io/agent-sandbox/extensions/controllers/queue"
 	internalconfig "sigs.k8s.io/agent-sandbox/internal/config"
 	asmetrics "sigs.k8s.io/agent-sandbox/internal/metrics"
+	"sigs.k8s.io/agent-sandbox/internal/tlsutil"
 	"sigs.k8s.io/agent-sandbox/internal/version"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
@@ -301,7 +305,8 @@ func main() {
 		setupLog.V(1).Info("leader election is enabled (--leader-elect=true), but --leader-election-namespace is empty; attempting auto-detection")
 	}
 
-	ctx := ctrl.SetupSignalHandler()
+	ctx, cancel := context.WithCancel(ctrl.SetupSignalHandler())
+	defer cancel()
 
 	// Initialize Tracing Provider
 	var instrumenter = asmetrics.NewNoOp()
@@ -344,6 +349,7 @@ func main() {
 	if extensions {
 		utilruntime.Must(extensionsv1beta1.AddToScheme(scheme))
 	}
+	utilruntime.Must(configv1.Install(scheme))
 
 	metricsOpts := metricsserver.Options{
 		BindAddress: metricsAddr,
@@ -453,6 +459,46 @@ func main() {
 			"connections", apiConnections)
 	}
 
+	// When secure serving is enabled, try to read the cluster TLS profile
+	// and adherence policy from the OpenShift APIServer CR. On non-OpenShift
+	// clusters, the fetch fails and we fall back to Go defaults.
+	//
+	// When the adherence policy is StrictAllComponents, the cluster TLS
+	// profile is enforced even if explicit --tls-* flags are set.
+	var tlsState *tlsutil.OpenShiftTLSState
+	if metricsSecureServing {
+		state, err := tlsutil.FetchOpenShiftTLSProfile(ctx, restConfig, setupLog)
+		if err != nil {
+			setupLog.Info("OpenShift TLS profile not available, using Go defaults", "reason", err.Error())
+			// Register the watcher whenever the APIServer kind exists, even if
+			// this particular read failed (RBAC, transient API error). A later
+			// change — most importantly, enabling StrictAllComponents — must
+			// restart the process so the enforced profile is applied. On
+			// non-OpenShift clusters the kind is not served, so there is
+			// nothing to watch and registering the controller would only
+			// produce cache sync errors.
+			if !meta.IsNoMatchError(err) {
+				tlsState = &tlsutil.OpenShiftTLSState{}
+			}
+		} else {
+			strict := state.AdherencePolicy == configv1.TLSAdherencePolicyStrictAllComponents
+			if strict && (tlsMinVersion != "" || tlsCipherSuites != "") {
+				setupLog.Info("TLS adherence is StrictAllComponents: cluster TLS profile overrides CLI flags",
+					"tlsAdherence", state.AdherencePolicy)
+			}
+			if strict || (tlsMinVersion == "" && tlsCipherSuites == "") {
+				metricsOpts.TLSOpts = append(metricsOpts.TLSOpts, state.TLSOpt)
+				setupLog.Info("OpenShift cluster TLS profile applied to metrics server",
+					"tlsAdherence", state.AdherencePolicy)
+			}
+			// Watch even when the profile was not applied at startup (explicit
+			// --tls-* flags with a non-strict adherence policy): if an
+			// administrator later enforces the cluster profile, the process
+			// must restart to pick it up.
+			tlsState = state
+		}
+	}
+
 	mgrOpts := buildManagerOptions(scheme, metricsOpts, probeAddr, enableLeaderElection, leaderElectionNamespace)
 	// managedFields stripping, the Pod spec diet, and (optionally) the
 	// tracking-label scoping; see buildCacheOptions for the rationale.
@@ -477,6 +523,14 @@ func main() {
 	if err != nil {
 		setupLog.Error(err, "unable to start manager")
 		os.Exit(1)
+	}
+
+	if tlsState != nil {
+		if err := setupSecurityProfileWatcher(mgr, tlsState, cancel); err != nil {
+			setupLog.Error(err, "unable to set up TLS profile watcher")
+			os.Exit(1)
+		}
+		setupLog.Info("watching for cluster TLS profile and adherence policy changes (graceful restart on change)")
 	}
 
 	// Register the custom Sandbox metric collector globally.
