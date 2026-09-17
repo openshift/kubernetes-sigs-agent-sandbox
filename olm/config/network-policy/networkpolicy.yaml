@@ -34,7 +34,7 @@ spec:
   # Metrics scrape — open to all namespaces by default.
   - ports:
     - protocol: TCP
-      port: 8080   # Replace with 8443 when --metrics-secure-serving is enabled.
+      port: 8443   # Replace with 8443 when --metrics-secure-serving is enabled.
   # Kubelet health/readiness probes.
   - ports:
     - protocol: TCP
@@ -47,6 +47,16 @@ spec:
       port: 53
     - protocol: TCP
       port: 53
+  # OpenShift DNS — runs in openshift-dns namespace on port 5353.
+  - to:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: openshift-dns
+    ports:
+    - protocol: UDP
+      port: 5353
+    - protocol: TCP
+      port: 5353
   # Kubernetes API server — required for reconciliation and leader election.
   - ports:
     - protocol: TCP

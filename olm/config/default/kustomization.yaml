@@ -13,7 +13,7 @@ resources:
 # When --metrics-secure-serving is enabled, also update scheme and tlsConfig in
 # config/prometheus/monitor.yaml (see docs/configuration.md "Enabling secure
 # metrics end-to-end").
-# - ../prometheus
+- ../prometheus
 # [Optional] Controller NetworkPolicy: uncomment ../network-policy to deploy
 # ingress/egress restrictions for the controller pod. Required by compliance
 # frameworks (SOC 2, FedRAMP, PCI-DSS, CIS Kubernetes benchmarks) that mandate

@@ -24,10 +24,13 @@ spec:
       - args:
         - --leader-elect=true
         - --extensions
+        - --metrics-secure-serving
+        - --metrics-bind-address=:8443
+        - --metrics-cert-dir=/etc/metrics-certs
         image: controller:latest
         name: agent-sandbox-controller
         ports:
-        - containerPort: 8080
+        - containerPort: 8443
           name: metrics
           protocol: TCP
         - containerPort: 8081
@@ -37,9 +40,15 @@ spec:
         - mountPath: /etc/sandbox-config
           name: config-volume
           readOnly: true
+        - mountPath: /etc/metrics-certs
+          name: metrics-certs
+          readOnly: true
       serviceAccountName: agent-sandbox-controller
       volumes:
       - configMap:
           name: agent-sandbox-config
           optional: true
         name: config-volume
+      - name: metrics-certs
+        secret:
+          secretName: agent-sandbox-metrics-tls

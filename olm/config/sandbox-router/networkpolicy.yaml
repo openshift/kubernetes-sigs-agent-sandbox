@@ -58,6 +58,16 @@ spec:
       port: 53
     - protocol: TCP
       port: 53
+  # OpenShift DNS — runs in openshift-dns namespace on port 5353.
+  - to:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: openshift-dns
+    ports:
+    - protocol: UDP
+      port: 5353
+    - protocol: TCP
+      port: 5353
   # Forward traffic to sandbox pods. The upstream port is caller-specified
   # (X-Sandbox-Port header, default 8888) so the port is unrestricted.
   # Destinations are limited to pods that carry
