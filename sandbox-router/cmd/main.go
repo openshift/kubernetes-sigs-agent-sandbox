@@ -161,6 +161,12 @@ func run(cfg *config.Config, log logr.Logger) error {
 			}
 			log.Info("metrics server TLS enabled (--metrics-secure-serving)")
 		}
+
+		// On OpenShift, apply the cluster-wide TLS profile when no
+		// explicit version or ciphers were set via flags.
+		if cfg.TLSMinVersion == "" && len(cfg.TLSCipherSuites) == 0 {
+			ctx = tryApplyOpenShiftTLS(ctx, cfg.Kubeconfig, tlsConfig, log)
+		}
 	}
 
 	// --- Kubernetes client (shared by cache + tokenreview) ----------------
