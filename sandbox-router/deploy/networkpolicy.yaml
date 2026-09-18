@@ -34,10 +34,7 @@ spec:
     - namespaceSelector: {}
     ports:
     - protocol: TCP
-      port: 8080
-    # Uncomment when TLS is enabled:
-    # - protocol: TCP
-    #   port: 8443
+      port: 8443
   # Metrics scrape — restrict to your monitoring namespace.
   - from:
     - namespaceSelector:
