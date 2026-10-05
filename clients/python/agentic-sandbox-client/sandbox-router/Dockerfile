@@ -27,6 +27,11 @@ RUN pip install --no-cache-dir --require-hashes -r requirements.txt
 
 COPY sandbox_router.py .
 
+# Set the crypto policy to DEFAULT:PQ to comply with post-quantum crypto requirement
+# The tool is part of the package "crypto-policies-scripts", which is already
+# installed in our base image
+RUN update-crypto-policies --set DEFAULT:PQ
+
 # OpenShift runs containers as an arbitrary UID from the namespace range with GID 0.
 RUN chown -R 1001:0 /app && \
     chmod -R g+rwX /app
