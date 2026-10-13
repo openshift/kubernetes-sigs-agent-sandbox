@@ -31,48 +31,58 @@ import (
 )
 
 // tryApplyOpenShiftTLS attempts to read the cluster-wide TLS security profile
-// from the OpenShift APIServer CR and apply it to tlsConfig. If successful it
-// also starts a background goroutine that watches for profile changes and
-// cancels the returned context to trigger a graceful restart. On non-OpenShift
-// clusters the CRD does not exist and the original ctx is returned unchanged.
-func tryApplyOpenShiftTLS(ctx context.Context, kubeconfig string, tlsConfig *tls.Config, log logr.Logger) context.Context {
+// and adherence policy from the OpenShift APIServer CR and apply it to
+// tlsConfig. If successful it also starts a background goroutine that watches
+// for profile or adherence policy changes and cancels the returned context to
+// trigger a graceful restart. On non-OpenShift clusters the CRD does not exist
+// and the original ctx is returned unchanged.
+//
+// When cliTLSFlagsSet is true the caller has explicit TLS flags on the command
+// line. The cluster profile is still applied when the adherence policy is
+// StrictAllComponents (overriding CLI flags); otherwise it is skipped.
+func tryApplyOpenShiftTLS(ctx context.Context, kubeconfig string, tlsConfig *tls.Config, cliTLSFlagsSet bool, log logr.Logger) context.Context {
 	restCfg, err := loadRESTConfig(kubeconfig)
 	if err != nil {
 		return ctx
 	}
-	tlsOpt, profile, err := fetchOpenShiftTLSProfile(ctx, restCfg)
+	tlsOpt, profile, adherence, err := fetchOpenShiftTLSProfile(ctx, restCfg)
 	if err != nil {
 		log.V(4).Info("OpenShift TLS profile not available, using defaults", "error", err)
 		return ctx
 	}
-	tlsOpt(tlsConfig)
-	log.Info("applied OpenShift cluster TLS profile")
+
+	strict := adherence == configv1.TLSAdherencePolicyStrictAllComponents
+	if strict || !cliTLSFlagsSet {
+		tlsOpt(tlsConfig)
+		log.Info("applied OpenShift cluster TLS profile", "tlsAdherence", adherence)
+	}
 
 	ctx, cancel := context.WithCancel(ctx)
-	if err := watchAndExitOnTLSChange(ctx, restCfg, profile, cancel); err != nil {
+	if err := watchAndExitOnTLSChange(ctx, restCfg, profile, adherence, cancel); err != nil {
 		log.Error(err, "failed to start TLS profile watcher")
 	}
 	return ctx
 }
 
-// fetchOpenShiftTLSProfile reads the cluster-wide TLS security profile from
-// the OpenShift APIServer CR (apiserver.config.openshift.io/cluster). On
-// non-OpenShift clusters the CRD does not exist and this returns an error,
-// which callers treat as a no-op fallback to Go defaults.
-func fetchOpenShiftTLSProfile(ctx context.Context, cfg *rest.Config) (func(*tls.Config), *configv1.TLSSecurityProfile, error) {
+// fetchOpenShiftTLSProfile reads the cluster-wide TLS security profile and
+// adherence policy from the OpenShift APIServer CR
+// (apiserver.config.openshift.io/cluster). On non-OpenShift clusters the CRD
+// does not exist and this returns an error, which callers treat as a no-op
+// fallback to Go defaults.
+func fetchOpenShiftTLSProfile(ctx context.Context, cfg *rest.Config) (func(*tls.Config), *configv1.TLSSecurityProfile, configv1.TLSAdherencePolicy, error) {
 	s := runtime.NewScheme()
 	if err := configv1.Install(s); err != nil {
-		return nil, nil, err
+		return nil, nil, "", err
 	}
 
 	cl, err := client.New(cfg, client.Options{Scheme: s})
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, "", err
 	}
 
 	profileSpec, err := openshifttls.FetchAPIServerTLSProfile(ctx, cl)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, "", err
 	}
 
 	tlsOpt, unsupported := openshifttls.NewTLSConfigFromProfile(profileSpec)
@@ -80,18 +90,24 @@ func fetchOpenShiftTLSProfile(ctx context.Context, cfg *rest.Config) (func(*tls.
 		ctrl.Log.WithName("openshift-tls").Info("unsupported cipher suites in cluster TLS profile (skipped)", "ciphers", unsupported)
 	}
 
-	apiServer := &configv1.APIServer{}
-	if err := cl.Get(ctx, client.ObjectKey{Name: "cluster"}, apiServer); err != nil {
-		return nil, nil, fmt.Errorf("get APIServer: %w", err)
+	adherence, err := openshifttls.FetchAPIServerTLSAdherencePolicy(ctx, cl)
+	if err != nil {
+		ctrl.Log.WithName("openshift-tls").Info("could not fetch TLS adherence policy, defaulting to no-opinion", "reason", err.Error())
 	}
 
-	return tlsOpt, apiServer.Spec.TLSSecurityProfile, nil
+	apiServer := &configv1.APIServer{}
+	if err := cl.Get(ctx, client.ObjectKey{Name: "cluster"}, apiServer); err != nil {
+		return nil, nil, "", fmt.Errorf("get APIServer: %w", err)
+	}
+
+	return tlsOpt, apiServer.Spec.TLSSecurityProfile, adherence, nil
 }
 
 // watchAndExitOnTLSChange watches the APIServer CR for changes to the TLS
-// security profile. When a change is detected, it calls cancel() to trigger
-// a graceful shutdown so the pod restarts with the new profile.
-func watchAndExitOnTLSChange(ctx context.Context, cfg *rest.Config, current *configv1.TLSSecurityProfile, cancel context.CancelFunc) error {
+// security profile or adherence policy. When a change is detected, it calls
+// cancel() to trigger a graceful shutdown so the pod restarts with the new
+// configuration.
+func watchAndExitOnTLSChange(ctx context.Context, cfg *rest.Config, currentProfile *configv1.TLSSecurityProfile, currentAdherence configv1.TLSAdherencePolicy, cancel context.CancelFunc) error {
 	s := runtime.NewScheme()
 	if err := configv1.Install(s); err != nil {
 		return fmt.Errorf("install config scheme: %w", err)
@@ -125,8 +141,14 @@ func watchAndExitOnTLSChange(ctx context.Context, cfg *rest.Config, current *con
 				if !ok {
 					continue
 				}
-				if !equality.Semantic.DeepEqual(current, updated.Spec.TLSSecurityProfile) {
+				if !equality.Semantic.DeepEqual(currentProfile, updated.Spec.TLSSecurityProfile) {
 					log.Info("cluster TLS profile changed, triggering graceful restart")
+					cancel()
+					return
+				}
+				if currentAdherence != updated.Spec.TLSAdherence {
+					log.Info("cluster TLS adherence policy changed, triggering graceful restart",
+						"old", currentAdherence, "new", updated.Spec.TLSAdherence)
 					cancel()
 					return
 				}
