@@ -51,7 +51,7 @@ RUN CGO_ENABLED=0 GOOS=linux GOARCH=${TARGETARCH} go build \
     -o /tmp/sandbox-router ./sandbox-router/cmd
 
 # Final image: distroless static so we ship only the binary plus minimal runtime.
-FROM gcr.io/distroless/static:nonroot
+FROM registry.redhat.io/ubi9/ubi-minimal-pqc:9.8-1790840388
 
 COPY --from=builder /tmp/sandbox-router /sandbox-router
 
