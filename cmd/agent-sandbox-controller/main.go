@@ -457,20 +457,29 @@ func main() {
 			"connections", apiConnections)
 	}
 
-	// When secure serving is enabled without explicit TLS flags, try to read
-	// the cluster TLS profile from the OpenShift APIServer CR. On non-OpenShift
+	// When secure serving is enabled, try to read the cluster TLS profile
+	// and adherence policy from the OpenShift APIServer CR. On non-OpenShift
 	// clusters, the fetch fails and we fall back to Go defaults.
-	var initialTLSProfile configv1.TLSProfileSpec
-	var hasTLSProfile bool
-	if metricsSecureServing && tlsMinVersion == "" && tlsCipherSuites == "" {
-		tlsOpt, profile, err := fetchOpenShiftTLSProfile(ctx, restConfig)
+	//
+	// When the adherence policy is StrictAllComponents, the cluster TLS
+	// profile is enforced even if explicit --tls-* flags are set.
+	var tlsState *openShiftTLSState
+	if metricsSecureServing {
+		state, err := fetchOpenShiftTLSProfile(ctx, restConfig)
 		if err != nil {
 			setupLog.Info("OpenShift TLS profile not available, using Go defaults", "reason", err.Error())
 		} else {
-			metricsOpts.TLSOpts = append(metricsOpts.TLSOpts, tlsOpt)
-			initialTLSProfile = profile
-			hasTLSProfile = true
-			setupLog.Info("OpenShift cluster TLS profile applied to metrics server")
+			strict := state.adherencePolicy == configv1.TLSAdherencePolicyStrictAllComponents
+			if strict && (tlsMinVersion != "" || tlsCipherSuites != "") {
+				setupLog.Info("TLS adherence is StrictAllComponents: cluster TLS profile overrides CLI flags",
+					"tlsAdherence", state.adherencePolicy)
+			}
+			if strict || (tlsMinVersion == "" && tlsCipherSuites == "") {
+				metricsOpts.TLSOpts = append(metricsOpts.TLSOpts, state.tlsOpt)
+				tlsState = state
+				setupLog.Info("OpenShift cluster TLS profile applied to metrics server",
+					"tlsAdherence", state.adherencePolicy)
+			}
 		}
 	}
 
@@ -500,12 +509,12 @@ func main() {
 		os.Exit(1)
 	}
 
-	if hasTLSProfile {
-		if err := setupSecurityProfileWatcher(mgr, initialTLSProfile, cancel); err != nil {
+	if tlsState != nil {
+		if err := setupSecurityProfileWatcher(mgr, tlsState, cancel); err != nil {
 			setupLog.Error(err, "unable to set up TLS profile watcher")
 			os.Exit(1)
 		}
-		setupLog.Info("watching for cluster TLS profile changes (graceful restart on change)")
+		setupLog.Info("watching for cluster TLS profile and adherence policy changes (graceful restart on change)")
 	}
 
 	// Register the custom Sandbox metric collector globally.

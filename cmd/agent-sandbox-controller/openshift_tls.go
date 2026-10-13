@@ -26,24 +26,33 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
-// fetchOpenShiftTLSProfile reads the cluster-wide TLS security profile from
-// the OpenShift APIServer CR (apiserver.config.openshift.io/cluster). On
-// non-OpenShift clusters the CRD does not exist and this returns an error,
-// which callers treat as a no-op fallback to Go defaults.
-func fetchOpenShiftTLSProfile(ctx context.Context, cfg *rest.Config) (func(*tls.Config), configv1.TLSProfileSpec, error) {
+// openShiftTLSState bundles the TLS profile and adherence policy fetched from
+// the OpenShift APIServer CR at startup.
+type openShiftTLSState struct {
+	tlsOpt          func(*tls.Config)
+	profileSpec     configv1.TLSProfileSpec
+	adherencePolicy configv1.TLSAdherencePolicy
+}
+
+// fetchOpenShiftTLSProfile reads the cluster-wide TLS security profile and
+// adherence policy from the OpenShift APIServer CR
+// (apiserver.config.openshift.io/cluster). On non-OpenShift clusters the CRD
+// does not exist and this returns an error, which callers treat as a no-op
+// fallback to Go defaults.
+func fetchOpenShiftTLSProfile(ctx context.Context, cfg *rest.Config) (*openShiftTLSState, error) {
 	s := runtime.NewScheme()
 	if err := configv1.Install(s); err != nil {
-		return nil, configv1.TLSProfileSpec{}, err
+		return nil, err
 	}
 
 	tempClient, err := client.New(cfg, client.Options{Scheme: s})
 	if err != nil {
-		return nil, configv1.TLSProfileSpec{}, err
+		return nil, err
 	}
 
 	profileSpec, err := openshifttls.FetchAPIServerTLSProfile(ctx, tempClient)
 	if err != nil {
-		return nil, configv1.TLSProfileSpec{}, err
+		return nil, err
 	}
 
 	tlsOpt, unsupported := openshifttls.NewTLSConfigFromProfile(profileSpec)
@@ -51,19 +60,34 @@ func fetchOpenShiftTLSProfile(ctx context.Context, cfg *rest.Config) (func(*tls.
 		setupLog.Info("unsupported cipher suites in cluster TLS profile (skipped)", "ciphers", unsupported)
 	}
 
-	return tlsOpt, profileSpec, nil
+	adherence, err := openshifttls.FetchAPIServerTLSAdherencePolicy(ctx, tempClient)
+	if err != nil {
+		setupLog.Info("could not fetch TLS adherence policy, defaulting to no-opinion", "reason", err.Error())
+	}
+
+	return &openShiftTLSState{
+		tlsOpt:          tlsOpt,
+		profileSpec:     profileSpec,
+		adherencePolicy: adherence,
+	}, nil
 }
 
 // setupSecurityProfileWatcher registers a controller that watches the
-// APIServer CR for TLS profile changes. When the profile changes, it
-// cancels the manager context to trigger a graceful restart — the pod
-// restarts with the updated profile.
-func setupSecurityProfileWatcher(mgr ctrl.Manager, initialProfile configv1.TLSProfileSpec, cancel context.CancelFunc) error {
+// APIServer CR for TLS profile and adherence policy changes. When either
+// changes, it cancels the manager context to trigger a graceful restart —
+// the pod restarts with the updated configuration.
+func setupSecurityProfileWatcher(mgr ctrl.Manager, state *openShiftTLSState, cancel context.CancelFunc) error {
 	watcher := &openshifttls.SecurityProfileWatcher{
-		Client:                mgr.GetClient(),
-		InitialTLSProfileSpec: initialProfile,
+		Client:                    mgr.GetClient(),
+		InitialTLSProfileSpec:     state.profileSpec,
+		InitialTLSAdherencePolicy: state.adherencePolicy,
 		OnProfileChange: func(_ context.Context, _, _ configv1.TLSProfileSpec) {
 			setupLog.Info("cluster TLS profile changed, triggering graceful restart")
+			cancel()
+		},
+		OnAdherencePolicyChange: func(_ context.Context, old, new configv1.TLSAdherencePolicy) {
+			setupLog.Info("cluster TLS adherence policy changed, triggering graceful restart",
+				"old", old, "new", new)
 			cancel()
 		},
 	}
