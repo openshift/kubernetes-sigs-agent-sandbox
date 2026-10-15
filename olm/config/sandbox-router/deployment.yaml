@@ -34,7 +34,7 @@ spec:
         prometheus.io/path: "/metrics"
         # Uncomment when --metrics-secure-serving is enabled so scrapers
         # use HTTPS. The scraper must trust the metrics serving certificate.
-        prometheus.io/scheme: "https"
+        # prometheus.io/scheme: "https"
     spec:
       serviceAccountName: sandbox-router
       # Spread replicas across nodes/zones so a single failure doesn't take
