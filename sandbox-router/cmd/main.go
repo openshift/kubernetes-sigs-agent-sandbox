@@ -166,7 +166,8 @@ func run(cfg *config.Config, log logr.Logger) error {
 		// adherence policy is StrictAllComponents the cluster profile
 		// overrides CLI flags; otherwise apply only when no explicit
 		// version or ciphers were set.
-		ctx = tryApplyOpenShiftTLS(ctx, cfg.Kubeconfig, tlsConfig,
+		ctx = tryApplyOpenShiftTLS(ctx, cfg.Kubeconfig,
+			[]*tls.Config{tlsConfig, metricsTLSConfig},
 			cfg.TLSMinVersion != "" || len(cfg.TLSCipherSuites) > 0, log)
 	}
 

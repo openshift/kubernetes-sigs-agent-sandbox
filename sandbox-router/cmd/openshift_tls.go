@@ -31,16 +31,17 @@ import (
 )
 
 // tryApplyOpenShiftTLS attempts to read the cluster-wide TLS security profile
-// and adherence policy from the OpenShift APIServer CR and apply it to
-// tlsConfig. If successful it also starts a background goroutine that watches
-// for profile or adherence policy changes and cancels the returned context to
-// trigger a graceful restart. On non-OpenShift clusters the CRD does not exist
-// and the original ctx is returned unchanged.
+// and adherence policy from the OpenShift APIServer CR and apply it to every
+// non-nil TLS config (proxy and metrics). If successful it also starts a
+// background goroutine that watches for profile or adherence policy changes
+// and cancels the returned context to trigger a graceful restart. On
+// non-OpenShift clusters the CRD does not exist and the original ctx is
+// returned unchanged.
 //
 // When cliTLSFlagsSet is true the caller has explicit TLS flags on the command
 // line. The cluster profile is still applied when the adherence policy is
 // StrictAllComponents (overriding CLI flags); otherwise it is skipped.
-func tryApplyOpenShiftTLS(ctx context.Context, kubeconfig string, tlsConfig *tls.Config, cliTLSFlagsSet bool, log logr.Logger) context.Context {
+func tryApplyOpenShiftTLS(ctx context.Context, kubeconfig string, tlsConfigs []*tls.Config, cliTLSFlagsSet bool, log logr.Logger) context.Context {
 	restCfg, err := loadRESTConfig(kubeconfig)
 	if err != nil {
 		return ctx
@@ -53,7 +54,11 @@ func tryApplyOpenShiftTLS(ctx context.Context, kubeconfig string, tlsConfig *tls
 
 	strict := adherence == configv1.TLSAdherencePolicyStrictAllComponents
 	if strict || !cliTLSFlagsSet {
-		tlsOpt(tlsConfig)
+		for _, tc := range tlsConfigs {
+			if tc != nil {
+				tlsOpt(tc)
+			}
+		}
 		log.Info("applied OpenShift cluster TLS profile", "tlsAdherence", adherence)
 	}
 
