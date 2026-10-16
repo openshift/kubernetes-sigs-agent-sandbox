@@ -23,6 +23,9 @@ subjects:
 - kind: ServiceAccount
   name: agent-sandbox-controller
   namespace: agent-sandbox-system
+- kind: ServiceAccount
+  name: sandbox-router
+  namespace: agent-sandbox-system
 roleRef:
   kind: ClusterRole
   name: agent-sandbox-controller-openshift-tls

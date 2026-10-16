@@ -304,6 +304,14 @@ spec:
         serviceAccountName: agent-sandbox-controller
       - rules:
         - apiGroups:
+          - config.openshift.io
+          resources:
+          - apiservers
+          verbs:
+          - get
+          - list
+          - watch
+        - apiGroups:
           - ""
           resources:
           - pods
