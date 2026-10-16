@@ -60,12 +60,12 @@ spec:
         image: registry.k8s.io/agent-sandbox/sandbox-router-go:latest
         imagePullPolicy: IfNotPresent
         args:
-        - --http-bind-address=:8080
+        - --http-bind-address=
         # Uncomment to enable TLS:
-        # - --https-bind-address=:8443
-        # - --tls-cert-file=/tls/tls.crt
-        # - --tls-key-file=/tls/tls.key
-        # - --metrics-secure-serving
+        - --https-bind-address=:8443
+        - --tls-cert-file=/etc/tls/tls.crt
+        - --tls-key-file=/etc/tls/tls.key
+        - --metrics-secure-serving
         - --metrics-bind-address=:9090
         - --health-probe-bind-address=:8081
         - --cluster-domain=cluster.local
@@ -79,8 +79,8 @@ spec:
         # rbac.yaml) to fall back to DNS-only routing.
         - --cache-enabled=true
         ports:
-        - name: proxy
-          containerPort: 8080
+        - name: proxy-tls
+          containerPort: 8443
           protocol: TCP
         # Uncomment to enable TLS:
         # - name: proxy-tls
@@ -118,6 +118,10 @@ spec:
           limits:
             cpu: "2"
             memory: 1Gi
+        volumeMounts:
+        - name: tls-certs
+          mountPath: /etc/tls
+          readOnly: true
         securityContext:
           allowPrivilegeEscalation: false
           readOnlyRootFilesystem: true
@@ -134,4 +138,8 @@ spec:
       # Give in-flight requests a chance to finish before the kubelet
       # delivers SIGKILL. The router's own --shutdown-timeout defaults to
       # 30s; keep this slightly larger.
+      volumes:
+      - name: tls-certs
+        secret:
+          secretName: sandbox-router-tls
       terminationGracePeriodSeconds: 45
