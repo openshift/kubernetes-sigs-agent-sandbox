@@ -4,7 +4,7 @@ set -xe
 
 OCP_VERSIONS=$1
 
-test -n "$OCP_VERSIONS" || OCP_VERSIONS="v4.*"
+test -n "$OCP_VERSIONS" || OCP_VERSIONS="v*"
 
 BUILD_REGISTRY="quay.io/redhat-user-workloads/ose-osc-tenant/"
 RELEASE_REGISTRY="registry.redhat.io/agent-sandbox/"
