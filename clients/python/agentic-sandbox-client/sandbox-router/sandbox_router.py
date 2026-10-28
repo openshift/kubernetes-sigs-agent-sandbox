@@ -22,13 +22,6 @@ import secrets
 import time
 
 import httpx
-<<<<<<< HEAD
-from starlette.applications import Starlette
-from starlette.exceptions import HTTPException
-from starlette.requests import Request
-from starlette.responses import JSONResponse, StreamingResponse
-from starlette.routing import Route
-=======
 import websockets
 from fastapi import FastAPI, Request, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import StreamingResponse
@@ -36,7 +29,6 @@ from websockets.exceptions import ConnectionClosed, PayloadTooBig
 
 # Initialize the FastAPI application
 app = FastAPI()
->>>>>>> umain
 
 # Configuration
 MIN_TCP_PORT = 1
