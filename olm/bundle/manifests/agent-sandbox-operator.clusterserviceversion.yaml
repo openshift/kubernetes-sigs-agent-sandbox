@@ -455,6 +455,9 @@ spec:
                 - mountPath: /var/run/secrets/kubernetes.io/serviceaccount
                   name: kubernetes-api-access
                   readOnly: true
+                - mountPath: /etc/tls
+                  name: tls-certs
+                  readOnly: true
               serviceAccountName: sandbox-router
               terminationGracePeriodSeconds: 45
               topologySpreadConstraints:

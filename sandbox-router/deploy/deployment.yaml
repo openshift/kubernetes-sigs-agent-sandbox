@@ -100,10 +100,9 @@ spec:
         - name: kubernetes-api-access
           mountPath: /var/run/secrets/kubernetes.io/serviceaccount
           readOnly: true
-        # Uncomment to enable TLS mounts:
-        # - name: tls-certs
-        #   mountPath: /tls
-        #   readOnly: true
+        - name: tls-certs
+          mountPath: /etc/tls
+          readOnly: true
         livenessProbe:
           httpGet:
             path: /healthz
@@ -125,10 +124,6 @@ spec:
           limits:
             cpu: "2"
             memory: 1Gi
-        volumeMounts:
-        - name: tls-certs
-          mountPath: /etc/tls
-          readOnly: true
         securityContext:
           allowPrivilegeEscalation: false
           readOnlyRootFilesystem: true
@@ -160,15 +155,10 @@ spec:
                   apiVersion: v1
                   fieldPath: metadata.namespace
                 path: namespace
-      # Uncomment to provide TLS certificates via Secret:
-      # - name: tls-certs
-      #   secret:
-      #     secretName: sandbox-router-tls
-      # Give in-flight requests a chance to finish before the kubelet
-      # delivers SIGKILL. The router's own --shutdown-timeout defaults to
-      # 30s; keep this slightly larger.
-      volumes:
       - name: tls-certs
         secret:
           secretName: sandbox-router-tls
+      # Give in-flight requests a chance to finish before the kubelet
+      # delivers SIGKILL. The router's own --shutdown-timeout defaults to
+      # 30s; keep this slightly larger.
       terminationGracePeriodSeconds: 45
