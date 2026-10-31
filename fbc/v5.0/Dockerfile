@@ -1,9 +1,9 @@
-FROM registry.redhat.io/openshift5/ose-operator-registry-rhel9:v5.0 as builder
+FROM registry.redhat.io/openshift5/ose-operator-registry-rhel9:v5.1.0 as builder
 
 ADD catalog/ /configs
 RUN ["/bin/opm", "serve", "/configs", "--cache-dir=/tmp/cache", "--cache-only"]
 
-FROM registry.redhat.io/openshift5/ose-operator-registry-rhel9:v5.0
+FROM registry.redhat.io/openshift5/ose-operator-registry-rhel9:v5.1.0
 
 ENTRYPOINT ["/bin/opm"]
 CMD ["serve", "/configs", "--cache-dir=/tmp/cache"]
