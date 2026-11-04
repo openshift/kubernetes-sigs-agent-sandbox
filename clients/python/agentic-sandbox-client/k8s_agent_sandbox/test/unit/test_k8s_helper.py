@@ -12,17 +12,74 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
+import tempfile
 import unittest
 from unittest.mock import MagicMock, patch
 
+from kubernetes import client
+from kubernetes.config import incluster_config
+import urllib3.exceptions
+from pydantic import ValidationError
+from k8s_agent_sandbox.models import AdditionalPodMetadata
 from k8s_agent_sandbox.k8s_helper import K8sHelper
-from k8s_agent_sandbox.exceptions import SandboxMetadataError, SandboxTemplateNotFoundError
+from k8s_agent_sandbox.exceptions import SandboxClaimFailedError, SandboxMetadataError, SandboxTemplateNotFoundError
+from k8s_agent_sandbox.constants import CLIENT_REQUEST_TIME_ANNOTATION
+from k8s_agent_sandbox.models import SandboxClaimEnvVar
 
 
 @patch("k8s_agent_sandbox.k8s_helper.client.CoreV1Api")
 @patch("k8s_agent_sandbox.k8s_helper.client.CustomObjectsApi")
 @patch("k8s_agent_sandbox.k8s_helper.config")
 class TestK8sHelperCreateSandboxClaim(unittest.TestCase):
+
+    def test_env_var_model_serializes_container_name_alias(self, mock_config, mock_api_cls, mock_core_cls):
+        env_var = SandboxClaimEnvVar(
+            name="FOO", value="bar", container_name="runtime"
+        )
+
+        self.assertEqual(
+            env_var.model_dump(by_alias=True, exclude_none=True),
+            {"name": "FOO", "value": "bar", "containerName": "runtime"},
+        )
+
+    def test_env_var_model_rejects_non_string_values(self, mock_config, mock_api_cls, mock_core_cls):
+        with self.assertRaises(ValidationError):
+            SandboxClaimEnvVar(name="FOO", value=1)
+
+    def test_env_var_model_accepts_kubernetes_env_var_names(self, mock_config, mock_api_cls, mock_core_cls):
+        valid_names = ["FOO", "_FOO", "my.env-name", "MY_ENV.NAME", "MyEnvName1"]
+
+        for name in valid_names:
+            self.assertEqual(SandboxClaimEnvVar(name=name, value="bar").name, name)
+
+    def test_env_var_model_rejects_invalid_names(self, mock_config, mock_api_cls, mock_core_cls):
+        invalid_names = ["", "1FOO", "BAD NAME", "BAD=NAME", ".", "..", "..FOO"]
+
+        for name in invalid_names:
+            with self.assertRaises(ValidationError):
+                SandboxClaimEnvVar(name=name, value="bar")
+
+    def test_env_included_in_manifest(self, mock_config, mock_api_cls, mock_core_cls):
+        mock_api = MagicMock()
+        mock_api_cls.return_value = mock_api
+
+        helper = K8sHelper()
+        helper.create_sandbox_claim(
+            "test-claim",
+            "test-warmpool",
+            "test-namespace",
+            env={"FOO": "bar", "DEBUG": "true"},
+        )
+
+        body = mock_api.create_namespaced_custom_object.call_args.kwargs["body"]
+        self.assertEqual(
+            body["spec"]["env"],
+            [
+                {"name": "FOO", "value": "bar"},
+                {"name": "DEBUG", "value": "true"},
+            ],
+        )
 
     def test_labels_and_annotations_coexist_in_manifest(self, mock_config, mock_api_cls, mock_core_cls):
         mock_api = MagicMock()
@@ -37,8 +94,9 @@ class TestK8sHelperCreateSandboxClaim(unittest.TestCase):
 
         mock_api.create_namespaced_custom_object.assert_called_once()
         body = mock_api.create_namespaced_custom_object.call_args.kwargs["body"]
-        self.assertEqual(body["metadata"]["annotations"], {"opentelemetry.io/trace-context": "trace-data"})
-        self.assertEqual(body["metadata"]["labels"], {"agent": "code-agent", "team": "platform"})
+        self.assertEqual(body["metadata"]["annotations"]["opentelemetry.io/trace-context"], "trace-data")
+        self.assertIn(CLIENT_REQUEST_TIME_ANNOTATION, body["metadata"]["annotations"])
+        self.assertEqual(body["metadata"]["labels"], {"agent": "code-agent", "team": "platform", "agents.x-k8s.io/created-by": "python-client"})
 
     def test_labels_only_no_annotations(self, mock_config, mock_api_cls, mock_core_cls):
         mock_api = MagicMock()
@@ -51,8 +109,8 @@ class TestK8sHelperCreateSandboxClaim(unittest.TestCase):
         )
 
         body = mock_api.create_namespaced_custom_object.call_args.kwargs["body"]
-        self.assertEqual(body["metadata"]["annotations"], {})
-        self.assertEqual(body["metadata"]["labels"], {"agent": "code-agent"})
+        self.assertEqual(set(body["metadata"]["annotations"].keys()), {CLIENT_REQUEST_TIME_ANNOTATION})
+        self.assertEqual(body["metadata"]["labels"], {"agent": "code-agent", "agents.x-k8s.io/created-by": "python-client"})
 
     def test_no_labels_no_annotations(self, mock_config, mock_api_cls, mock_core_cls):
         mock_api = MagicMock()
@@ -62,8 +120,21 @@ class TestK8sHelperCreateSandboxClaim(unittest.TestCase):
         helper.create_sandbox_claim("test-claim", "test-warmpool", "test-namespace")
 
         body = mock_api.create_namespaced_custom_object.call_args.kwargs["body"]
-        self.assertEqual(body["metadata"]["annotations"], {})
-        self.assertNotIn("labels", body["metadata"])
+        self.assertEqual(set(body["metadata"]["annotations"].keys()), {CLIENT_REQUEST_TIME_ANNOTATION})
+        self.assertEqual(body["metadata"]["labels"], {"agents.x-k8s.io/created-by": "python-client"})
+
+    def test_created_by_label_override_rejected(self, mock_config, mock_api_cls, mock_core_cls):
+        mock_api = MagicMock()
+        mock_api_cls.return_value = mock_api
+
+        helper = K8sHelper()
+        helper.create_sandbox_claim(
+            "test-claim", "test-warmpool", "test-namespace",
+            labels={"agent": "code-agent", "agents.x-k8s.io/created-by": "foo"},
+        )
+
+        body = mock_api.create_namespaced_custom_object.call_args.kwargs["body"]
+        self.assertEqual(body["metadata"]["labels"], {"agent": "code-agent", "agents.x-k8s.io/created-by": "python-client"})
 
     def test_lifecycle_included_in_manifest(self, mock_config, mock_api_cls, mock_core_cls):
         mock_api = MagicMock()
@@ -91,6 +162,47 @@ class TestK8sHelperCreateSandboxClaim(unittest.TestCase):
 
         body = mock_api.create_namespaced_custom_object.call_args.kwargs["body"]
         self.assertNotIn("lifecycle", body["spec"])
+
+    def test_pod_metadata_included_in_manifest(self, mock_config, mock_api_cls, mock_core_cls):
+        mock_api = MagicMock()
+        mock_api_cls.return_value = mock_api
+
+        pod_metadata = AdditionalPodMetadata(labels={"client-id": "tenant-a"})
+        helper = K8sHelper()
+        helper.create_sandbox_claim(
+            "test-claim", "test-warmpool", "test-namespace", pod_metadata=pod_metadata
+        )
+
+        body = mock_api.create_namespaced_custom_object.call_args.kwargs["body"]
+        self.assertEqual(
+            body["spec"]["additionalPodMetadata"]["labels"]["client-id"], "tenant-a"
+        )
+
+    def test_pod_metadata_dict_backward_compatible(self, mock_config, mock_api_cls, mock_core_cls):
+        mock_api = MagicMock()
+        mock_api_cls.return_value = mock_api
+
+        helper = K8sHelper()
+        helper.create_sandbox_claim(
+            "test-claim", "test-warmpool", "test-namespace",
+            pod_metadata={"labels": {"client-id": "tenant-a"}, "annotations": {"a": "b"}},
+        )
+
+        body = mock_api.create_namespaced_custom_object.call_args.kwargs["body"]
+        self.assertEqual(
+            body["spec"]["additionalPodMetadata"],
+            {"labels": {"client-id": "tenant-a"}, "annotations": {"a": "b"}},
+        )
+
+    def test_no_pod_metadata_omits_key(self, mock_config, mock_api_cls, mock_core_cls):
+        mock_api = MagicMock()
+        mock_api_cls.return_value = mock_api
+
+        helper = K8sHelper()
+        helper.create_sandbox_claim("test-claim", "test-warmpool", "test-namespace")
+
+        body = mock_api.create_namespaced_custom_object.call_args.kwargs["body"]
+        self.assertNotIn("additionalPodMetadata", body["spec"])
 
 
 @patch("k8s_agent_sandbox.k8s_helper.client.CoreV1Api")
@@ -144,8 +256,839 @@ class TestK8sHelperResolveSandboxName(unittest.TestCase):
         
         with self.assertRaises(SandboxMetadataError) as context:
             helper.resolve_sandbox_name("test-claim", "default", timeout=5)
-            
+
         self.assertIn("SandboxClaim 'test-claim' was deleted while resolving sandbox name", str(context.exception))
+
+    @patch("k8s_agent_sandbox.k8s_helper.watch.Watch")
+    def test_wait_for_claim_ready_single_event(self, mock_watch_class, mock_config, mock_api_cls, mock_core_cls):
+        """Warm-pool fast path: name + Ready arrive in one claim status update."""
+        mock_watch = MagicMock()
+        mock_event = {
+            "type": "MODIFIED",
+            "object": {
+                "metadata": {"name": "test-claim"},
+                "status": {
+                    "conditions": [{"type": "Ready", "status": "True"}],
+                    "sandbox": {"name": "warm-sandbox-1", "podIPs": ["10.0.0.5"]},
+                },
+            },
+        }
+        mock_watch.stream.return_value = [mock_event]
+        mock_watch_class.return_value = mock_watch
+
+        helper = K8sHelper()
+        name = helper.wait_for_claim_ready("test-claim", "default", timeout=5)
+
+        self.assertEqual(name, "warm-sandbox-1")
+        # Only the claim is watched; no call against the Sandbox resource.
+        self.assertEqual(mock_watch_class.call_count, 1)
+
+    @patch("k8s_agent_sandbox.k8s_helper.watch.Watch")
+    def test_wait_for_claim_ready_name_before_ready(self, mock_watch_class, mock_config, mock_api_cls, mock_core_cls):
+        """Cold-start path: the name lands first, Ready arrives on a later event."""
+        mock_watch = MagicMock()
+        name_only_event = {
+            "type": "MODIFIED",
+            "object": {
+                "metadata": {"name": "test-claim"},
+                "status": {
+                    "conditions": [{"type": "Ready", "status": "False", "reason": "SandboxNotReady"}],
+                    "sandbox": {"name": "cold-sandbox-1"},
+                },
+            },
+        }
+        ready_event = {
+            "type": "MODIFIED",
+            "object": {
+                "metadata": {"name": "test-claim"},
+                "status": {
+                    "conditions": [{"type": "Ready", "status": "True"}],
+                    "sandbox": {"name": "cold-sandbox-1", "podIPs": ["10.0.0.9"]},
+                },
+            },
+        }
+        mock_watch.stream.return_value = [name_only_event, ready_event]
+        mock_watch_class.return_value = mock_watch
+
+        helper = K8sHelper()
+        name = helper.wait_for_claim_ready("test-claim", "default", timeout=5)
+        self.assertEqual(name, "cold-sandbox-1")
+
+    @patch("k8s_agent_sandbox.k8s_helper.watch.Watch")
+    def test_wait_for_claim_ready_template_not_found(self, mock_watch_class, mock_config, mock_api_cls, mock_core_cls):
+        mock_watch = MagicMock()
+        mock_event = {
+            "type": "MODIFIED",
+            "object": {
+                "metadata": {"name": "test-claim"},
+                "status": {
+                    "conditions": [
+                        {
+                            "type": "Ready",
+                            "status": "False",
+                            "reason": "TemplateNotFound",
+                            "message": "Template 'non-existent-template' not found",
+                        }
+                    ]
+                },
+            },
+        }
+        mock_watch.stream.return_value = [mock_event]
+        mock_watch_class.return_value = mock_watch
+
+        helper = K8sHelper()
+        with self.assertRaises(SandboxTemplateNotFoundError):
+            helper.wait_for_claim_ready("test-claim", "default", timeout=5)
+
+    @patch("k8s_agent_sandbox.k8s_helper.watch.Watch")
+    def test_wait_for_claim_ready_terminal_reason_fails_fast(self, mock_watch_class, mock_config, mock_api_cls, mock_core_cls):
+        """A terminal Ready=False reason raises immediately instead of waiting out the timeout."""
+        cases = [
+            ("VolumeClaimTemplatesError", "volumeClaimTemplates overrides are not allowed"),
+            ("InvalidConfiguration", "Service 'test-claim' is invalid: must be no more than 63 characters"),
+            ("PodFailed", "Pod failed"),
+            ("PodSucceeded", "Pod completed successfully"),
+        ]
+        for reason, message in cases:
+            with self.subTest(reason=reason):
+                mock_watch = MagicMock()
+                mock_event = {
+                    "type": "MODIFIED",
+                    "object": {
+                        "metadata": {"name": "test-claim"},
+                        "status": {
+                            "conditions": [
+                                {"type": "Ready", "status": "False", "reason": reason, "message": message}
+                            ]
+                        },
+                    },
+                }
+                mock_watch.stream.return_value = [mock_event]
+                mock_watch_class.return_value = mock_watch
+
+                helper = K8sHelper()
+                with self.assertRaises(SandboxClaimFailedError) as context:
+                    helper.wait_for_claim_ready("test-claim", "default", timeout=5)
+                self.assertIn(reason, str(context.exception))
+
+    @patch("k8s_agent_sandbox.k8s_helper.watch.Watch")
+    def test_wait_for_claim_ready_transient_reason_keeps_waiting(self, mock_watch_class, mock_config, mock_api_cls, mock_core_cls):
+        """Transient Ready=False reasons (controller retries) do not abort the wait."""
+        mock_watch = MagicMock()
+        transient_event = {
+            "type": "MODIFIED",
+            "object": {
+                "metadata": {"name": "test-claim"},
+                "status": {
+                    "conditions": [{"type": "Ready", "status": "False", "reason": "ReconcilerError",
+                                    "message": "Error seen: transient conflict"}],
+                },
+            },
+        }
+        ready_event = {
+            "type": "MODIFIED",
+            "object": {
+                "metadata": {"name": "test-claim"},
+                "status": {
+                    "conditions": [{"type": "Ready", "status": "True"}],
+                    "sandbox": {"name": "recovered-sandbox-1"},
+                },
+            },
+        }
+        mock_watch.stream.return_value = [transient_event, ready_event]
+        mock_watch_class.return_value = mock_watch
+
+        helper = K8sHelper()
+        name = helper.wait_for_claim_ready("test-claim", "default", timeout=5)
+        self.assertEqual(name, "recovered-sandbox-1")
+
+    @patch("k8s_agent_sandbox.k8s_helper.watch.Watch")
+    def test_resolve_sandbox_name_returns_before_ready(self, mock_watch_class, mock_config, mock_api_cls, mock_core_cls):
+        """resolve_sandbox_name keeps its legacy semantics: name alone suffices."""
+        mock_watch = MagicMock()
+        mock_event = {
+            "type": "MODIFIED",
+            "object": {
+                "metadata": {"name": "test-claim"},
+                "status": {
+                    "conditions": [{"type": "Ready", "status": "False", "reason": "SandboxNotReady"}],
+                    "sandbox": {"name": "pending-sandbox"},
+                },
+            },
+        }
+        mock_watch.stream.return_value = [mock_event]
+        mock_watch_class.return_value = mock_watch
+
+        helper = K8sHelper()
+        name = helper.resolve_sandbox_name("test-claim", "default", timeout=5)
+        self.assertEqual(name, "pending-sandbox")
+
+
+@patch("k8s_agent_sandbox.k8s_helper.client.CoreV1Api")
+@patch("k8s_agent_sandbox.k8s_helper.client.CustomObjectsApi")
+@patch("k8s_agent_sandbox.k8s_helper.config")
+class TestK8sHelperDeleteSandboxClaim(unittest.TestCase):
+
+    def test_delete_404_is_ignored(self, mock_config, mock_api_cls, mock_core_cls):
+        mock_api = MagicMock()
+        mock_api_cls.return_value = mock_api
+        exc = client.ApiException(status=404)
+        mock_api.delete_namespaced_custom_object.side_effect = exc
+
+        helper = K8sHelper()
+        helper.delete_sandbox_claim("missing-claim", "default")
+
+    def test_delete_non_404_reraises(self, mock_config, mock_api_cls, mock_core_cls):
+        mock_api = MagicMock()
+        mock_api_cls.return_value = mock_api
+        exc = client.ApiException(status=403)
+        mock_api.delete_namespaced_custom_object.side_effect = exc
+
+        helper = K8sHelper()
+        with self.assertRaises(client.ApiException) as ctx:
+            helper.delete_sandbox_claim("claim", "default")
+        self.assertEqual(ctx.exception.status, 403)
+
+    def test_delete_defaults_to_no_request_timeout(self, mock_config, mock_api_cls, mock_core_cls):
+        mock_api = MagicMock()
+        mock_api_cls.return_value = mock_api
+
+        helper = K8sHelper()
+        helper.delete_sandbox_claim("claim", "default")
+
+        self.assertIsNone(mock_api.delete_namespaced_custom_object.call_args.kwargs["_request_timeout"])
+
+    def test_delete_forwards_request_timeout(self, mock_config, mock_api_cls, mock_core_cls):
+        mock_api = MagicMock()
+        mock_api_cls.return_value = mock_api
+
+        helper = K8sHelper()
+        helper.delete_sandbox_claim("claim", "default", _request_timeout=30)
+
+        self.assertEqual(mock_api.delete_namespaced_custom_object.call_args.kwargs["_request_timeout"], 30)
+
+
+@patch("k8s_agent_sandbox.k8s_helper.client.CoreV1Api")
+@patch("k8s_agent_sandbox.k8s_helper.client.CustomObjectsApi")
+@patch("k8s_agent_sandbox.k8s_helper.config")
+class TestK8sHelperWaitForGatewayIP(unittest.TestCase):
+
+    @patch("k8s_agent_sandbox.k8s_helper.watch.Watch")
+    def test_wait_for_gateway_ip_valid_ip(self, mock_watch_class, mock_config, mock_api_cls, mock_core_cls):
+        mock_watch = MagicMock()
+        mock_event = {
+            "type": "MODIFIED",
+            "object": {
+                "metadata": {"name": "test-gateway"},
+                "status": {
+                    "addresses": [{"value": "192.168.1.1"}]
+                }
+            }
+        }
+        mock_watch.stream.return_value = [mock_event]
+        mock_watch_class.return_value = mock_watch
+
+        helper = K8sHelper()
+        ip = helper.wait_for_gateway_ip("test-gateway", "default", timeout=5)
+        self.assertEqual(ip, "192.168.1.1")
+
+    @patch("k8s_agent_sandbox.k8s_helper.watch.Watch")
+    def test_wait_for_gateway_ip_valid_hostname(self, mock_watch_class, mock_config, mock_api_cls, mock_core_cls):
+        mock_watch = MagicMock()
+        mock_event = {
+            "type": "MODIFIED",
+            "object": {
+                "metadata": {"name": "test-gateway"},
+                "status": {
+                    "addresses": [{"value": "gateway.example.com"}]
+                }
+            }
+        }
+        mock_watch.stream.return_value = [mock_event]
+        mock_watch_class.return_value = mock_watch
+
+        helper = K8sHelper()
+        ip = helper.wait_for_gateway_ip("test-gateway", "default", timeout=5)
+        self.assertEqual(ip, "gateway.example.com")
+
+    @patch("k8s_agent_sandbox.k8s_helper.watch.Watch")
+    def test_wait_for_gateway_ip_invalid_address_special_chars(self, mock_watch_class, mock_config, mock_api_cls, mock_core_cls):
+        mock_watch = MagicMock()
+        mock_event_invalid = {
+            "type": "MODIFIED",
+            "object": {
+                "metadata": {"name": "test-gateway"},
+                "status": {
+                    "addresses": [{"value": "192.168.1.1/path"}]
+                }
+            }
+        }
+        mock_event_valid = {
+            "type": "MODIFIED",
+            "object": {
+                "metadata": {"name": "test-gateway"},
+                "status": {
+                    "addresses": [{"value": "192.168.1.1"}]
+                }
+            }
+        }
+        mock_watch.stream.return_value = [mock_event_invalid, mock_event_valid]
+        mock_watch_class.return_value = mock_watch
+
+        helper = K8sHelper()
+        ip = helper.wait_for_gateway_ip("test-gateway", "default", timeout=5)
+        self.assertEqual(ip, "192.168.1.1")
+
+    @patch("k8s_agent_sandbox.k8s_helper.watch.Watch")
+    def test_wait_for_gateway_ip_invalid_hostname(self, mock_watch_class, mock_config, mock_api_cls, mock_core_cls):
+        mock_watch = MagicMock()
+        mock_event_invalid = {
+            "type": "MODIFIED",
+            "object": {
+                "metadata": {"name": "test-gateway"},
+                "status": {
+                    "addresses": [{"value": "bad_hostname"}]
+                }
+            }
+        }
+        mock_event_valid = {
+            "type": "MODIFIED",
+            "object": {
+                "metadata": {"name": "test-gateway"},
+                "status": {
+                    "addresses": [{"value": "192.168.1.1"}]
+                }
+            }
+        }
+        mock_watch.stream.return_value = [mock_event_invalid, mock_event_valid]
+        mock_watch_class.return_value = mock_watch
+
+        helper = K8sHelper()
+        ip = helper.wait_for_gateway_ip("test-gateway", "default", timeout=5)
+        self.assertEqual(ip, "192.168.1.1")
+
+    @patch("k8s_agent_sandbox.k8s_helper.watch.Watch")
+    def test_wait_for_gateway_ip_multiple_addresses_in_event(self, mock_watch_class, mock_config, mock_api_cls, mock_core_cls):
+        mock_watch = MagicMock()
+        mock_event = {
+            "type": "MODIFIED",
+            "object": {
+                "metadata": {"name": "test-gateway"},
+                "status": {
+                    "addresses": [
+                        {"value": "bad_hostname"},
+                        {"value": "192.168.1.2"},
+                    ]
+                }
+            }
+        }
+        mock_watch.stream.return_value = [mock_event]
+        mock_watch_class.return_value = mock_watch
+
+        helper = K8sHelper()
+        ip = helper.wait_for_gateway_ip("test-gateway", "default", timeout=5)
+        self.assertEqual(ip, "192.168.1.2")
+
+    @patch("k8s_agent_sandbox.k8s_helper.watch.Watch")
+    def test_wait_for_gateway_ip_accepts_ipv6(self, mock_watch_class, mock_config, mock_api_cls, mock_core_cls):
+        mock_watch = MagicMock()
+        mock_event_ipv6 = {
+            "type": "MODIFIED",
+            "object": {
+                "metadata": {"name": "test-gateway"},
+                "status": {
+                    "addresses": [{"value": "2001:db8::1"}]
+                }
+            }
+        }
+        mock_watch.stream.return_value = [mock_event_ipv6]
+        mock_watch_class.return_value = mock_watch
+
+        helper = K8sHelper()
+        ip = helper.wait_for_gateway_ip("test-gateway", "default", timeout=5)
+        self.assertEqual(ip, "2001:db8::1")
+
+    @patch("k8s_agent_sandbox.k8s_helper.watch.Watch")
+    def test_wait_for_gateway_ip_disguised_ip_decimal(self, mock_watch_class, mock_config, mock_api_cls, mock_core_cls):
+        mock_watch = MagicMock()
+        mock_event_invalid = {
+            "type": "MODIFIED",
+            "object": {
+                "metadata": {"name": "test-gateway"},
+                "status": {
+                    "addresses": [{"value": "2130706433"}]
+                }
+            }
+        }
+        mock_event_valid = {
+            "type": "MODIFIED",
+            "object": {
+                "metadata": {"name": "test-gateway"},
+                "status": {
+                    "addresses": [{"value": "192.168.1.1"}]
+                }
+            }
+        }
+        mock_watch.stream.return_value = [mock_event_invalid, mock_event_valid]
+        mock_watch_class.return_value = mock_watch
+
+        helper = K8sHelper()
+        ip = helper.wait_for_gateway_ip("test-gateway", "default", timeout=5)
+        self.assertEqual(ip, "192.168.1.1")
+
+    @patch("k8s_agent_sandbox.k8s_helper.watch.Watch")
+    def test_wait_for_gateway_ip_disguised_ip_hex(self, mock_watch_class, mock_config, mock_api_cls, mock_core_cls):
+        mock_watch = MagicMock()
+        mock_event_invalid = {
+            "type": "MODIFIED",
+            "object": {
+                "metadata": {"name": "test-gateway"},
+                "status": {
+                    "addresses": [{"value": "0x7f000001"}]
+                }
+            }
+        }
+        mock_event_valid = {
+            "type": "MODIFIED",
+            "object": {
+                "metadata": {"name": "test-gateway"},
+                "status": {
+                    "addresses": [{"value": "192.168.1.1"}]
+                }
+            }
+        }
+        mock_watch.stream.return_value = [mock_event_invalid, mock_event_valid]
+        mock_watch_class.return_value = mock_watch
+
+        helper = K8sHelper()
+        ip = helper.wait_for_gateway_ip("test-gateway", "default", timeout=5)
+        self.assertEqual(ip, "192.168.1.1")
+
+    @patch("k8s_agent_sandbox.k8s_helper.watch.Watch")
+    def test_wait_for_gateway_ip_disguised_ip_dotted_hex(self, mock_watch_class, mock_config, mock_api_cls, mock_core_cls):
+        mock_watch = MagicMock()
+        mock_event_invalid = {
+            "type": "MODIFIED",
+            "object": {
+                "metadata": {"name": "test-gateway"},
+                "status": {
+                    "addresses": [{"value": "0x7f.0x0.0x0.0x1"}]
+                }
+            }
+        }
+        mock_event_valid = {
+            "type": "MODIFIED",
+            "object": {
+                "metadata": {"name": "test-gateway"},
+                "status": {
+                    "addresses": [{"value": "192.168.1.1"}]
+                }
+            }
+        }
+        mock_watch.stream.return_value = [mock_event_invalid, mock_event_valid]
+        mock_watch_class.return_value = mock_watch
+
+        helper = K8sHelper()
+        ip = helper.wait_for_gateway_ip("test-gateway", "default", timeout=5)
+        self.assertEqual(ip, "192.168.1.1")
+
+    @patch("k8s_agent_sandbox.k8s_helper.watch.Watch")
+    def test_wait_for_gateway_ip_bare_hex_prefix_ip(self, mock_watch_class, mock_config, mock_api_cls, mock_core_cls):
+        mock_watch = MagicMock()
+        mock_event_invalid = {
+            "type": "MODIFIED",
+            "object": {
+                "metadata": {"name": "test-gateway"},
+                "status": {
+                    "addresses": [{"value": "0x.1"}]
+                }
+            }
+        }
+        mock_event_valid = {
+            "type": "MODIFIED",
+            "object": {
+                "metadata": {"name": "test-gateway"},
+                "status": {
+                    "addresses": [{"value": "192.168.1.1"}]
+                }
+            }
+        }
+        mock_watch.stream.return_value = [mock_event_invalid, mock_event_valid]
+        mock_watch_class.return_value = mock_watch
+
+        helper = K8sHelper()
+        ip = helper.wait_for_gateway_ip("test-gateway", "default", timeout=5)
+        self.assertEqual(ip, "192.168.1.1")
+
+    @patch("k8s_agent_sandbox.k8s_helper.watch.Watch")
+    def test_wait_for_gateway_ip_bare_hex_prefix_ip_dotted(self, mock_watch_class, mock_config, mock_api_cls, mock_core_cls):
+        mock_watch = MagicMock()
+        mock_event_invalid = {
+            "type": "MODIFIED",
+            "object": {
+                "metadata": {"name": "test-gateway"},
+                "status": {
+                    "addresses": [{"value": "00.0x.0x.1"}]
+                }
+            }
+        }
+        mock_event_valid = {
+            "type": "MODIFIED",
+            "object": {
+                "metadata": {"name": "test-gateway"},
+                "status": {
+                    "addresses": [{"value": "192.168.1.1"}]
+                }
+            }
+        }
+        mock_watch.stream.return_value = [mock_event_invalid, mock_event_valid]
+        mock_watch_class.return_value = mock_watch
+
+        helper = K8sHelper()
+        ip = helper.wait_for_gateway_ip("test-gateway", "default", timeout=5)
+        self.assertEqual(ip, "192.168.1.1")
+
+    @patch("k8s_agent_sandbox.k8s_helper.watch.Watch")
+    def test_wait_for_gateway_ip_invalid_label_length(self, mock_watch_class, mock_config, mock_api_cls, mock_core_cls):
+        mock_watch = MagicMock()
+        long_label = "a" * 64
+        mock_event_invalid = {
+            "type": "MODIFIED",
+            "object": {
+                "metadata": {"name": "test-gateway"},
+                "status": {
+                    "addresses": [{"value": f"{long_label}.example.com"}]
+                }
+            }
+        }
+        mock_event_valid = {
+            "type": "MODIFIED",
+            "object": {
+                "metadata": {"name": "test-gateway"},
+                "status": {
+                    "addresses": [{"value": "gateway.example.com"}]
+                }
+            }
+        }
+        mock_watch.stream.return_value = [mock_event_invalid, mock_event_valid]
+        mock_watch_class.return_value = mock_watch
+
+        helper = K8sHelper()
+        ip = helper.wait_for_gateway_ip("test-gateway", "default", timeout=5)
+        self.assertEqual(ip, "gateway.example.com")
+
+    @patch("k8s_agent_sandbox.k8s_helper.watch.Watch")
+    def test_wait_for_gateway_ip_non_dict_address(self, mock_watch_class, mock_config, mock_api_cls, mock_core_cls):
+        mock_watch = MagicMock()
+        mock_event_invalid = {
+            "type": "MODIFIED",
+            "object": {
+                "metadata": {"name": "test-gateway"},
+                "status": {
+                    "addresses": ["not-a-dict"]
+                }
+            }
+        }
+        mock_event_valid = {
+            "type": "MODIFIED",
+            "object": {
+                "metadata": {"name": "test-gateway"},
+                "status": {
+                    "addresses": [{"value": "192.168.1.1"}]
+                }
+            }
+        }
+        mock_watch.stream.return_value = [mock_event_invalid, mock_event_valid]
+        mock_watch_class.return_value = mock_watch
+
+        helper = K8sHelper()
+        ip = helper.wait_for_gateway_ip("test-gateway", "default", timeout=5)
+        self.assertEqual(ip, "192.168.1.1")
+
+    @patch("k8s_agent_sandbox.k8s_helper.watch.Watch")
+    def test_wait_for_gateway_ip_integer_value(self, mock_watch_class, mock_config, mock_api_cls, mock_core_cls):
+        mock_watch = MagicMock()
+        mock_event_invalid = {
+            "type": "MODIFIED",
+            "object": {
+                "metadata": {"name": "test-gateway"},
+                "status": {
+                    "addresses": [{"value": 2130706433}]
+                }
+            }
+        }
+        mock_event_valid = {
+            "type": "MODIFIED",
+            "object": {
+                "metadata": {"name": "test-gateway"},
+                "status": {
+                    "addresses": [{"value": "192.168.1.1"}]
+                }
+            }
+        }
+        mock_watch.stream.return_value = [mock_event_invalid, mock_event_valid]
+        mock_watch_class.return_value = mock_watch
+
+        helper = K8sHelper()
+        ip = helper.wait_for_gateway_ip("test-gateway", "default", timeout=5)
+        self.assertEqual(ip, "192.168.1.1")
+
+
+@patch("k8s_agent_sandbox.k8s_helper.client.CoreV1Api")
+@patch("k8s_agent_sandbox.k8s_helper.client.CustomObjectsApi")
+@patch("k8s_agent_sandbox.k8s_helper.config")
+class TestK8sHelperWatchResourceVersion(unittest.TestCase):
+    """The claim ready-wait watch must always carry an explicit
+    resourceVersion (the created claim's, or "0") so the apiserver serves it
+    from the watch cache — an unset resourceVersion forces a quorum etcd read
+    to establish initial state on every wait."""
+
+    @staticmethod
+    def _ready_event(rv="7"):
+        return {
+            "type": "MODIFIED",
+            "object": {
+                "metadata": {"name": "test-claim", "resourceVersion": rv},
+                "status": {
+                    "conditions": [{"type": "Ready", "status": "True"}],
+                    "sandbox": {"name": "warm-sandbox-1"},
+                },
+            },
+        }
+
+    def test_create_sandbox_claim_returns_api_response(self, mock_config, mock_api_cls, mock_core_cls):
+        mock_api = MagicMock()
+        mock_api_cls.return_value = mock_api
+        mock_api.create_namespaced_custom_object.return_value = {
+            "metadata": {"name": "test-claim", "resourceVersion": "42"}
+        }
+
+        helper = K8sHelper()
+        resp = helper.create_sandbox_claim("test-claim", "test-warmpool", "test-namespace")
+        self.assertEqual(resp["metadata"]["resourceVersion"], "42")
+
+    @patch("k8s_agent_sandbox.k8s_helper.watch.Watch")
+    def test_watch_defaults_to_resource_version_zero(self, mock_watch_class, mock_config, mock_api_cls, mock_core_cls):
+        mock_watch = MagicMock()
+        mock_watch.stream.return_value = [self._ready_event()]
+        mock_watch_class.return_value = mock_watch
+
+        helper = K8sHelper()
+        name = helper.wait_for_claim_ready("test-claim", "default", timeout=5)
+
+        self.assertEqual(name, "warm-sandbox-1")
+        self.assertEqual(mock_watch.stream.call_args.kwargs["resource_version"], "0")
+
+    @patch("k8s_agent_sandbox.k8s_helper.watch.Watch")
+    def test_watch_starts_from_created_claim_resource_version(self, mock_watch_class, mock_config, mock_api_cls, mock_core_cls):
+        mock_watch = MagicMock()
+        mock_watch.stream.return_value = [self._ready_event()]
+        mock_watch_class.return_value = mock_watch
+
+        helper = K8sHelper()
+        name = helper.wait_for_claim_ready("test-claim", "default", timeout=5, resource_version="12345")
+
+        self.assertEqual(name, "warm-sandbox-1")
+        self.assertEqual(mock_watch.stream.call_args.kwargs["resource_version"], "12345")
+
+    @patch("k8s_agent_sandbox.k8s_helper.watch.Watch")
+    def test_watch_410_gone_restarts_from_zero(self, mock_watch_class, mock_config, mock_api_cls, mock_core_cls):
+        """A compacted-away resourceVersion (410 Gone) restarts the watch
+        from "0" instead of failing the wait."""
+        mock_watch = MagicMock()
+        mock_watch.stream.side_effect = [
+            client.ApiException(status=410),
+            [self._ready_event()],
+        ]
+        mock_watch_class.return_value = mock_watch
+
+        helper = K8sHelper()
+        name = helper.wait_for_claim_ready("test-claim", "default", timeout=5, resource_version="12345")
+
+        self.assertEqual(name, "warm-sandbox-1")
+        first, second = mock_watch.stream.call_args_list
+        self.assertEqual(first.kwargs["resource_version"], "12345")
+        self.assertEqual(second.kwargs["resource_version"], "0")
+
+    @patch("k8s_agent_sandbox.k8s_helper.watch.Watch")
+    def test_watch_non_410_api_exception_reraises(self, mock_watch_class, mock_config, mock_api_cls, mock_core_cls):
+        mock_watch = MagicMock()
+        mock_watch.stream.side_effect = client.ApiException(status=403)
+        mock_watch_class.return_value = mock_watch
+
+        helper = K8sHelper()
+        with self.assertRaises(client.ApiException) as ctx:
+            helper.wait_for_claim_ready("test-claim", "default", timeout=5)
+        self.assertEqual(ctx.exception.status, 403)
+
+    @patch("k8s_agent_sandbox.k8s_helper.watch.Watch")
+    def test_watch_transient_disconnect_resumes_from_tracked_resource_version(
+        self, mock_watch_class, mock_config, mock_api_cls, mock_core_cls
+    ):
+        """A transient network disconnect resumes from the tracked resourceVersion
+        instead of resetting to '0'."""
+        first_event = {
+            "type": "MODIFIED",
+            "object": {
+                "metadata": {"name": "test-claim", "resourceVersion": "5555"},
+                "status": {"conditions": []},
+            },
+        }
+
+        def _first_stream(*args, **kwargs):
+            yield first_event
+            raise urllib3.exceptions.ProtocolError("Connection broken: RemoteDisconnected")
+
+        mock_watch = MagicMock()
+        mock_watch.stream.side_effect = [
+            _first_stream(),
+            [self._ready_event()],
+        ]
+        mock_watch_class.return_value = mock_watch
+
+        helper = K8sHelper()
+        name = helper.wait_for_claim_ready("test-claim", "default", timeout=5, resource_version="12345")
+
+        self.assertEqual(name, "warm-sandbox-1")
+        first_call, second_call = mock_watch.stream.call_args_list
+        self.assertEqual(first_call.kwargs["resource_version"], "12345")
+        self.assertEqual(second_call.kwargs["resource_version"], "5555")
+
+    @patch("k8s_agent_sandbox.k8s_helper.watch.Watch")
+    def test_watch_non_transient_network_exception_reraises(
+        self, mock_watch_class, mock_config, mock_api_cls, mock_core_cls
+    ):
+        """Non-transient exceptions (such as SSLError) must not be caught and retried."""
+        mock_watch = MagicMock()
+        mock_watch.stream.side_effect = urllib3.exceptions.SSLError("certificate verify failed")
+        mock_watch_class.return_value = mock_watch
+
+        helper = K8sHelper()
+        with self.assertRaises(urllib3.exceptions.SSLError):
+            helper.wait_for_claim_ready("test-claim", "default", timeout=5)
+
+    @patch("k8s_agent_sandbox.k8s_helper.watch.Watch")
+    def test_wait_for_sandbox_ready_transient_disconnect_reconnects(
+        self, mock_watch_class, mock_config, mock_api_cls, mock_core_cls
+    ):
+        """wait_for_sandbox_ready reconnects upon transient network disconnect."""
+        ready_sandbox_event = {
+            "type": "MODIFIED",
+            "object": {
+                "metadata": {"name": "test-sandbox"},
+                "status": {
+                    "conditions": [{"type": "Ready", "status": "True"}],
+                    "podIPs": ["10.244.0.5"],
+                },
+            },
+        }
+        mock_watch = MagicMock()
+        mock_watch.stream.side_effect = [
+            urllib3.exceptions.ProtocolError("Connection broken"),
+            [ready_sandbox_event],
+        ]
+        mock_watch_class.return_value = mock_watch
+
+        helper = K8sHelper()
+        ip = helper.wait_for_sandbox_ready("test-sandbox", "default", timeout=5)
+        self.assertEqual(ip, "10.244.0.5")
+        self.assertEqual(mock_watch.stream.call_count, 2)
+
+
+@patch("k8s_agent_sandbox.k8s_helper.client.CoreV1Api")
+@patch("k8s_agent_sandbox.k8s_helper.client.CustomObjectsApi")
+@patch("k8s_agent_sandbox.k8s_helper.config")
+class TestK8sHelperApiClientInjection(unittest.TestCase):
+
+    def test_injected_api_client_used_and_no_config_loaded(
+        self, mock_config, mock_custom_cls, mock_core_cls
+    ):
+        sentinel = MagicMock(name="ApiClient")
+        K8sHelper(api_client=sentinel)
+        mock_custom_cls.assert_called_once_with(sentinel)
+        mock_core_cls.assert_called_once_with(sentinel)
+        mock_config.load_incluster_config.assert_not_called()
+        mock_config.load_kube_config.assert_not_called()
+
+    def test_injected_api_client_is_exposed_only_when_injected(
+        self, mock_config, mock_custom_cls, mock_core_cls
+    ):
+        sentinel = MagicMock(name="ApiClient")
+        self.assertIs(K8sHelper(api_client=sentinel).injected_api_client, sentinel)
+        self.assertIsNone(K8sHelper().injected_api_client)
+
+
+class TestK8sHelperInClusterAuth(unittest.TestCase):
+
+    def test_incluster_service_account_token_is_sent(self):
+        # 36.0.0 loaded the token but never sent it; a mocked loader can't catch that.
+        original = client.Configuration.get_default_copy()
+        self.addCleanup(client.Configuration.set_default, original)
+        with tempfile.TemporaryDirectory() as tmp:
+            token_path = os.path.join(tmp, "token")
+            ca_path = os.path.join(tmp, "ca.crt")
+            for path, content in ((token_path, "test-token"), (ca_path, "test-ca")):
+                with open(path, "w") as f:
+                    f.write(content)
+            with patch.dict(os.environ, {
+                "KUBERNETES_SERVICE_HOST": "10.0.0.1",
+                "KUBERNETES_SERVICE_PORT": "443",
+            }), patch.object(
+                incluster_config, "SERVICE_TOKEN_FILENAME", token_path
+            ), patch.object(incluster_config, "SERVICE_CERT_FILENAME", ca_path):
+                helper = K8sHelper()
+
+        settings = helper.core_v1_api.api_client.configuration.auth_settings()
+        self.assertTrue(
+            any("test-token" in str(s.get("value")) for s in settings.values()),
+            f"in-cluster token missing from auth settings: {settings}",
+        )
+
+
+class TestK8sHelperWatchTimeout(unittest.TestCase):
+    def test_one_second_wait_observes_ready_resource(self):
+        ready = {"type": "Ready", "status": "True"}
+        cases = [
+            ("resolve_sandbox_name", {"sandbox": {"name": "sandbox"}}, "sandbox"),
+            ("wait_for_claim_ready", {"sandbox": {"name": "sandbox"}, "conditions": [ready]}, "sandbox"),
+            ("wait_for_sandbox_ready", {"conditions": [ready], "podIPs": [{"ip": "10.0.0.1"}]}, "10.0.0.1"),
+            ("wait_for_gateway_ip", {"addresses": [{"value": "10.0.0.2"}]}, "10.0.0.2"),
+        ]
+        with client.ApiClient(client.Configuration()) as api_client:
+            helper = K8sHelper(api_client)
+            for method, status, expected in cases:
+                with self.subTest(method=method), patch(
+                    "k8s_agent_sandbox.k8s_helper.time", **{"monotonic.side_effect": [100.0, 100.1]}
+                ), patch("k8s_agent_sandbox.k8s_helper.watch.Watch") as watch_cls:
+                    watch_cls.return_value.stream.return_value = iter([
+                        {"type": "ADDED", "object": {"status": status}}
+                    ])
+                    self.assertEqual(getattr(helper, method)("resource", "default", timeout=1), expected)
+                    self.assertEqual(watch_cls.return_value.stream.call_args.kwargs["timeout_seconds"], 1)
+
+    def test_claim_watch_restarts_during_final_fractional_second(self):
+        with client.ApiClient(client.Configuration()) as api_client:
+            helper = K8sHelper(api_client)
+            with patch(
+                "k8s_agent_sandbox.k8s_helper.time", **{"monotonic.side_effect": [100.0, 100.1, 104.5]}
+            ), patch("k8s_agent_sandbox.k8s_helper.watch.Watch") as watch_cls:
+                watch_cls.return_value.stream.side_effect = [iter([]), iter([
+                    {"type": "ADDED", "object": {"status": {"sandbox": {"name": "sandbox"}}}}
+                ])]
+                self.assertEqual(helper.resolve_sandbox_name("claim", "default", timeout=5), "sandbox")
+                self.assertEqual(watch_cls.return_value.stream.call_count, 2)
+                self.assertEqual(watch_cls.return_value.stream.call_args.kwargs["timeout_seconds"], 1)
+
+    def test_expired_wait_does_not_start_watch(self):
+        with client.ApiClient(client.Configuration()) as api_client:
+            helper = K8sHelper(api_client)
+            with patch(
+                "k8s_agent_sandbox.k8s_helper.time", **{"monotonic.side_effect": [100.0, 101.0]}
+            ), patch("k8s_agent_sandbox.k8s_helper.watch.Watch") as watch_cls:
+                with self.assertRaises(TimeoutError):
+                    helper.resolve_sandbox_name("claim", "default", timeout=1)
+                watch_cls.assert_not_called()
+
 
 
 if __name__ == '__main__':

@@ -7,7 +7,7 @@ metadata:
     build.appstudio.redhat.com/target_branch: '{{target_branch}}'
     pipelinesascode.tekton.dev/cancel-in-progress: "false"
     pipelinesascode.tekton.dev/max-keep-runs: "3"
-    pipelinesascode.tekton.dev/on-cel-expression: event == "push" && target_branch == "main" && ( "clients/python/agentic-sandbox-client/sandbox-router/***".pathChanged() || ".tekton/agent-sandbox-router-push.yaml".pathChanged() )
+    pipelinesascode.tekton.dev/on-cel-expression: event == "push" && target_branch == "main" && ( "sandbox-router/***".pathChanged() || ".tekton/agent-sandbox-router-push.yaml".pathChanged() )
   creationTimestamp:
   labels:
     appstudio.openshift.io/application: agent-sandbox
@@ -22,7 +22,7 @@ spec:
   - name: build-source-image
     value: "true"
   - name: prefetch-input
-    value: '{"type": "pip", "path": "clients/python/agentic-sandbox-client/sandbox-router", "binary": {"packages": "pydantic-core", "platform": "manylinux.*_(x86_64|s390x)"}}'
+    value: '{"type": "pip", "path": "sandbox-router", "binary": {"packages": "pydantic-core", "platform": "manylinux.*_(x86_64|s390x)"}}'
   - name: hermetic
     value: "true"
   - name: revision
@@ -34,9 +34,9 @@ spec:
     - linux/x86_64
     - linux/s390x
   - name: dockerfile
-    value: clients/python/agentic-sandbox-client/sandbox-router/Dockerfile
+    value: sandbox-router/Dockerfile
   - name: path-context
-    value: clients/python/agentic-sandbox-client/sandbox-router
+    value: sandbox-router
   pipelineSpec:
     description: |
       This pipeline is ideal for building multi-arch container images from a Containerfile while maintaining trust after pipeline customization.

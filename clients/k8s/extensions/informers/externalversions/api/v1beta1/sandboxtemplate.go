@@ -22,6 +22,7 @@ import (
 
 	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	runtime "k8s.io/apimachinery/pkg/runtime"
+	schema "k8s.io/apimachinery/pkg/runtime/schema"
 	watch "k8s.io/apimachinery/pkg/watch"
 	cache "k8s.io/client-go/tools/cache"
 	versioned "sigs.k8s.io/agent-sandbox/clients/k8s/extensions/clientset/versioned"
@@ -31,11 +32,39 @@ import (
 )
 
 // SandboxTemplateInformer provides access to a shared informer and lister for
-// SandboxTemplates.
+// SandboxTemplates. Prefer using the type-safe variant (see [TypedSandboxTemplateInformer]).
 type SandboxTemplateInformer interface {
 	Informer() cache.SharedIndexInformer
 	Lister() apiv1beta1.SandboxTemplateLister
 }
+
+// TypedSandboxTemplateInformer provides access to a shared informer and lister for
+// SandboxTemplates, including the type-safe TypedInformer variant.
+// It is a superset of SandboxTemplateInformer.
+type TypedSandboxTemplateInformer interface {
+	Informer() cache.SharedIndexInformer
+	TypedInformer() SandboxTemplateIndexInformer
+	Lister() apiv1beta1.SandboxTemplateLister
+}
+
+// SandboxTemplateIndexInformer is a wrapper around the underlying [cache.SharedIndexInformer]
+// with type-safe variants of several methods.
+type SandboxTemplateIndexInformer cache.TypedSharedIndexInformer[*extensionsapiv1beta1.SandboxTemplate]
+
+// SandboxTemplateHandlerFuncs is a specialization of [cache.TypedResourceEventHandlerFuncs] for SandboxTemplate.
+type SandboxTemplateHandlerFuncs = cache.TypedResourceEventHandlerFuncs[*extensionsapiv1beta1.SandboxTemplate]
+
+// SandboxTemplateDetailedHandlerFuncs is a specialization of [cache.TypedResourceEventHandlerDetailedFuncs] for SandboxTemplate.
+type SandboxTemplateDetailedHandlerFuncs = cache.TypedResourceEventHandlerDetailedFuncs[*extensionsapiv1beta1.SandboxTemplate]
+
+// SandboxTemplateFilteringHandler is a specialization of [cache.TypedFilteringResourceEventHandler] for SandboxTemplate.
+type SandboxTemplateFilteringHandler = cache.TypedFilteringResourceEventHandler[*extensionsapiv1beta1.SandboxTemplate]
+
+// SandboxTemplateIndexers is a specialization of [cache.TypedIndexers] for SandboxTemplate.
+type SandboxTemplateIndexers = cache.TypedIndexers[*extensionsapiv1beta1.SandboxTemplate]
+
+// DeletedSandboxTemplate is a specialization of [cache.DeletedObject] for SandboxTemplate.
+type DeletedSandboxTemplate = cache.DeletedObject[*extensionsapiv1beta1.SandboxTemplate]
 
 type sandboxTemplateInformer struct {
 	factory          internalinterfaces.SharedInformerFactory
@@ -46,55 +75,132 @@ type sandboxTemplateInformer struct {
 // NewSandboxTemplateInformer constructs a new informer for SandboxTemplate type.
 // Always prefer using an informer factory to get a shared informer instead of getting an independent
 // one. This reduces memory footprint and number of connections to the server.
+// If you really need an independent one, prefer using the type-safe variant (see [NewTypedSandboxTemplateInformer]).
 func NewSandboxTemplateInformer(client versioned.Interface, namespace string, resyncPeriod time.Duration, indexers cache.Indexers) cache.SharedIndexInformer {
-	return NewFilteredSandboxTemplateInformer(client, namespace, resyncPeriod, indexers, nil)
+	return NewSandboxTemplateInformerWithOptions(client, namespace, internalinterfaces.InformerOptions{ResyncPeriod: resyncPeriod, Indexers: indexers})
+}
+
+// NewTypedSandboxTemplateInformer constructs a new informer for SandboxTemplate type.
+// Always prefer using an informer factory to get a shared informer instead of getting an independent
+// one. This reduces memory footprint and number of connections to the server.
+func NewTypedSandboxTemplateInformer(client versioned.Interface, namespace string, resyncPeriod time.Duration, indexers SandboxTemplateIndexers) SandboxTemplateIndexInformer {
+	return NewTypedSandboxTemplateInformerWithOptions(client, namespace, internalinterfaces.InformerOptions{ResyncPeriod: resyncPeriod, Indexers: cache.TypedIndexersToIndexers(indexers)})
 }
 
 // NewFilteredSandboxTemplateInformer constructs a new informer for SandboxTemplate type.
 // Always prefer using an informer factory to get a shared informer instead of getting an independent
 // one. This reduces memory footprint and number of connections to the server.
+// If you really need an independent one, prefer using the type-safe variant (see [NewTypedFilteredSandboxTemplateInformer]).
 func NewFilteredSandboxTemplateInformer(client versioned.Interface, namespace string, resyncPeriod time.Duration, indexers cache.Indexers, tweakListOptions internalinterfaces.TweakListOptionsFunc) cache.SharedIndexInformer {
-	return cache.NewSharedIndexInformer(
+	return NewTypedSandboxTemplateInformerWithOptions(client, namespace, internalinterfaces.InformerOptions{ResyncPeriod: resyncPeriod, Indexers: indexers, TweakListOptions: tweakListOptions})
+}
+
+// NewTypedFilteredSandboxTemplateInformer constructs a new informer for SandboxTemplate type.
+// Always prefer using an informer factory to get a shared informer instead of getting an independent
+// one. This reduces memory footprint and number of connections to the server.
+func NewTypedFilteredSandboxTemplateInformer(client versioned.Interface, namespace string, resyncPeriod time.Duration, indexers SandboxTemplateIndexers, tweakListOptions internalinterfaces.TweakListOptionsFunc) SandboxTemplateIndexInformer {
+	return NewTypedSandboxTemplateInformerWithOptions(client, namespace, internalinterfaces.InformerOptions{ResyncPeriod: resyncPeriod, Indexers: cache.TypedIndexersToIndexers(indexers), TweakListOptions: tweakListOptions})
+}
+
+// NewSandboxTemplateInformerWithOptions constructs a new informer for SandboxTemplate type with additional options.
+// Always prefer using an informer factory to get a shared informer instead of getting an independent
+// one. This reduces memory footprint and number of connections to the server.
+// If you really need an independent one, prefer using the type-safe variant (see [NewTypedSandboxTemplateInformerWithOptions]).
+func NewSandboxTemplateInformerWithOptions(client versioned.Interface, namespace string, options internalinterfaces.InformerOptions) cache.SharedIndexInformer {
+	return NewTypedSandboxTemplateInformerWithOptions(client, namespace, options)
+}
+
+// NewTypedSandboxTemplateInformerWithOptions constructs a new informer for SandboxTemplate type with additional options.
+// Always prefer using an informer factory to get a shared informer instead of getting an independent
+// one. This reduces memory footprint and number of connections to the server.
+func NewTypedSandboxTemplateInformerWithOptions(client versioned.Interface, namespace string, options internalinterfaces.InformerOptions) SandboxTemplateIndexInformer {
+	gvr := schema.GroupVersionResource{Group: "extensions.agents.x-k8s.io", Version: "v1beta1", Resource: "sandboxtemplates"}
+	identifier := options.InformerName.WithResource(gvr)
+	tweakListOptions := options.TweakListOptions
+	return cache.NewTypedSharedIndexInformer[*extensionsapiv1beta1.SandboxTemplate](cache.NewSharedIndexInformerWithOptions(
 		cache.ToListWatcherWithWatchListSemantics(&cache.ListWatch{
-			ListFunc: func(options v1.ListOptions) (runtime.Object, error) {
+			ListFunc: func(opts v1.ListOptions) (runtime.Object, error) {
 				if tweakListOptions != nil {
-					tweakListOptions(&options)
+					tweakListOptions(&opts)
 				}
-				return client.ExtensionsV1beta1().SandboxTemplates(namespace).List(context.Background(), options)
+				return client.ExtensionsV1beta1().SandboxTemplates(namespace).List(context.Background(), opts)
 			},
-			WatchFunc: func(options v1.ListOptions) (watch.Interface, error) {
+			WatchFunc: func(opts v1.ListOptions) (watch.Interface, error) {
 				if tweakListOptions != nil {
-					tweakListOptions(&options)
+					tweakListOptions(&opts)
 				}
-				return client.ExtensionsV1beta1().SandboxTemplates(namespace).Watch(context.Background(), options)
+				return client.ExtensionsV1beta1().SandboxTemplates(namespace).Watch(context.Background(), opts)
 			},
-			ListWithContextFunc: func(ctx context.Context, options v1.ListOptions) (runtime.Object, error) {
+			ListWithContextFunc: func(ctx context.Context, opts v1.ListOptions) (runtime.Object, error) {
 				if tweakListOptions != nil {
-					tweakListOptions(&options)
+					tweakListOptions(&opts)
 				}
-				return client.ExtensionsV1beta1().SandboxTemplates(namespace).List(ctx, options)
+				return client.ExtensionsV1beta1().SandboxTemplates(namespace).List(ctx, opts)
 			},
-			WatchFuncWithContext: func(ctx context.Context, options v1.ListOptions) (watch.Interface, error) {
+			WatchFuncWithContext: func(ctx context.Context, opts v1.ListOptions) (watch.Interface, error) {
 				if tweakListOptions != nil {
-					tweakListOptions(&options)
+					tweakListOptions(&opts)
 				}
-				return client.ExtensionsV1beta1().SandboxTemplates(namespace).Watch(ctx, options)
+				return client.ExtensionsV1beta1().SandboxTemplates(namespace).Watch(ctx, opts)
 			},
 		}, client),
 		&extensionsapiv1beta1.SandboxTemplate{},
-		resyncPeriod,
-		indexers,
-	)
+		cache.SharedIndexInformerOptions{
+			ResyncPeriod: options.ResyncPeriod,
+			Indexers:     options.Indexers,
+			Identifier:   identifier,
+		},
+	))
 }
 
 func (f *sandboxTemplateInformer) defaultInformer(client versioned.Interface, resyncPeriod time.Duration) cache.SharedIndexInformer {
-	return NewFilteredSandboxTemplateInformer(client, f.namespace, resyncPeriod, cache.Indexers{cache.NamespaceIndex: cache.MetaNamespaceIndexFunc}, f.tweakListOptions)
+	return NewTypedSandboxTemplateInformerWithOptions(client, f.namespace, internalinterfaces.InformerOptions{ResyncPeriod: resyncPeriod, Indexers: cache.Indexers{cache.NamespaceIndex: cache.MetaNamespaceIndexFunc}, InformerName: f.factory.InformerName(), TweakListOptions: f.tweakListOptions})
 }
 
 func (f *sandboxTemplateInformer) Informer() cache.SharedIndexInformer {
-	return f.factory.InformerFor(&extensionsapiv1beta1.SandboxTemplate{}, f.defaultInformer)
+	return f.TypedInformer()
+}
+
+func (f *sandboxTemplateInformer) TypedInformer() SandboxTemplateIndexInformer {
+	return cache.NewTypedSharedIndexInformer[*extensionsapiv1beta1.SandboxTemplate](f.factory.InformerFor(&extensionsapiv1beta1.SandboxTemplate{}, f.defaultInformer))
 }
 
 func (f *sandboxTemplateInformer) Lister() apiv1beta1.SandboxTemplateLister {
 	return apiv1beta1.NewSandboxTemplateLister(f.Informer().GetIndexer())
+}
+
+// ToTypedSandboxTemplateInformer converts an untyped informer into a TypedSandboxTemplateInformer.
+//
+// WARNING: this conversion is only safe if the informer handles objects of type
+// *SandboxTemplate. If that is not the case, calling type-safe methods of the returned
+// TypedSandboxTemplateInformer leads to runtime panics. A safer alternative is to pass
+// around a TypedSandboxTemplateInformer instances that was obtained from a
+// SharedInformerFactory.
+func ToTypedSandboxTemplateInformer(informer SandboxTemplateInformer) TypedSandboxTemplateInformer {
+	if informer, ok := informer.(TypedSandboxTemplateInformer); ok {
+		return informer
+	}
+	return &sandboxTemplateTypedInformerAdapter{informer}
+}
+
+type sandboxTemplateTypedInformerAdapter struct {
+	SandboxTemplateInformer
+}
+
+func (a *sandboxTemplateTypedInformerAdapter) TypedInformer() SandboxTemplateIndexInformer {
+	return cache.NewTypedSharedIndexInformer[*extensionsapiv1beta1.SandboxTemplate](a.Informer())
+}
+
+// ToSandboxTemplateIndexInformer converts an untyped informer into a SandboxTemplateIndexInformer.
+//
+// WARNING: this conversion is only safe if the informer handles objects of type
+// *SandboxTemplate. If that is not the case, calling type-safe methods of the returned
+// SandboxTemplateIndexInformer leads to runtime panics. A safer alternative is to pass
+// around a SandboxTemplateIndexInformer instances that was obtained from a
+// SharedInformerFactory.
+func ToSandboxTemplateIndexInformer(informer cache.SharedIndexInformer) SandboxTemplateIndexInformer {
+	if informer, ok := informer.(SandboxTemplateIndexInformer); ok {
+		return informer
+	}
+	return cache.NewTypedSharedIndexInformer[*extensionsapiv1beta1.SandboxTemplate](informer)
 }

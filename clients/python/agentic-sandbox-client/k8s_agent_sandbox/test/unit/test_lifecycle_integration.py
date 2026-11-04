@@ -58,12 +58,14 @@ class TestLifecycleIntegration(unittest.TestCase):
         sandbox_client.tracing_manager = None
         sandbox_client.tracer = MagicMock()
         sandbox_client.connection_config = MagicMock()
+        sandbox_client.file_config = None
         sandbox_client.tracer_config = MagicMock()
         sandbox_client.tracer_config.enable_tracing = False
         sandbox_client._active_connection_sandboxes = {}
         sandbox_client.sandbox_class = MagicMock()
 
         real_helper.resolve_sandbox_name = MagicMock(return_value="sandbox-abc")
+        real_helper.wait_for_claim_ready = MagicMock(return_value="sandbox-abc")
         real_helper.wait_for_sandbox_ready = MagicMock()
 
         before = datetime.now(timezone.utc)
@@ -104,12 +106,14 @@ class TestLifecycleIntegration(unittest.TestCase):
         sandbox_client.tracing_manager = None
         sandbox_client.tracer = MagicMock()
         sandbox_client.connection_config = MagicMock()
+        sandbox_client.file_config = None
         sandbox_client.tracer_config = MagicMock()
         sandbox_client.tracer_config.enable_tracing = False
         sandbox_client._active_connection_sandboxes = {}
         sandbox_client.sandbox_class = MagicMock()
 
         real_helper.resolve_sandbox_name = MagicMock(return_value="sandbox-abc")
+        real_helper.wait_for_claim_ready = MagicMock(return_value="sandbox-abc")
         real_helper.wait_for_sandbox_ready = MagicMock()
 
         sandbox_client.create_sandbox("my-warmpool", "default")
@@ -134,6 +138,7 @@ class TestLifecycleIntegration(unittest.TestCase):
         sandbox_client.tracing_manager = None
         sandbox_client.tracer = MagicMock()
         sandbox_client.connection_config = MagicMock()
+        sandbox_client.file_config = None
         sandbox_client.tracer_config = MagicMock()
         sandbox_client.tracer_config.enable_tracing = False
         sandbox_client._active_connection_sandboxes = {}

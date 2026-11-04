@@ -16,20 +16,29 @@ package sandbox
 
 import (
 	"fmt"
+	"maps"
 	"net/http"
 	"net/url"
 	"os"
+	"slices"
 	"time"
 
 	"github.com/go-logr/logr"
 	"github.com/go-logr/logr/funcr"
 	"go.opentelemetry.io/otel/trace"
+	metav1validation "k8s.io/apimachinery/pkg/apis/meta/v1/validation"
+	"k8s.io/apimachinery/pkg/util/validation/field"
 	"k8s.io/client-go/rest"
+
+	sandboxv1beta1 "sigs.k8s.io/agent-sandbox/api/v1beta1"
+	extv1beta1 "sigs.k8s.io/agent-sandbox/extensions/api/v1beta1"
 )
 
 const (
 	defaultNamespace               = "default"
 	defaultServerPort              = 8888
+	defaultSandboxdRESTPort        = 8080
+	defaultSandboxdGRPCPort        = 9090
 	defaultSandboxReadyTimeout     = 180 * time.Second
 	defaultGatewayReadyTimeout     = 180 * time.Second
 	defaultPortForwardReadyTimeout = 30 * time.Second
@@ -40,17 +49,145 @@ const (
 	defaultMaxUploadSize           = 256 << 20 // 256 MB
 )
 
+// Runtime identifies the in-sandbox runtime API the SDK speaks.
+type Runtime string
+
+const (
+	// RuntimeLegacyPython is the python-runtime HTTP API (POST /upload,
+	// GET /download|list|exists/{path}, POST /execute on port 8888),
+	// reached through the sandbox-router unless Connectivity selects a
+	// direct pod dial. Default.
+	RuntimeLegacyPython Runtime = "legacy-python"
+	// RuntimeSandboxd is the sandboxd hybrid API defined by KEP-539.2:
+	// REST filesystem (/v1/files/...) on port 8080 plus gRPC
+	// ProcessService on port 9090. The SDK reaches the sandbox pod directly
+	// or over a port-forward (default), see Connectivity.
+	RuntimeSandboxd Runtime = "sandboxd"
+)
+
+// Connectivity selects the transport used to reach the in-sandbox runtime.
+type Connectivity string
+
+const (
+	// ConnectivityPortForward reaches the sandbox over a SPDY port-forward
+	// brokered by the apiserver. Works from anywhere a kubeconfig does,
+	// including a laptop or CI runner. Default.
+	//
+	// With RuntimeSandboxd the forward targets the sandbox pod itself, which
+	// does not work for Kata or gVisor pods: their workload does not listen in
+	// the pod's host-side network namespace. Use an in-cluster mode, or
+	// ConnectivityRouterPortForward.
+	// RuntimeLegacyPython forwards to the sandbox-router instead and is
+	// unaffected.
+	ConnectivityPortForward Connectivity = "port-forward"
+
+	// ConnectivityRouterPortForward port-forwards the sandbox-router, which
+	// proxies sandboxd's REST API to SandboxdRESTPort and its gRPC API (Run,
+	// Start, and Watchers) to SandboxdGRPCPort. gRPC needs sandbox-router
+	// v1.0.9 or later. Requires RuntimeSandboxd. The legacy runtime already
+	// uses ConnectivityPortForward for the same tunnel. This is the laptop or
+	// CI path for Kata and gVisor sandboxes, which pod port-forward cannot
+	// reach.
+	//
+	// The router strips the Authorization header, so sandboxd rejects every
+	// routed call except GET /v1/health when it runs with --auth-token-*
+	// (#2102). The router also caps each REST request at its ProxyTimeout
+	// (default 180s), so raise ProxyTimeout for longer file transfers.
+	ConnectivityRouterPortForward Connectivity = "router-port-forward"
+	// ConnectivityInClusterService dials the Sandbox's headless Service by
+	// its in-cluster DNS name (Status.ServiceFQDN), taking the apiserver —
+	// and, for RuntimeLegacyPython, the sandbox-router, off the data path.
+	//
+	// Prefer this over ConnectivityInClusterPodIP when sandboxes cross a trust
+	// boundary. The Service's selector only ever matches its own Sandbox's
+	// pod, so a pod IP that Kubernetes has since reassigned to another
+	// tenant would be caught when the TTL expires. A deleted Sandbox takes
+	// its Service with it: connections then fail rather than landing on a stranger.
+	// (DNS caching still leaves a TTL-bounded window)
+	//
+	// Requires the Sandbox to have a Service — set spec.service: true on
+	// the template. Open fails when Status.ServiceFQDN is empty rather than
+	// falling back to the pod IP, so the safety property cannot be lost
+	// silently.
+	ConnectivityInClusterService Connectivity = "in-cluster-service"
+
+	// ConnectivityInClusterPodIP dials Status.PodIP. It needs no Service, so
+	// it works against any Sandbox without template changes.
+	//
+	// It carries the pod IP's reuse hazard: nothing detects that the sandbox
+	// pod was rescheduled, so requests can continue to a stale address that
+	// Kubernetes may have since reassigned to an unrelated pod. Use
+	// ConnectivityInClusterService where that matters.
+	ConnectivityInClusterPodIP Connectivity = "in-cluster-pod-ip"
+)
+
+// isInCluster reports whether c dials the sandbox pod directly, by either
+// addressing mode.
+func (c Connectivity) isInCluster() bool {
+	return c == ConnectivityInClusterPodIP || c == ConnectivityInClusterService
+}
+
 // Options configures a Sandbox instance.
 type Options struct {
-	// WarmPoolName is the name of the SandboxWarmPool to use. Required.
+	// WarmPoolName is the name of the SandboxWarmPool to use.
+	// Required in Options before calling Open() to provision a new sandbox.
+	// Optional on Client-level Options; pass the pool name per-sandbox to
+	// CreateSandbox instead.
 	// Must be a valid Kubernetes DNS subdomain (lowercase, [a-z0-9.-]).
 	WarmPoolName string
+
+	// ClaimName is an optional deterministic name for the SandboxClaim.
+	// When empty, Kubernetes generates a unique name with prefix "sandbox-claim-".
+	// When set and a SandboxClaim with this name already exists in Namespace,
+	// Open fails with ErrClaimFailed unless AdoptExisting is also set.
+	// A named claim is caller-owned: a failed Open and
+	// Client.EnableAutoCleanup leave it in place; Close still deletes it.
+	// Must be a valid Kubernetes DNS subdomain (lowercase, [a-z0-9.-]).
+	// NewClient rejects it; use WithClaimName with Client.CreateSandbox.
+	ClaimName string
+
+	// AdoptExisting makes Open attach to an existing SandboxClaim named
+	// ClaimName when creating it returns HTTP 409 Conflict, instead of
+	// failing. The existing claim must reference the same WarmPoolName and
+	// must not be terminating, and Open fails if it is replaced or starts
+	// terminating before its sandbox name resolves. Creation options are not
+	// reapplied to an adopted claim.
+	// Requires ClaimName. NewClient rejects it; use WithAdoptExisting with
+	// Client.CreateSandbox.
+	AdoptExisting bool
+
+	// Runtime selects the in-sandbox runtime API. Default: RuntimeLegacyPython.
+	// RuntimeSandboxd talks to sandboxd on the sandbox pod, so GatewayName is
+	// not supported with it. APIURL remains available as an advanced/testing
+	// escape hatch for the REST endpoint only: Run needs the gRPC endpoint and
+	// returns ErrUnsupportedByRuntime with it.
+	Runtime Runtime
+
+	// Connectivity selects the transport. Default: ConnectivityPortForward.
+	//
+	// The in-cluster values conflict with both GatewayName and APIURL, and
+	// require that this process runs inside the same cluster as the sandbox
+	// pods. ConnectivityRouterPortForward also conflicts with GatewayName and
+	// APIURL.
+	Connectivity Connectivity
+
+	// SandboxdRESTPort is the pod port of sandboxd's Filesystem & Runtime
+	// REST API. Only used with RuntimeSandboxd. Default: 8080.
+	SandboxdRESTPort int
+
+	// SandboxdGRPCPort is the pod port of sandboxd's gRPC ProcessService.
+	// Only used with RuntimeSandboxd. Default: 9090.
+	SandboxdGRPCPort int
 
 	// Namespace where the SandboxClaim will be created. Default: "default".
 	// Must be a valid Kubernetes DNS label (lowercase, [a-z0-9-]).
 	Namespace string
 
-	// GatewayName enables production mode. The client watches this Gateway resource
+	// RouterNamespace is where port-forward modes find sandbox-router-svc
+	// (shipped manifests use "agent-sandbox-system"). Default: Namespace.
+	RouterNamespace string
+
+	// GatewayName enables Gateway mode. The client watches this Gateway resource
 	// for an external IP, then routes through the sandbox-router.
 	// Must be a valid Kubernetes DNS subdomain (lowercase, [a-z0-9.-]).
 	GatewayName string
@@ -63,12 +200,43 @@ type Options struct {
 	// from the Gateway's address. Default: "http".
 	GatewayScheme string
 
-	// APIURL enables advanced mode. The client connects directly to this URL,
+	// APIURL enables Direct URL mode. The client connects directly to this URL,
 	// bypassing gateway discovery. Takes precedence over GatewayName.
 	APIURL string
 
 	// ServerPort is the port the sandbox runtime listens on. Default: 8888.
 	ServerPort int
+
+	// Env is the list of environment variables to inject into the SandboxClaim.
+	// Setting Env forces a cold start from the warm pool template.
+	Env []extv1beta1.EnvVar
+
+	// Labels are added to every SandboxClaim this client creates, so they can
+	// be selected later (see WithLabelSelector). The SDK's own created-by label
+	// always wins over a colliding key.
+	Labels map[string]string
+
+	// ShutdownAfter expires every SandboxClaim this client creates that long
+	// after creation, so a crashed client cannot leak sandboxes. The claim
+	// gets spec.lifecycle.shutdownTime and the Delete shutdown policy; the
+	// deadline is rounded up to a whole second. Zero (the default) means no expiry.
+	ShutdownAfter time.Duration
+
+	// PodLabels are propagated to the backing Sandbox Pod via
+	// spec.additionalPodMetadata.labels (unlike Labels, which are placed on the
+	// SandboxClaim object itself). Label keys must carry a domain prefix from
+	// the controller's label-domain allowlist (default: sandbox.users.io).
+	PodLabels map[string]string
+
+	// PodAnnotations are propagated to the backing Sandbox Pod via
+	// spec.additionalPodMetadata.annotations.
+	PodAnnotations map[string]string
+
+	// VolumeClaimTemplates is a list of persistent volume claim templates to
+	// create for the sandbox via spec.volumeClaimTemplates. Setting
+	// VolumeClaimTemplates forces a cold start because warm pool pods do not
+	// have these volumes.
+	VolumeClaimTemplates []sandboxv1beta1.PersistentVolumeClaimTemplate
 
 	// SandboxReadyTimeout is how long to wait for the sandbox to become ready. Default: 180s.
 	SandboxReadyTimeout time.Duration
@@ -95,13 +263,14 @@ type Options struct {
 	// Default: 60s.
 	PerAttemptTimeout time.Duration
 
-	// MaxDownloadSize is the maximum response body size for Read().
+	// MaxDownloadSize is the maximum response body size for Read() and ReadTo().
 	// Run() uses a fixed 16 MB decode limit; List() and Exists() use a
 	// fixed 8 MB internal limit. Default: 256 MB.
 	MaxDownloadSize int64
 
-	// MaxUploadSize is the maximum content size for Write(). Content
-	// exceeding this limit is rejected before any network I/O. Default: 256 MB.
+	// MaxUploadSize is the maximum content size for Write() and WriteReader().
+	// Write rejects oversized content before network I/O; WriteReader enforces
+	// the limit while streaming. Default: 256 MB.
 	MaxUploadSize int64
 
 	// Logger for structured logging. Defaults to stderr at INFO level.
@@ -136,6 +305,31 @@ type Options struct {
 	// TracerProvider sets the OpenTelemetry TracerProvider for span creation.
 	// If nil, falls back to otel.GetTracerProvider (noop by default).
 	TracerProvider trace.TracerProvider
+
+	// DisablePodIPRouting suppresses the X-Sandbox-Pod-IP header even when a
+	// pod IP is available. Use in environments with strict network policies,
+	// service meshes, or secure overlays where direct pod-to-pod IP routing is
+	// restricted but service-based DNS routing works correctly.
+	//
+	// ConnectivityRouterPortForward sends X-Sandbox-Pod-IP by default, which
+	// makes the router dial the stored pod IP directly and skip its cache and
+	// DNS lookup. If the sandbox pod was rescheduled, that stale IP may now
+	// belong to another pod. Set DisablePodIPRouting: true when the router runs
+	// with --cache-enabled or the Sandbox has a headless Service
+	// (spec.service: true), so the router resolves the live pod by cache or
+	// DNS instead.
+	// Note: this only affects router-based transports that send X-Sandbox-* headers.
+	// Default: false (header is sent when router headers are enabled and a pod IP is present).
+	DisablePodIPRouting bool
+}
+
+// routerNamespace defaults lazily, not in setDefaults, so it follows the
+// per-call Namespace that Client swaps in on CreateSandbox and GetSandbox.
+func (o *Options) routerNamespace() string {
+	if o.RouterNamespace != "" {
+		return o.RouterNamespace
+	}
+	return o.Namespace
 }
 
 func (o *Options) setDefaults() {
@@ -148,8 +342,20 @@ func (o *Options) setDefaults() {
 	if o.GatewayScheme == "" {
 		o.GatewayScheme = "http"
 	}
+	if o.Runtime == "" {
+		o.Runtime = RuntimeLegacyPython
+	}
+	if o.Connectivity == "" {
+		o.Connectivity = ConnectivityPortForward
+	}
 	if o.ServerPort == 0 {
 		o.ServerPort = defaultServerPort
+	}
+	if o.SandboxdRESTPort == 0 {
+		o.SandboxdRESTPort = defaultSandboxdRESTPort
+	}
+	if o.SandboxdGRPCPort == 0 {
+		o.SandboxdGRPCPort = defaultSandboxdGRPCPort
 	}
 	if o.SandboxReadyTimeout == 0 {
 		o.SandboxReadyTimeout = defaultSandboxReadyTimeout
@@ -191,6 +397,22 @@ func (o *Options) setDefaults() {
 			}, funcr.Options{LogTimestamp: true})
 		}
 	}
+	o.Labels = maps.Clone(o.Labels)
+	o.PodLabels = maps.Clone(o.PodLabels)
+	o.PodAnnotations = maps.Clone(o.PodAnnotations)
+	o.Env = slices.Clone(o.Env)
+	o.VolumeClaimTemplates = cloneVolumeClaimTemplates(o.VolumeClaimTemplates)
+}
+
+func cloneVolumeClaimTemplates(in []sandboxv1beta1.PersistentVolumeClaimTemplate) []sandboxv1beta1.PersistentVolumeClaimTemplate {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make([]sandboxv1beta1.PersistentVolumeClaimTemplate, len(in))
+	for i := range in {
+		in[i].DeepCopyInto(&out[i])
+	}
+	return out
 }
 
 // isValidDNSSubdomain checks RFC 1123 DNS subdomain rules: max 253 chars,
@@ -201,7 +423,7 @@ func isValidDNSSubdomain(s string) bool {
 	if len(s) == 0 || len(s) > 253 {
 		return false
 	}
-	for i := 0; i < len(s); i++ {
+	for i := range len(s) {
 		c := s[i]
 		switch {
 		case c >= 'a' && c <= 'z', c >= '0' && c <= '9':
@@ -238,7 +460,18 @@ func isValidDNSLabel(s string) bool {
 	return true
 }
 
-func (o *Options) validate() error {
+// validateWarmPoolName checks that a warm pool name is present and a valid DNS subdomain.
+func validateWarmPoolName(name string) error {
+	if name == "" {
+		return fmt.Errorf("sandbox: WarmPoolName is required")
+	}
+	if !isValidDNSSubdomain(name) {
+		return fmt.Errorf("sandbox: WarmPoolName %q is not a valid Kubernetes DNS subdomain name", name)
+	}
+	return nil
+}
+
+func (o *Options) validateCommon() error {
 	if o.APIURL != "" {
 		u, err := url.Parse(o.APIURL)
 		if err != nil {
@@ -251,14 +484,26 @@ func (o *Options) validate() error {
 			return fmt.Errorf("sandbox: APIURL %q must include a host", o.APIURL)
 		}
 	}
-	if o.WarmPoolName == "" {
-		return fmt.Errorf("sandbox: WarmPoolName is required")
+	if err := metav1validation.ValidateLabels(o.Labels, field.NewPath("Labels")).ToAggregate(); err != nil {
+		return fmt.Errorf("sandbox: invalid Labels: %w", err)
 	}
-	if !isValidDNSSubdomain(o.WarmPoolName) {
-		return fmt.Errorf("sandbox: WarmPoolName %q is not a valid Kubernetes DNS subdomain name", o.WarmPoolName)
+	if err := metav1validation.ValidateLabels(o.PodLabels, field.NewPath("PodLabels")).ToAggregate(); err != nil {
+		return fmt.Errorf("sandbox: invalid PodLabels: %w", err)
+	}
+	if o.ShutdownAfter < 0 {
+		return fmt.Errorf("sandbox: ShutdownAfter must not be negative, got %s", o.ShutdownAfter)
+	}
+	if o.ClaimName != "" && !isValidDNSSubdomain(o.ClaimName) {
+		return fmt.Errorf("sandbox: ClaimName %q is not a valid Kubernetes DNS subdomain name", o.ClaimName)
+	}
+	if o.AdoptExisting && o.ClaimName == "" {
+		return fmt.Errorf("sandbox: AdoptExisting requires ClaimName")
 	}
 	if !isValidDNSLabel(o.Namespace) {
 		return fmt.Errorf("sandbox: Namespace %q is not a valid Kubernetes namespace (DNS label)", o.Namespace)
+	}
+	if o.RouterNamespace != "" && !isValidDNSLabel(o.RouterNamespace) {
+		return fmt.Errorf("sandbox: RouterNamespace %q is not a valid Kubernetes namespace (DNS label)", o.RouterNamespace)
 	}
 	if !isValidDNSLabel(o.GatewayNamespace) {
 		return fmt.Errorf("sandbox: GatewayNamespace %q is not a valid Kubernetes namespace (DNS label)", o.GatewayNamespace)
@@ -271,6 +516,49 @@ func (o *Options) validate() error {
 	}
 	if o.ServerPort <= 0 || o.ServerPort > 65535 {
 		return fmt.Errorf("sandbox: ServerPort must be between 1 and 65535, got %d", o.ServerPort)
+	}
+	if o.Runtime != RuntimeLegacyPython && o.Runtime != RuntimeSandboxd {
+		return fmt.Errorf("sandbox: Runtime must be %q or %q, got %q", RuntimeLegacyPython, RuntimeSandboxd, o.Runtime)
+	}
+	switch o.Connectivity {
+	case ConnectivityPortForward, ConnectivityRouterPortForward, ConnectivityInClusterPodIP, ConnectivityInClusterService:
+	default:
+		return fmt.Errorf("sandbox: Connectivity must be %q, %q, %q or %q, got %q",
+			ConnectivityPortForward, ConnectivityRouterPortForward, ConnectivityInClusterPodIP, ConnectivityInClusterService, o.Connectivity)
+	}
+	if o.Connectivity.isInCluster() {
+		if o.APIURL != "" {
+			return fmt.Errorf("sandbox: %s connectivity cannot be combined with APIURL: both select an endpoint, so set only one", o.Connectivity)
+		}
+		if o.GatewayName != "" {
+			return fmt.Errorf("sandbox: %s connectivity cannot be combined with GatewayName: the gateway routes through the sandbox-router, which in-cluster connectivity bypasses", o.Connectivity)
+		}
+	}
+	if o.Connectivity == ConnectivityRouterPortForward {
+		if o.Runtime != RuntimeSandboxd {
+			return fmt.Errorf("sandbox: %s requires %s: the legacy runtime already port-forwards the sandbox-router when Connectivity is %s",
+				ConnectivityRouterPortForward, RuntimeSandboxd, ConnectivityPortForward)
+		}
+		if o.APIURL != "" {
+			return fmt.Errorf("sandbox: %s connectivity cannot be combined with APIURL: both select an endpoint, so set only one", o.Connectivity)
+		}
+		if o.GatewayName != "" {
+			return fmt.Errorf("sandbox: %s connectivity cannot be combined with GatewayName: both reach the sandbox-router, so set only one", o.Connectivity)
+		}
+	}
+	if o.Runtime == RuntimeSandboxd {
+		if o.GatewayName != "" {
+			return fmt.Errorf("sandbox: RuntimeSandboxd cannot be combined with GatewayName: Gateway mode does not support sandboxd yet; use %s, pod port-forward, or an in-cluster mode", ConnectivityRouterPortForward)
+		}
+		if o.SandboxdRESTPort <= 0 || o.SandboxdRESTPort > 65535 {
+			return fmt.Errorf("sandbox: SandboxdRESTPort must be between 1 and 65535, got %d", o.SandboxdRESTPort)
+		}
+		if o.SandboxdGRPCPort <= 0 || o.SandboxdGRPCPort > 65535 {
+			return fmt.Errorf("sandbox: SandboxdGRPCPort must be between 1 and 65535, got %d", o.SandboxdGRPCPort)
+		}
+		if o.SandboxdRESTPort == o.SandboxdGRPCPort {
+			return fmt.Errorf("sandbox: SandboxdRESTPort and SandboxdGRPCPort must differ (both %d)", o.SandboxdRESTPort)
+		}
 	}
 	if o.SandboxReadyTimeout <= 0 {
 		return fmt.Errorf("sandbox: SandboxReadyTimeout must be positive")

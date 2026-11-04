@@ -1,0 +1,705 @@
+# Copyright 2026 The Kubernetes Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+from unittest.mock import MagicMock
+
+import pytest
+from kubernetes import client
+
+from agent_sandbox_rl import constants
+from agent_sandbox_rl.config import ResourceSpec, TemplateSpec
+from agent_sandbox_rl.exceptions import OwnedByAnotherRunError
+from agent_sandbox_rl.resources import Resources
+
+IMG = "slimshetty/swebench-verified:sweb.eval.x86_64.astropy__astropy-12907"
+TNAME = "r2e-img-abc123"
+
+
+def _resources():
+  return Resources(MagicMock(), MagicMock(), "ns")
+
+
+def test_ensure_template_creates_when_absent():
+  r = _resources()
+  r.custom_api.get_namespaced_custom_object.side_effect = client.ApiException(status=404)
+  created = r.ensure_template(IMG, TNAME, TemplateSpec(runtime_class="gvisor",
+                              node_selector={"k": "v"}, image_pull_secret="ps"))
+  assert created is True
+  args, kwargs = r.custom_api.create_namespaced_custom_object.call_args
+  body = kwargs["body"]
+  assert kwargs["plural"] == constants.TEMPLATES_PLURAL
+  assert body["kind"] == "SandboxTemplate"
+  assert body["metadata"]["labels"] == constants.DEFAULT_LABELS
+  pod = body["spec"]["podTemplate"]["spec"]
+  assert pod["containers"][0]["image"] == IMG
+  assert pod["containers"][0]["command"] == constants.KEEPALIVE_COMMAND
+  assert pod["runtimeClassName"] == "gvisor"
+  assert pod["nodeSelector"] == {"k": "v"}
+  assert pod["imagePullSecrets"] == [{"name": "ps"}]
+  # default pull policy reuses the node layer cache across runs/epochs
+  assert pod["containers"][0]["imagePullPolicy"] == "IfNotPresent"
+
+
+def test_template_manifest_pull_policy_override():
+  r = _resources()
+  r.custom_api.get_namespaced_custom_object.side_effect = client.ApiException(status=404)
+  r.ensure_template(IMG, TNAME, TemplateSpec(image_pull_policy="Always"))
+  _, kwargs = r.custom_api.create_namespaced_custom_object.call_args
+  pod = kwargs["body"]["spec"]["podTemplate"]["spec"]
+  assert pod["containers"][0]["imagePullPolicy"] == "Always"
+
+
+def test_template_manifest_colocate_emits_pod_affinity():
+  r = _resources()
+  r.custom_api.get_namespaced_custom_object.side_effect = client.ApiException(status=404)
+  r.ensure_template(IMG, TNAME, TemplateSpec(colocate_replicas=True))
+  _, kwargs = r.custom_api.create_namespaced_custom_object.call_args
+  pod = kwargs["body"]["spec"]["podTemplate"]["spec"]
+  term = pod["affinity"]["podAffinity"][
+      "preferredDuringSchedulingIgnoredDuringExecution"][0]
+  assert term["weight"] == 100
+  assert term["podAffinityTerm"]["topologyKey"] == "kubernetes.io/hostname"
+  # packs replicas of THIS pool together (they share the sandbox=<template> label)
+  assert term["podAffinityTerm"]["labelSelector"]["matchLabels"] == {"sandbox": TNAME}
+
+
+def test_template_manifest_no_affinity_by_default():
+  r = _resources()
+  r.custom_api.get_namespaced_custom_object.side_effect = client.ApiException(status=404)
+  r.ensure_template(IMG, TNAME, TemplateSpec())
+  _, kwargs = r.custom_api.create_namespaced_custom_object.call_args
+  assert "affinity" not in kwargs["body"]["spec"]["podTemplate"]["spec"]
+
+
+def test_colocate_composes_with_extra_pod_spec_affinity():
+  # colocate_replicas + a user-supplied affinity (e.g. nodeAffinity) must COMPOSE,
+  # not silently clobber the colocation podAffinity via the shallow update().
+  r = _resources()
+  r.custom_api.get_namespaced_custom_object.side_effect = client.ApiException(status=404)
+  node_aff = {"nodeAffinity": {"requiredDuringSchedulingIgnoredDuringExecution": {
+      "nodeSelectorTerms": [{"matchExpressions": [
+          {"key": "gpu", "operator": "Exists"}]}]}}}
+  r.ensure_template(IMG, TNAME, TemplateSpec(
+      colocate_replicas=True, extra_pod_spec={"affinity": node_aff}))
+  _, kwargs = r.custom_api.create_namespaced_custom_object.call_args
+  aff = kwargs["body"]["spec"]["podTemplate"]["spec"]["affinity"]
+  assert "nodeAffinity" in aff                 # user's affinity preserved
+  assert "podAffinity" in aff                  # colocation NOT clobbered
+
+
+def test_extra_pod_spec_empty_containers_preserves_base():
+  r = _resources()
+  r.custom_api.get_namespaced_custom_object.side_effect = client.ApiException(status=404)
+  r.ensure_template(IMG, TNAME, TemplateSpec(extra_pod_spec={"containers": []}))
+  _, kwargs = r.custom_api.create_namespaced_custom_object.call_args
+  pod = kwargs["body"]["spec"]["podTemplate"]["spec"]
+  assert len(pod["containers"]) == 1
+  assert pod["containers"][0]["name"] == "agent-runtime"
+  assert pod["containers"][0]["image"] == IMG
+
+
+def test_extra_pod_spec_merges_primary_container_and_appends_sidecars():
+  r = _resources()
+  r.custom_api.get_namespaced_custom_object.side_effect = client.ApiException(status=404)
+  extra_containers = [
+      {"env": [{"name": "KEY", "value": "VAL"}]},
+      {"name": "sidecar", "image": "sidecar:v1"},
+  ]
+  r.ensure_template(IMG, TNAME, TemplateSpec(extra_pod_spec={"containers": extra_containers}))
+  _, kwargs = r.custom_api.create_namespaced_custom_object.call_args
+  pod = kwargs["body"]["spec"]["podTemplate"]["spec"]
+  assert len(pod["containers"]) == 2
+  assert pod["containers"][0]["name"] == "agent-runtime"
+  assert pod["containers"][0]["image"] == IMG
+  assert pod["containers"][0]["env"] == [{"name": "KEY", "value": "VAL"}]
+  assert pod["containers"][1]["name"] == "sidecar"
+  assert pod["containers"][1]["image"] == "sidecar:v1"
+
+
+def test_extra_pod_spec_sidecar_only_does_not_clobber_primary():
+  r = _resources()
+  r.custom_api.get_namespaced_custom_object.side_effect = client.ApiException(status=404)
+  extra_containers = [{"name": "sidecar", "image": "sidecar:v1"}]
+  r.ensure_template(IMG, TNAME, TemplateSpec(extra_pod_spec={"containers": extra_containers}))
+  _, kwargs = r.custom_api.create_namespaced_custom_object.call_args
+  pod = kwargs["body"]["spec"]["podTemplate"]["spec"]
+  assert len(pod["containers"]) == 2
+  assert pod["containers"][0]["name"] == "agent-runtime"
+  assert pod["containers"][0]["image"] == IMG
+  assert pod["containers"][1]["name"] == "sidecar"
+  assert pod["containers"][1]["image"] == "sidecar:v1"
+
+
+def test_extra_pod_spec_merges_matching_container_by_name():
+  r = _resources()
+  r.custom_api.get_namespaced_custom_object.side_effect = client.ApiException(status=404)
+  extra_containers = [
+      {"name": "agent-runtime", "resources": {"limits": {"cpu": "4"}}},
+      {"name": "logger", "image": "logger:latest"},
+  ]
+  r.ensure_template(IMG, TNAME, TemplateSpec(extra_pod_spec={"containers": extra_containers}))
+  _, kwargs = r.custom_api.create_namespaced_custom_object.call_args
+  pod = kwargs["body"]["spec"]["podTemplate"]["spec"]
+  assert len(pod["containers"]) == 2
+  assert pod["containers"][0]["name"] == "agent-runtime"
+  assert pod["containers"][0]["image"] == IMG
+  assert pod["containers"][0]["resources"]["requests"]["cpu"] == "250m"
+  assert pod["containers"][0]["resources"]["limits"]["cpu"] == "4"
+  assert pod["containers"][1]["name"] == "logger"
+  assert pod["containers"][1]["image"] == "logger:latest"
+
+
+def test_ensure_template_noop_when_present():
+  r = _resources()
+  r.custom_api.get_namespaced_custom_object.return_value = {"metadata": {"name": TNAME}}
+  created = r.ensure_template(IMG, TNAME, TemplateSpec())
+  assert created is False
+  r.custom_api.create_namespaced_custom_object.assert_not_called()
+
+
+def test_ensure_template_reraises_non_404():
+  r = _resources()
+  r.custom_api.get_namespaced_custom_object.side_effect = client.ApiException(status=500)
+  with pytest.raises(client.ApiException):
+    r.ensure_template(IMG, TNAME, TemplateSpec())
+
+
+def test_create_warmpool_body():
+  r = _resources()
+  r.create_warmpool("pool-x", TNAME, 3)
+  _, kwargs = r.custom_api.create_namespaced_custom_object.call_args
+  body = kwargs["body"]
+  assert kwargs["plural"] == constants.WARMPOOLS_PLURAL
+  assert body["kind"] == "SandboxWarmPool"
+  assert body["spec"] == {"replicas": 3, "sandboxTemplateRef": {"name": TNAME}}
+
+
+def test_ensure_template_dry_run_forwarded():
+  r = _resources()
+  r.custom_api.get_namespaced_custom_object.side_effect = client.ApiException(status=404)
+  r.ensure_template(IMG, TNAME, TemplateSpec(), dry_run=True)
+  _, kwargs = r.custom_api.create_namespaced_custom_object.call_args
+  assert kwargs["dry_run"] == "All"
+
+
+def test_create_warmpool_dry_run_forwarded():
+  r = _resources()
+  r.create_warmpool("pool-x", TNAME, 1, dry_run=True)
+  _, kwargs = r.custom_api.create_namespaced_custom_object.call_args
+  assert kwargs["dry_run"] == "All"
+  # default is a real create (no dry run)
+  r2 = _resources()
+  r2.create_warmpool("pool-y", TNAME, 1)
+  _, kwargs2 = r2.custom_api.create_namespaced_custom_object.call_args
+  assert kwargs2["dry_run"] is None
+
+
+def test_validate_manifests_dry_runs_template_then_warmpool():
+  r = _resources()
+  r.validate_manifests(IMG, TemplateSpec())
+  calls = r.custom_api.create_namespaced_custom_object.call_args_list
+  assert len(calls) == 2
+  assert calls[0].kwargs["plural"] == constants.TEMPLATES_PLURAL
+  assert calls[0].kwargs["dry_run"] == "All"
+  assert calls[1].kwargs["plural"] == constants.WARMPOOLS_PLURAL
+  assert calls[1].kwargs["dry_run"] == "All"
+
+
+def test_create_warmpool_reconcile_upserts_replicas_on_409():
+  # The warm path (reconcile=True) patches an existing pool (409) to the requested
+  # replica count so a reused/leftover pool converges instead of being pinned.
+  r = _resources()
+  r.custom_api.create_namespaced_custom_object.side_effect = client.ApiException(status=409)
+  r.create_warmpool("pool-x", TNAME, 4, reconcile=True)  # no raise
+  _, kwargs = r.custom_api.patch_namespaced_custom_object.call_args
+  assert kwargs["name"] == "pool-x"
+  assert kwargs["plural"] == constants.WARMPOOLS_PLURAL
+  assert kwargs["body"] == {"spec": {"replicas": 4}}
+
+
+def test_create_warmpool_409_no_patch_without_reconcile():
+  # Default (the on-demand claim path): a 409 is a silent no-op, NOT a patch, so
+  # a hot reused size-1 pool isn't written to on every claim.
+  r = _resources()
+  r.custom_api.create_namespaced_custom_object.side_effect = client.ApiException(status=409)
+  r.create_warmpool("pool-x", TNAME, 1)  # no raise
+  r.custom_api.patch_namespaced_custom_object.assert_not_called()
+
+
+def test_create_warmpool_dry_run_409_does_not_patch():
+  # validation path: a 409 under dry-run must not mutate the live pool.
+  r = _resources()
+  r.custom_api.create_namespaced_custom_object.side_effect = client.ApiException(status=409)
+  r.create_warmpool("pool-x", TNAME, 4, dry_run=True, reconcile=True)
+  r.custom_api.patch_namespaced_custom_object.assert_not_called()
+
+
+def test_create_warmpool_reraises_non_409():
+  r = _resources()
+  r.custom_api.create_namespaced_custom_object.side_effect = client.ApiException(status=500)
+  with pytest.raises(client.ApiException):
+    r.create_warmpool("pool-x", TNAME, 1)
+
+
+def test_delete_swallows_404():
+  r = _resources()
+  r.custom_api.delete_namespaced_custom_object.side_effect = client.ApiException(status=404)
+  r.delete_warmpool("pool-x")   # no raise
+  r.delete_template(TNAME)      # no raise
+
+
+def test_pool_ready_replicas_reads_status():
+  r = _resources()
+  r.custom_api.get_namespaced_custom_object.return_value = {"status": {"readyReplicas": 2}}
+  assert r.pool_ready_replicas("pool-x") == 2
+
+
+def test_wait_for_pool_ready_true_immediately():
+  r = _resources()
+  r.custom_api.get_namespaced_custom_object.return_value = {"status": {"readyReplicas": 3}}
+  assert r.wait_for_pool_ready("pool-x", 3, timeout=5) is True
+
+
+def test_wait_for_pool_ready_times_out():
+  r = _resources()
+  r.custom_api.get_namespaced_custom_object.return_value = {"status": {"readyReplicas": 0}}
+  assert r.wait_for_pool_ready("pool-x", 1, timeout=0) is False
+
+
+def test_wait_for_pool_ready_via_watch(monkeypatch):
+  # Not ready on the fast-path GET; a watch MODIFIED event flips it to ready.
+  r = _resources()
+  r.custom_api.get_namespaced_custom_object.return_value = {"status": {"readyReplicas": 0}}
+
+  class FakeWatch:
+    def stream(self, func, **kw):
+      return [
+          {"type": "MODIFIED", "object": {"metadata": {"name": "other"},
+                                          "status": {"readyReplicas": 9}}},   # ignored
+          {"type": "MODIFIED", "object": {"metadata": {"name": "pool-x"},
+                                          "status": {"readyReplicas": 2}}},
+      ]
+
+    def stop(self):
+      pass
+
+  monkeypatch.setattr("agent_sandbox_rl.resources.watch.Watch", lambda: FakeWatch())
+  assert r.wait_for_pool_ready("pool-x", 2, timeout=5) is True
+
+
+def test_wait_for_pool_ready_scopes_watch_with_field_selector(monkeypatch):
+  # The watch must be scoped server-side to this pool, not list all warmpools.
+  r = _resources()
+  r.custom_api.get_namespaced_custom_object.return_value = {"status": {"readyReplicas": 0}}
+  seen = {}
+
+  class _RecordingWatch:
+    def stream(self, func, **kw):
+      seen.update(kw)
+      return [{"type": "MODIFIED", "object": {"metadata": {"name": "pool-x"},
+                                              "status": {"readyReplicas": 1}}}]
+
+    def stop(self):
+      pass
+
+  monkeypatch.setattr("agent_sandbox_rl.resources.watch.Watch", lambda: _RecordingWatch())
+  assert r.wait_for_pool_ready("pool-x", 1, timeout=5) is True
+  assert seen.get("field_selector") == "metadata.name=pool-x"
+
+
+def test_list_uses_label_selector():
+  r = _resources()
+  r.custom_api.list_namespaced_custom_object.return_value = {
+      "items": [{"metadata": {"name": "a"}}, {"metadata": {"name": "b"}}]}
+  assert r.list_warmpools(label_selector=r.managed_selector()) == ["a", "b"]
+  _, kwargs = r.custom_api.list_namespaced_custom_object.call_args
+  assert kwargs["label_selector"] == "app=agent-sandbox-rl"
+
+
+def test_wait_for_pool_ready_raises_on_forbidden(monkeypatch):
+  # A terminal API error (RBAC 403) should fail fast, not busy-loop to timeout.
+  r = _resources()
+  r.custom_api.get_namespaced_custom_object.return_value = {"status": {"readyReplicas": 0}}
+
+  class _ForbiddenWatch:
+    def stream(self, *a, **k):
+      raise client.ApiException(status=403)
+
+    def stop(self):
+      pass
+
+  monkeypatch.setattr("agent_sandbox_rl.resources.watch.Watch", lambda: _ForbiddenWatch())
+  with pytest.raises(client.ApiException):
+    r.wait_for_pool_ready("pool-x", 1, timeout=5)
+
+
+def test_labels_always_include_management_label():
+  # Custom labels must not drop app=agent-sandbox-rl (teardown selects on it).
+  r = Resources(MagicMock(), MagicMock(), "ns", labels={"team": "rl"})
+  assert r.labels["team"] == "rl"
+  assert r.labels[constants.MANAGED_BY_LABEL] == constants.MANAGED_BY_VALUE
+  # even if a custom label tries to override it
+  r2 = Resources(MagicMock(), MagicMock(), "ns", labels={"app": "evil"})
+  assert r2.labels["app"] == constants.MANAGED_BY_VALUE
+
+
+def test_ensure_template_swallows_409():
+  r = _resources()
+  r.custom_api.get_namespaced_custom_object.side_effect = client.ApiException(status=404)
+  r.custom_api.create_namespaced_custom_object.side_effect = client.ApiException(status=409)
+  assert r.ensure_template(IMG, TNAME, TemplateSpec()) is False   # no raise
+
+
+def test_deep_merge_named_lists_merges_by_name_and_appends():
+  from agent_sandbox_rl.resources import _deep_merge
+
+  base = {
+      "env": [
+          {"name": "VAR1", "value": "val1"},
+          {"name": "VAR2", "value": "val2"},
+      ],
+      "ports": [{"name": "http", "containerPort": 80}],
+  }
+  override = {
+      "env": [
+          {"name": "VAR2", "value": "val2-updated"},
+          {"name": "VAR3", "value": "val3"},
+      ],
+      "ports": [{"name": "metrics", "containerPort": 9090}],
+  }
+  merged = _deep_merge(base, override)
+  assert merged["env"] == [
+      {"name": "VAR1", "value": "val1"},
+      {"name": "VAR2", "value": "val2-updated"},
+      {"name": "VAR3", "value": "val3"},
+  ]
+  assert merged["ports"] == [
+      {"name": "http", "containerPort": 80},
+      {"name": "metrics", "containerPort": 9090},
+  ]
+
+
+def test_deep_merge_unnamed_lists_replaces():
+  from agent_sandbox_rl.resources import _deep_merge
+
+  base = {"command": ["sleep", "10"], "args": ["--verbose"]}
+  override = {"command": ["tail", "-f", "/dev/null"]}
+  merged = _deep_merge(base, override)
+  assert merged["command"] == ["tail", "-f", "/dev/null"]
+  assert merged["args"] == ["--verbose"]
+
+
+def test_extra_pod_spec_containers_non_list_raises_type_error():
+  r = _resources()
+  r.custom_api.get_namespaced_custom_object.side_effect = client.ApiException(status=404)
+  with pytest.raises(TypeError, match="extra_pod_spec\\['containers'\\] must be a list"):
+    r.ensure_template(IMG, TNAME, TemplateSpec(extra_pod_spec={"containers": {"name": "invalid"}}))
+
+
+def test_extra_pod_spec_merges_env_vars_in_container():
+  r = _resources()
+  r.custom_api.get_namespaced_custom_object.side_effect = client.ApiException(status=404)
+  extra_containers = [
+      {
+          "name": "agent-runtime",
+          "env": [
+              {"name": "BASE_VAR", "value": "base"},
+              {"name": "EXTRA_VAR", "value": "extra"},
+          ],
+      }
+  ]
+  r.ensure_template(IMG, TNAME, TemplateSpec(extra_pod_spec={"containers": extra_containers}))
+  _, kwargs = r.custom_api.create_namespaced_custom_object.call_args
+  pod = kwargs["body"]["spec"]["podTemplate"]["spec"]
+  assert pod["containers"][0]["name"] == "agent-runtime"
+  assert pod["containers"][0]["env"] == [
+      {"name": "BASE_VAR", "value": "base"},
+      {"name": "EXTRA_VAR", "value": "extra"},
+  ]
+
+
+# --- networkPolicyManagement (one policy per namespace, see
+# examples/agent-sandbox-rl-network-policy) -----------------------------------
+def _existing_template(**spec):
+  """A live template whose labels already match this run's, so only a policy-mode
+  change can produce a patch."""
+  return {"metadata": {"name": TNAME, "resourceVersion": "41",
+                       "labels": dict(constants.DEFAULT_LABELS)},
+          "spec": {"podTemplate": {"metadata": {"labels": {
+              **constants.DEFAULT_LABELS, "sandbox": TNAME}}}, **spec}}
+
+
+def test_template_manifest_omits_network_policy_management_by_default():
+  r = _resources()
+  r.custom_api.get_namespaced_custom_object.side_effect = client.ApiException(status=404)
+  r.ensure_template(IMG, TNAME, TemplateSpec())
+  _, kwargs = r.custom_api.create_namespaced_custom_object.call_args
+  # absent -> the controller's default (Managed), exactly as before the knob existed
+  assert "networkPolicyManagement" not in kwargs["body"]["spec"]
+
+
+def test_template_manifest_network_policy_management_unmanaged():
+  r = _resources()
+  r.custom_api.get_namespaced_custom_object.side_effect = client.ApiException(status=404)
+  r.ensure_template(IMG, TNAME, TemplateSpec(network_policy_management="Unmanaged"))
+  _, kwargs = r.custom_api.create_namespaced_custom_object.call_args
+  assert kwargs["body"]["spec"]["networkPolicyManagement"] == "Unmanaged"
+  assert "podTemplate" in kwargs["body"]["spec"]
+
+
+def test_template_spec_rejects_unknown_network_policy_management():
+  with pytest.raises(ValueError, match="Managed|Unmanaged"):
+    TemplateSpec(network_policy_management="Cilium")
+
+
+def test_ensure_template_patches_network_policy_management_on_existing():
+  r = _resources()
+  r.custom_api.get_namespaced_custom_object.return_value = _existing_template()
+  created = r.ensure_template(IMG, TNAME, TemplateSpec(network_policy_management="Unmanaged"))
+  assert created is False
+  r.custom_api.patch_namespaced_custom_object.assert_called_once()
+  _, kwargs = r.custom_api.patch_namespaced_custom_object.call_args
+  assert kwargs["name"] == TNAME
+  assert kwargs["plural"] == constants.TEMPLATES_PLURAL
+  # a merge patch on the one field, conditioned on the object that was read: the
+  # pod template (and so the pools) is untouched
+  assert kwargs["body"] == {"spec": {"networkPolicyManagement": "Unmanaged"},
+                            "metadata": {"resourceVersion": "41"}}
+
+
+def test_ensure_template_patches_back_to_managed_when_asked():
+  r = _resources()
+  r.custom_api.get_namespaced_custom_object.return_value = _existing_template(
+      networkPolicyManagement="Unmanaged")
+  r.ensure_template(IMG, TNAME, TemplateSpec(network_policy_management="Managed"))
+  _, kwargs = r.custom_api.patch_namespaced_custom_object.call_args
+  assert kwargs["body"]["spec"] == {"networkPolicyManagement": "Managed"}
+
+
+def test_ensure_template_leaves_policy_mode_alone_when_unset_or_equal():
+  r = _resources()
+  r.custom_api.get_namespaced_custom_object.return_value = _existing_template(
+      networkPolicyManagement="Unmanaged")
+  # no opinion: must not flip an operator's Unmanaged template back to Managed
+  r.ensure_template(IMG, TNAME, TemplateSpec())
+  # same value: nothing to do
+  r.ensure_template(IMG, TNAME, TemplateSpec(network_policy_management="Unmanaged"))
+  r.custom_api.patch_namespaced_custom_object.assert_not_called()
+
+
+def test_ensure_template_policy_mode_patch_failure_is_non_fatal():
+  r = _resources()
+  r.custom_api.get_namespaced_custom_object.return_value = _existing_template()
+  r.custom_api.patch_namespaced_custom_object.side_effect = client.ApiException(status=403)
+  assert r.ensure_template(IMG, TNAME, TemplateSpec(network_policy_management="Unmanaged")) is False
+
+
+def test_ensure_template_does_not_touch_foreign_template_policy_mode():
+  r = _resources()
+  r.custom_api.get_namespaced_custom_object.return_value = {
+      "metadata": {"name": TNAME, "labels": {**constants.DEFAULT_LABELS,
+                                             constants.RUN_ID_LABEL: "other-run"}},
+      "spec": {"podTemplate": {"metadata": {"labels": {}}}}}
+  created = r.ensure_template(IMG, TNAME, TemplateSpec(network_policy_management="Unmanaged"),
+                              owner_run_id="this-run", share_foreign=True)
+  assert created is False
+  r.custom_api.patch_namespaced_custom_object.assert_not_called()
+
+
+def test_fleet_pod_labels_are_the_labels_that_reach_pods():
+  r = Resources(MagicMock(), MagicMock(), "ns",
+                labels={constants.RUN_ID_LABEL: "run-1",
+                        "extensions.agents.x-k8s.io/other": "x", "team": "rl"})
+  labels = r.fleet_pod_labels()
+  assert labels == {constants.MANAGED_BY_LABEL: constants.MANAGED_BY_VALUE,
+                    constants.POD_RUN_ID_LABEL: "run-1", "team": "rl"}
+  # the controller drops reserved keys from pods, and `sandbox` is per template
+  assert constants.RUN_ID_LABEL in r._pod_template_labels(TNAME)
+  assert not any(k.startswith(constants.RESERVED_POD_LABEL_PREFIXES) for k in labels)
+
+
+def test_ensure_template_dry_run_never_writes_to_an_existing_template():
+  r = _resources()
+  # stale labels (no run id yet) and a different mode: both reconciles would patch
+  r.custom_api.get_namespaced_custom_object.return_value = {
+      "metadata": {"name": TNAME, "resourceVersion": "41", "labels": {}},
+      "spec": {"podTemplate": {"metadata": {"labels": {}}}}}
+  created = r.ensure_template(IMG, TNAME, TemplateSpec(network_policy_management="Unmanaged"),
+                              dry_run=True)
+  assert created is False
+  r.custom_api.patch_namespaced_custom_object.assert_not_called()
+
+
+def test_policy_mode_patch_is_conditioned_on_the_label_patch_result():
+  r = _resources()
+  stale = _existing_template()
+  stale["metadata"]["labels"] = {}                      # forces a label patch first
+  r.custom_api.get_namespaced_custom_object.return_value = stale
+  r.custom_api.patch_namespaced_custom_object.side_effect = [
+      {**stale, "metadata": {**stale["metadata"], "resourceVersion": "42"}}, {}]
+  r.ensure_template(IMG, TNAME, TemplateSpec(network_policy_management="Unmanaged"))
+  calls = r.custom_api.patch_namespaced_custom_object.call_args_list
+  assert len(calls) == 2
+  assert calls[1].kwargs["body"] == {"spec": {"networkPolicyManagement": "Unmanaged"},
+                                     "metadata": {"resourceVersion": "42"}}
+
+
+def test_policy_mode_patch_conflict_rereads_once_then_leaves_the_template_alone():
+  r = _resources()
+  r.custom_api.get_namespaced_custom_object.return_value = _existing_template()
+  r.custom_api.patch_namespaced_custom_object.side_effect = client.ApiException(status=409)
+  assert r.ensure_template(IMG, TNAME, TemplateSpec(network_policy_management="Unmanaged")) is False
+  assert r.custom_api.get_namespaced_custom_object.call_count == 2
+  assert r.custom_api.patch_namespaced_custom_object.call_count == 2
+
+
+def test_label_patch_is_conditioned_on_the_inspected_template():
+  r = _resources()
+  stale = _existing_template()
+  stale["metadata"]["labels"] = {}
+  r.custom_api.get_namespaced_custom_object.return_value = stale
+  r.ensure_template(IMG, TNAME, TemplateSpec())
+  body = r.custom_api.patch_namespaced_custom_object.call_args.kwargs["body"]
+  assert body["metadata"]["resourceVersion"] == "41"
+
+
+def test_conflict_rechecks_ownership_before_writing_again():
+  r = _resources()
+  ours = _existing_template()
+  ours["metadata"]["labels"] = {}                       # stale: label patch first
+  replacement = _existing_template()
+  replacement["metadata"]["resourceVersion"] = "77"
+  replacement["metadata"]["labels"] = {constants.RUN_ID_LABEL: "other-run"}
+  r.custom_api.get_namespaced_custom_object.side_effect = [ours, replacement]
+  r.custom_api.patch_namespaced_custom_object.side_effect = client.ApiException(status=409)
+  with pytest.raises(OwnedByAnotherRunError):
+    r.ensure_template(IMG, TNAME, TemplateSpec(network_policy_management="Unmanaged"),
+                      owner_run_id="this-run")
+  r.custom_api.patch_namespaced_custom_object.assert_called_once()   # nothing after
+
+
+def test_conflict_then_deleted_template_is_created_fresh():
+  r = _resources()
+  stale = _existing_template()
+  stale["metadata"]["labels"] = {}
+  r.custom_api.get_namespaced_custom_object.side_effect = [stale, client.ApiException(status=404)]
+  r.custom_api.patch_namespaced_custom_object.side_effect = client.ApiException(status=409)
+  assert r.ensure_template(IMG, TNAME, TemplateSpec(network_policy_management="Unmanaged")) is True
+  body = r.custom_api.create_namespaced_custom_object.call_args.kwargs["body"]
+  assert body["spec"]["networkPolicyManagement"] == "Unmanaged"
+
+
+
+# ------------------------------------------------ hardening, limits, sidecars
+
+
+def _created_body(r):
+  _, kwargs = r.custom_api.create_namespaced_custom_object.call_args
+  return kwargs["body"]
+
+
+def _absent():
+  r = _resources()
+  r.custom_api.get_namespaced_custom_object.side_effect = client.ApiException(status=404)
+  return r
+
+
+def test_template_manifest_is_hardened_by_default():
+  r = _absent()
+  r.ensure_template(IMG, TNAME, TemplateSpec())
+  pod = _created_body(r)["spec"]["podTemplate"]["spec"]
+  assert pod["automountServiceAccountToken"] is False
+  assert pod["shareProcessNamespace"] is False
+  assert "limits" not in pod["containers"][0]["resources"]      # unlimited unless asked
+
+
+def test_template_manifest_hardening_opt_out_and_limits():
+  r = _absent()
+  r.ensure_template(IMG, TNAME, TemplateSpec(
+      automount_service_account_token=True, share_process_namespace=True,
+      resources=ResourceSpec(cpu="1", memory="2Gi", cpu_limit="2", memory_limit="4Gi")))
+  pod = _created_body(r)["spec"]["podTemplate"]["spec"]
+  assert pod["automountServiceAccountToken"] is True and pod["shareProcessNamespace"] is True
+  assert pod["containers"][0]["resources"] == {
+      "requests": {"cpu": "1", "memory": "2Gi"}, "limits": {"cpu": "2", "memory": "4Gi"}}
+  # one limit alone is fine too
+  r = _absent()
+  r.ensure_template(IMG, TNAME, TemplateSpec(resources=ResourceSpec(memory_limit="4Gi")))
+  pod = _created_body(r)["spec"]["podTemplate"]["spec"]
+  assert pod["containers"][0]["resources"]["limits"] == {"memory": "4Gi"}
+
+
+def test_extra_pod_spec_task_image_placeholder_is_resolved_per_template():
+  extra = {
+      "containers": [{"name": "eval", "image": constants.TASK_IMAGE_PLACEHOLDER,
+                      "command": ["sleep", "infinity"]},
+                     {"name": "proxy", "image": "proxy:v1", "imagePullPolicy": "Always"},
+                     {"name": "otel", "image": "otel/collector:0.90"}],
+      "initContainers": [{"name": "seed", "image": "{task_image}", "command": ["true"]},
+                         {"name": "fetch", "image": "busybox:1.36", "command": ["true"]}],
+  }
+  spec = TemplateSpec(extra_pod_spec=extra)
+  r = _absent()
+  r.ensure_template(IMG, TNAME, spec)
+  pod = _created_body(r)["spec"]["podTemplate"]["spec"]
+  by_name = {c["name"]: c for c in pod["containers"]}
+  assert by_name["eval"]["image"] == IMG                        # the template's task image
+  assert by_name["eval"]["imagePullPolicy"] == "IfNotPresent"   # filled from the template
+  assert by_name["proxy"]["imagePullPolicy"] == "Always"        # explicit value kept
+  assert "imagePullPolicy" not in by_name["otel"]               # not the task image:
+  assert pod["initContainers"][0]["image"] == IMG                # Kubernetes default
+  assert pod["initContainers"][0]["imagePullPolicy"] == "IfNotPresent"
+  assert "imagePullPolicy" not in pod["initContainers"][1]
+  # a second template from the same spec gets ITS image: the caller's dicts are
+  # never written to
+  r = _absent()
+  r.ensure_template("other/image:1", "r2e-img-other", spec)
+  pod = _created_body(r)["spec"]["podTemplate"]["spec"]
+  assert {c["name"]: c["image"] for c in pod["containers"]}["eval"] == "other/image:1"
+  assert extra["containers"][0]["image"] == constants.TASK_IMAGE_PLACEHOLDER
+  assert extra["initContainers"][0]["image"] == "{task_image}"
+
+
+def test_resource_limits_reject_empty_strings_instead_of_dropping_them():
+  with pytest.raises(ValueError, match="non-empty"):
+    ResourceSpec(cpu_limit="")
+  with pytest.raises(ValueError, match="non-empty"):
+    ResourceSpec(memory="  ")
+  assert ResourceSpec(cpu_limit=None).cpu_limit is None
+
+
+def test_extra_pod_spec_keys_win_over_the_hardening_defaults():
+  r = _absent()
+  r.ensure_template(IMG, TNAME, TemplateSpec(extra_pod_spec={"shareProcessNamespace": True}))
+  pod = _created_body(r)["spec"]["podTemplate"]["spec"]
+  assert pod["shareProcessNamespace"] is True
+  assert pod["automountServiceAccountToken"] is False
+
+
+def test_extra_template_spec_rejects_keys_that_have_their_own_knob():
+  with pytest.raises(ValueError, match="network_policy_management"):
+    TemplateSpec(extra_template_spec={"networkPolicyManagement": "Unmanaged"})
+  with pytest.raises(ValueError, match="extra_pod_spec"):
+    TemplateSpec(extra_template_spec={"podTemplate": {}})
+
+
+def test_extra_template_spec_merges_next_to_pod_template_and_rejects_pod_template():
+  r = _absent()
+  r.ensure_template(IMG, TNAME, TemplateSpec(extra_template_spec={"foo": {"bar": 1}},
+                                             network_policy_management="Unmanaged"))
+  spec = _created_body(r)["spec"]
+  assert spec["foo"] == {"bar": 1} and spec["networkPolicyManagement"] == "Unmanaged"
+  assert "podTemplate" in spec
+  with pytest.raises(ValueError, match="podTemplate"):
+    TemplateSpec(extra_template_spec={"podTemplate": {}})

@@ -17,11 +17,18 @@ package controllers
 import (
 	"context"
 	"errors"
+	"fmt"
+	"math/rand/v2"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/go-cmp/cmp/cmpopts"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/testutil"
+	dto "github.com/prometheus/client_model/go"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
@@ -30,13 +37,20 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/intstr"
+	"k8s.io/apimachinery/pkg/util/validation/field"
+	"k8s.io/client-go/tools/events"
 	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
+	"sigs.k8s.io/controller-runtime/pkg/event"
 
 	sandboxv1beta1 "sigs.k8s.io/agent-sandbox/api/v1beta1"
+	extensionsv1beta1 "sigs.k8s.io/agent-sandbox/extensions/api/v1beta1"
 	asmetrics "sigs.k8s.io/agent-sandbox/internal/metrics"
 )
 
@@ -44,16 +58,58 @@ func newFakeClient(initialObjs ...runtime.Object) client.WithWatch {
 	return fake.NewClientBuilder().
 		WithScheme(Scheme).
 		WithStatusSubresource(&sandboxv1beta1.Sandbox{}).
+		WithIndex(&corev1.Pod{}, podSandboxNameHashIndex, podSandboxNameHashIndexer).
 		WithRuntimeObjects(initialObjs...).
 		Build()
 }
+
+type createTimestampClient struct {
+	client.WithWatch
+	now func() time.Time
+}
+
+func (c *createTimestampClient) Create(ctx context.Context, obj client.Object, opts ...client.CreateOption) error {
+	if pod, ok := obj.(*corev1.Pod); ok && pod.CreationTimestamp.IsZero() {
+		pod.CreationTimestamp = metav1.NewTime(c.now())
+	}
+	if svc, ok := obj.(*corev1.Service); ok && svc.CreationTimestamp.IsZero() {
+		svc.CreationTimestamp = metav1.NewTime(c.now())
+	}
+	return c.WithWatch.Create(ctx, obj, opts...)
+}
+
+func newFakeClientWithInterceptor(funcs interceptor.Funcs, initialObjs ...runtime.Object) client.WithWatch {
+	return fake.NewClientBuilder().
+		WithScheme(Scheme).
+		WithStatusSubresource(&sandboxv1beta1.Sandbox{}).
+		WithIndex(&corev1.Pod{}, podSandboxNameHashIndex, podSandboxNameHashIndexer).
+		WithRuntimeObjects(initialObjs...).
+		WithInterceptorFuncs(funcs).
+		Build()
+}
+
+// invalidServiceNameError mirrors the apiserver's rejection of a Service whose
+// metadata.name exceeds the 63-character DNS-1035 label limit. The fake client
+// does not run apiserver name validation, so tests inject this via an
+// interceptor to reproduce the real permanent-failure path.
+func invalidServiceNameError(name string) error {
+	return k8serrors.NewInvalid(
+		schema.GroupKind{Kind: "Service"},
+		name,
+		field.ErrorList{
+			field.Invalid(field.NewPath("metadata.name"), name, "must be no more than 63 characters"),
+		},
+	)
+}
+
+const overlongSandboxName = "sandbox-name-deliberately-exceeding-the-sixty-three-char-service-label-limit"
 
 const sandboxUID = types.UID("test-sandbox-uid")
 
 func sandboxControllerRef(name string) metav1.OwnerReference {
 	return metav1.OwnerReference{
-		APIVersion:         "agents.x-k8s.io/v1beta1",
-		Kind:               "Sandbox",
+		APIVersion:         sandboxv1beta1.GroupVersion.String(),
+		Kind:               sandboxv1beta1.SandboxKind,
 		Name:               name,
 		UID:                sandboxUID,
 		Controller:         new(true),
@@ -67,8 +123,12 @@ func TestComputeConditions(t *testing.T) {
 	gen := int64(1)
 	sbWithMode := func(mode sandboxv1beta1.SandboxOperatingMode) *sandboxv1beta1.Sandbox {
 		return &sandboxv1beta1.Sandbox{
-			ObjectMeta: metav1.ObjectMeta{Generation: gen},
-			Spec:       sandboxv1beta1.SandboxSpec{OperatingMode: mode},
+			ObjectMeta: metav1.ObjectMeta{
+				Name:       "test-sandbox",
+				UID:        "test-uid",
+				Generation: gen,
+			},
+			Spec: sandboxv1beta1.SandboxSpec{OperatingMode: mode},
 		}
 	}
 
@@ -78,12 +138,59 @@ func TestComputeConditions(t *testing.T) {
 		return sb
 	}
 
+	// ownedPod stamps the controller ownerRef pointing at the fixture sandbox.
+	// Conditions that mirror Pod state (Finished, PodScheduled) only trust a Pod
+	// this Sandbox owns, so fixtures standing in for the real backing Pod need it.
+	ownedPod := func(pod *corev1.Pod) *corev1.Pod {
+		pod.OwnerReferences = []metav1.OwnerReference{{
+			APIVersion: sandboxv1beta1.GroupVersion.String(),
+			Kind:       sandboxv1beta1.SandboxKind,
+			Name:       "test-sandbox",
+			UID:        "test-uid",
+			Controller: new(true),
+		}}
+		return pod
+	}
+
+	// waitingContainer is a container the kubelet reports as waiting. lastExit,
+	// when set, is the reason of its previous termination.
+	waitingContainer := func(name, reason string, restarts int32, lastExit string) corev1.ContainerStatus {
+		cs := corev1.ContainerStatus{
+			Name:         name,
+			RestartCount: restarts,
+			State:        corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{Reason: reason, Message: "kubelet detail that changes on every backoff"}},
+		}
+		if lastExit != "" {
+			cs.LastTerminationState.Terminated = &corev1.ContainerStateTerminated{Reason: lastExit, ExitCode: 1}
+		}
+		return cs
+	}
+
+	podWithContainerState := func(phase corev1.PodPhase, ready bool, containers ...corev1.ContainerStatus) *corev1.Pod {
+		readyStatus := corev1.ConditionFalse
+		if ready {
+			readyStatus = corev1.ConditionTrue
+		}
+		return &corev1.Pod{Status: corev1.PodStatus{
+			Phase:             phase,
+			PodIPs:            []corev1.PodIP{{IP: "10.244.0.1"}},
+			Conditions:        []corev1.PodCondition{{Type: corev1.PodReady, Status: readyStatus}},
+			ContainerStatuses: containers,
+		}}
+	}
+
+	// A permanent apiserver validation error (a derived Service name over the
+	// 63-character limit) must map to Ready=False/InvalidConfiguration rather than
+	// the generic ReconcilerError.
+	invalidNameErr := invalidServiceNameError("too-long-service-name")
+
 	testCases := []struct {
 		name               string
 		sandbox            *sandboxv1beta1.Sandbox
 		err                error
 		svc                *corev1.Service
 		pod                *corev1.Pod
+		podErr             error
 		expectedConditions []metav1.Condition
 	}{
 		{
@@ -92,6 +199,7 @@ func TestComputeConditions(t *testing.T) {
 			svc:     nil,
 			pod:     nil,
 			expectedConditions: []metav1.Condition{
+				{Type: "Suspended", Status: "False", ObservedGeneration: gen, Reason: "NotSuspended", Message: "Sandbox is not suspended"},
 				{Type: "Ready", Status: "False", ObservedGeneration: gen, Reason: "DependenciesNotReady", Message: "Pod does not exist; Service does not exist"},
 			},
 		},
@@ -101,6 +209,7 @@ func TestComputeConditions(t *testing.T) {
 			svc:     &corev1.Service{},
 			pod:     nil,
 			expectedConditions: []metav1.Condition{
+				{Type: "Suspended", Status: "False", ObservedGeneration: gen, Reason: "NotSuspended", Message: "Sandbox is not suspended"},
 				{Type: "Ready", Status: "False", ObservedGeneration: gen, Reason: "DependenciesNotReady", Message: "Pod does not exist; Service Exists"},
 			},
 		},
@@ -108,8 +217,10 @@ func TestComputeConditions(t *testing.T) {
 			name:    "3. Pod Pending",
 			sandbox: sbWithMode(sandboxv1beta1.SandboxOperatingModeRunning),
 			svc:     &corev1.Service{},
-			pod:     &corev1.Pod{Status: corev1.PodStatus{Phase: corev1.PodPending}},
+			pod:     ownedPod(&corev1.Pod{Status: corev1.PodStatus{Phase: corev1.PodPending}}),
 			expectedConditions: []metav1.Condition{
+				{Type: "Suspended", Status: "False", ObservedGeneration: gen, Reason: "NotSuspended", Message: "Sandbox is not suspended"},
+				{Type: "PodScheduled", Status: "Unknown", ObservedGeneration: gen, Reason: "PodSchedulingUnknown", Message: "Pod has not reported a PodScheduled condition yet"},
 				{Type: "Ready", Status: "False", ObservedGeneration: gen, Reason: "DependenciesNotReady", Message: "Pod exists with phase: Pending; Service Exists"},
 			},
 		},
@@ -117,16 +228,19 @@ func TestComputeConditions(t *testing.T) {
 			name:    "4. Pod Running but not Ready",
 			sandbox: sbWithMode(sandboxv1beta1.SandboxOperatingModeRunning),
 			svc:     &corev1.Service{},
-			pod: &corev1.Pod{
+			pod: ownedPod(&corev1.Pod{
 				Status: corev1.PodStatus{
 					Phase:  corev1.PodRunning,
 					PodIPs: []corev1.PodIP{{IP: "10.244.0.1"}},
 					Conditions: []corev1.PodCondition{
+						{Type: corev1.PodScheduled, Status: corev1.ConditionTrue},
 						{Type: corev1.PodReady, Status: corev1.ConditionFalse},
 					},
 				},
-			},
+			}),
 			expectedConditions: []metav1.Condition{
+				{Type: "Suspended", Status: "False", ObservedGeneration: gen, Reason: "NotSuspended", Message: "Sandbox is not suspended"},
+				{Type: "PodScheduled", Status: "True", ObservedGeneration: gen, Reason: "PodScheduled"},
 				{Type: "Ready", Status: "False", ObservedGeneration: gen, Reason: "DependenciesNotReady", Message: "Pod is Running but not Ready; Service Exists"},
 			},
 		},
@@ -134,7 +248,7 @@ func TestComputeConditions(t *testing.T) {
 			name:    "5. Pod ready but no IP yet",
 			sandbox: sbWithMode(sandboxv1beta1.SandboxOperatingModeRunning),
 			svc:     &corev1.Service{},
-			pod: &corev1.Pod{
+			pod: ownedPod(&corev1.Pod{
 				Status: corev1.PodStatus{
 					Phase: corev1.PodRunning,
 					Conditions: []corev1.PodCondition{
@@ -144,8 +258,10 @@ func TestComputeConditions(t *testing.T) {
 						},
 					},
 				},
-			},
+			}),
 			expectedConditions: []metav1.Condition{
+				{Type: "Suspended", Status: "False", ObservedGeneration: gen, Reason: "NotSuspended", Message: "Sandbox is not suspended"},
+				{Type: "PodScheduled", Status: "Unknown", ObservedGeneration: gen, Reason: "PodSchedulingUnknown", Message: "Pod has not reported a PodScheduled condition yet"},
 				{Type: "Ready", Status: "False", ObservedGeneration: gen, Reason: "DependenciesNotReady", Message: "Pod is Ready but has no podIPs yet; Service Exists"},
 			},
 		},
@@ -154,6 +270,19 @@ func TestComputeConditions(t *testing.T) {
 			sandbox: sbWithMode(sandboxv1beta1.SandboxOperatingModeSuspended),
 			svc:     &corev1.Service{},
 			pod: &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-sandbox-pod",
+					Namespace: "default",
+					OwnerReferences: []metav1.OwnerReference{
+						{
+							APIVersion: sandboxv1beta1.GroupVersion.String(),
+							Kind:       "Sandbox",
+							Name:       "test-sandbox",
+							UID:        "test-uid",
+							Controller: new(true),
+						},
+					},
+				},
 				Status: corev1.PodStatus{
 					Phase: corev1.PodRunning,
 					Conditions: []corev1.PodCondition{
@@ -162,8 +291,60 @@ func TestComputeConditions(t *testing.T) {
 				},
 			},
 			expectedConditions: []metav1.Condition{
-				{Type: "Suspended", Status: "False", ObservedGeneration: gen, Reason: "PodNotTerminated", Message: "Pod has not been terminated. Sandbox is operational."},
+				{Type: "Suspended", Status: "False", ObservedGeneration: gen, Reason: "PodTerminating", Message: "Pod is terminating. Sandbox is suspending"},
+				{Type: "PodScheduled", Status: "Unknown", ObservedGeneration: gen, Reason: "PodSchedulingUnknown", Message: "Pod has not reported a PodScheduled condition yet"},
 				{Type: "Ready", Status: "False", ObservedGeneration: gen, Reason: "SandboxSuspended", Message: "Sandbox is suspending"},
+			},
+		},
+		{
+			name:    "6b. Suspended by user - Pod not owned",
+			sandbox: sbWithMode(sandboxv1beta1.SandboxOperatingModeSuspended),
+			svc:     &corev1.Service{},
+			pod: &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-sandbox-pod",
+					Namespace: "default",
+				},
+				Status: corev1.PodStatus{
+					Phase: corev1.PodRunning,
+					Conditions: []corev1.PodCondition{
+						{Type: corev1.PodReady, Status: corev1.ConditionTrue},
+					},
+				},
+			},
+			expectedConditions: []metav1.Condition{
+				{Type: "Suspended", Status: "False", ObservedGeneration: gen, Reason: "PodNotOwned", Message: "Refused to delete pod because it is not owned by this sandbox"},
+				{Type: "Ready", Status: "False", ObservedGeneration: gen, Reason: "SandboxSuspended", Message: "Sandbox is suspending"},
+			},
+		},
+		{
+			name:    "6c. Suspended - owned pod present but delete failed stays terminating (not Unknown)",
+			sandbox: sbWithMode(sandboxv1beta1.SandboxOperatingModeSuspended),
+			svc:     &corev1.Service{},
+			pod: &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-sandbox-pod",
+					Namespace: "default",
+					OwnerReferences: []metav1.OwnerReference{
+						{
+							APIVersion: sandboxv1beta1.GroupVersion.String(),
+							Kind:       "Sandbox",
+							Name:       "test-sandbox",
+							UID:        "test-uid",
+							Controller: new(true),
+						},
+					},
+				},
+				Status: corev1.PodStatus{Phase: corev1.PodRunning},
+			},
+			// reconcilePod returns the still-present pod alongside the delete error, so
+			// we know the pod exists and must not report it as terminated/unknown.
+			podErr: errors.New("failed to delete pod: boom"),
+			err:    errors.New("failed to delete pod: boom"),
+			expectedConditions: []metav1.Condition{
+				{Type: "Suspended", Status: "False", ObservedGeneration: gen, Reason: "PodTerminating", Message: "Pod is terminating. Sandbox is suspending"},
+				{Type: "PodScheduled", Status: "Unknown", ObservedGeneration: gen, Reason: "PodSchedulingUnknown", Message: "Pod has not reported a PodScheduled condition yet"},
+				{Type: "Ready", Status: "False", ObservedGeneration: gen, Reason: "ReconcilerError", Message: "Error seen: failed to delete pod: boom"},
 			},
 		},
 		{
@@ -172,63 +353,355 @@ func TestComputeConditions(t *testing.T) {
 			svc:     &corev1.Service{},
 			pod:     nil,
 			expectedConditions: []metav1.Condition{
-				{Type: "Suspended", Status: "True", ObservedGeneration: gen, Reason: "PodTerminated", Message: "Pod has been terminated. Sandbox is not operational."},
+				{Type: "Suspended", Status: "True", ObservedGeneration: gen, Reason: "PodTerminated", Message: "Pod has been terminated. Sandbox is suspended"},
 				{Type: "Ready", Status: "False", ObservedGeneration: gen, Reason: "SandboxSuspended", Message: "Sandbox is suspended"},
 			},
 		},
 		{
-			name:    "8. Resuming - Pod missing",
+			name:    "7b. Suspended - pod reconcile failed reports Unknown",
+			sandbox: sbWithMode(sandboxv1beta1.SandboxOperatingModeSuspended),
+			svc:     &corev1.Service{},
+			pod:     nil,
+			// reconcilePod failed, so a nil pod does not prove the pod is gone.
+			podErr: errors.New("pod get failed"),
+			err:    errors.New("pod get failed"),
+			expectedConditions: []metav1.Condition{
+				{Type: "Suspended", Status: "Unknown", ObservedGeneration: gen, Reason: "PodStateUnknown", Message: "Pod state is unknown. Sandbox suspension cannot be confirmed"},
+				{Type: "PodScheduled", Status: "Unknown", ObservedGeneration: gen, Reason: "PodSchedulingUnknown", Message: "Pod state is unknown. Pod scheduling cannot be determined"},
+				{Type: "Ready", Status: "False", ObservedGeneration: gen, Reason: "ReconcilerError", Message: "Error seen: pod get failed"},
+			},
+		},
+		{
+			// A failed pod lookup must not be mistaken for a confirmed absent pod:
+			// PodScheduled reports Unknown so pruning keeps it, rather than removing
+			// it and implying the sandbox has no backing pod.
+			name:    "7c. Running - pod reconcile failed keeps PodScheduled as Unknown",
 			sandbox: sbWithMode(sandboxv1beta1.SandboxOperatingModeRunning),
 			svc:     &corev1.Service{},
 			pod:     nil,
+			podErr:  errors.New("pod list failed"),
+			err:     errors.New("pod list failed"),
 			expectedConditions: []metav1.Condition{
+				{Type: "Suspended", Status: "False", ObservedGeneration: gen, Reason: "NotSuspended", Message: "Sandbox is not suspended"},
+				{Type: "PodScheduled", Status: "Unknown", ObservedGeneration: gen, Reason: "PodSchedulingUnknown", Message: "Pod state is unknown. Pod scheduling cannot be determined"},
+				{Type: "Ready", Status: "False", ObservedGeneration: gen, Reason: "ReconcilerError", Message: "Error seen: pod list failed"},
+			},
+		},
+		{
+			name: "8. Resuming - Pod missing",
+			sandbox: func() *sandboxv1beta1.Sandbox {
+				sb := sbWithMode(sandboxv1beta1.SandboxOperatingModeRunning)
+				sb.Status.Conditions = []metav1.Condition{{Type: "Suspended", Status: "True"}}
+				return sb
+			}(),
+			svc: &corev1.Service{},
+			pod: nil,
+			expectedConditions: []metav1.Condition{
+				{Type: "Suspended", Status: "False", ObservedGeneration: gen, Reason: "NotSuspended", Message: "Sandbox is not suspended"},
 				{Type: "Ready", Status: "False", ObservedGeneration: gen, Reason: "DependenciesNotReady", Message: "Pod does not exist; Service Exists"},
 			},
 		},
 		{
-			name:    "9. Unresponsive - Pod Status Unknown",
+			name: "9. Recreate recovery clears Finished when failed pod was deleted",
+			sandbox: &sandboxv1beta1.Sandbox{
+				ObjectMeta: metav1.ObjectMeta{Generation: gen},
+				Spec: sandboxv1beta1.SandboxSpec{
+					SandboxBlueprint: sandboxv1beta1.SandboxBlueprint{FailedPodPolicy: sandboxv1beta1.FailedPodPolicyRecreate},
+					OperatingMode:    sandboxv1beta1.SandboxOperatingModeRunning,
+				},
+			},
+			svc: &corev1.Service{},
+			pod: nil,
+			expectedConditions: []metav1.Condition{
+				{Type: "Suspended", Status: "False", ObservedGeneration: gen, Reason: "NotSuspended", Message: "Sandbox is not suspended"},
+				{Type: "Ready", Status: "False", ObservedGeneration: gen, Reason: "DependenciesNotReady", Message: "Pod does not exist; Service Exists"},
+			},
+		},
+		{
+			name:    "10. Unresponsive - Pod Status Unknown",
 			sandbox: sbWithMode(sandboxv1beta1.SandboxOperatingModeRunning),
 			svc:     &corev1.Service{},
-			pod:     &corev1.Pod{Status: corev1.PodStatus{Phase: corev1.PodUnknown}},
+			pod:     ownedPod(&corev1.Pod{Status: corev1.PodStatus{Phase: corev1.PodUnknown}}),
 			expectedConditions: []metav1.Condition{
+				{Type: "Suspended", Status: "False", ObservedGeneration: gen, Reason: "NotSuspended", Message: "Sandbox is not suspended"},
+				{Type: "PodScheduled", Status: "Unknown", ObservedGeneration: gen, Reason: "PodSchedulingUnknown", Message: "Pod has not reported a PodScheduled condition yet"},
 				{Type: "Ready", Status: "False", ObservedGeneration: gen, Reason: "DependenciesNotReady", Message: "Pod exists with phase: Unknown; Service Exists"},
 			},
 		},
 		{
-			name:    "10. Pod Failed",
+			name:    "11. Pod Failed",
 			sandbox: sbWithMode(sandboxv1beta1.SandboxOperatingModeRunning),
 			svc:     &corev1.Service{},
-			pod:     &corev1.Pod{Status: corev1.PodStatus{Phase: corev1.PodFailed}},
+			pod: &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					OwnerReferences: []metav1.OwnerReference{
+						{APIVersion: sandboxv1beta1.GroupVersion.String(), Kind: "Sandbox", Name: "test-sandbox", UID: "test-uid", Controller: new(true)},
+					},
+				},
+				Status: corev1.PodStatus{
+					Phase: corev1.PodFailed,
+					Conditions: []corev1.PodCondition{
+						{Type: corev1.PodScheduled, Status: corev1.ConditionTrue},
+					},
+				},
+			},
 			expectedConditions: []metav1.Condition{
+				{Type: "Suspended", Status: "False", ObservedGeneration: gen, Reason: "NotSuspended", Message: "Sandbox is not suspended"},
 				{Type: "Finished", Status: "True", ObservedGeneration: gen, Reason: "PodFailed", Message: "Pod failed"},
-				{Type: "Ready", Status: "False", ObservedGeneration: gen, Reason: "DependenciesNotReady", Message: "Pod exists with phase: Failed; Service Exists"},
+				{Type: "PodScheduled", Status: "True", ObservedGeneration: gen, Reason: "PodScheduled"},
+				{Type: "Ready", Status: "False", ObservedGeneration: gen, Reason: "PodFailed", Message: "Pod failed"},
 			},
 		},
 		{
-			name:    "11. Pod Succeeded",
+			name:    "12. Pod Succeeded",
 			sandbox: sbWithMode(sandboxv1beta1.SandboxOperatingModeRunning),
 			svc:     &corev1.Service{},
-			pod:     &corev1.Pod{Status: corev1.PodStatus{Phase: corev1.PodSucceeded}},
+			pod: &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					OwnerReferences: []metav1.OwnerReference{
+						{APIVersion: sandboxv1beta1.GroupVersion.String(), Kind: "Sandbox", Name: "test-sandbox", UID: "test-uid", Controller: new(true)},
+					},
+				},
+				Status: corev1.PodStatus{
+					Phase: corev1.PodSucceeded,
+					Conditions: []corev1.PodCondition{
+						{Type: corev1.PodScheduled, Status: corev1.ConditionTrue},
+					},
+				},
+			},
 			expectedConditions: []metav1.Condition{
+				{Type: "Suspended", Status: "False", ObservedGeneration: gen, Reason: "NotSuspended", Message: "Sandbox is not suspended"},
 				{Type: "Finished", Status: "True", ObservedGeneration: gen, Reason: "PodSucceeded", Message: "Pod completed successfully"},
-				{Type: "Ready", Status: "False", ObservedGeneration: gen, Reason: "DependenciesNotReady", Message: "Pod exists with phase: Succeeded; Service Exists"},
+				{Type: "PodScheduled", Status: "True", ObservedGeneration: gen, Reason: "PodScheduled"},
+				{Type: "Ready", Status: "False", ObservedGeneration: gen, Reason: "PodSucceeded", Message: "Pod completed successfully"},
 			},
 		},
 		{
-			name:    "12. Reconciler error takes precedence",
+			name:    "12b. Foreign terminal pod does not drive Finished",
+			sandbox: sbWithMode(sandboxv1beta1.SandboxOperatingModeSuspended),
+			svc:     &corev1.Service{},
+			// A Succeeded pod not owned by this Sandbox (occupying the name while
+			// suspended) must not produce a Finished condition on this Sandbox.
+			pod: &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{Name: "test-sandbox-pod", Namespace: "default"},
+				Status:     corev1.PodStatus{Phase: corev1.PodSucceeded},
+			},
+			expectedConditions: []metav1.Condition{
+				{Type: "Suspended", Status: "False", ObservedGeneration: gen, Reason: "PodNotOwned", Message: "Refused to delete pod because it is not owned by this sandbox"},
+				{Type: "Ready", Status: "False", ObservedGeneration: gen, Reason: "SandboxSuspended", Message: "Sandbox is suspending"},
+			},
+		},
+		{
+			name:    "13. Reconciler error takes precedence",
 			sandbox: sbWithMode(sandboxv1beta1.SandboxOperatingModeRunning),
 			err:     errors.New("something went wrong"),
 			svc:     nil,
 			pod:     nil,
 			expectedConditions: []metav1.Condition{
+				{Type: "Suspended", Status: "False", ObservedGeneration: gen, Reason: "NotSuspended", Message: "Sandbox is not suspended"},
 				{Type: "Ready", Status: "False", ObservedGeneration: gen, Reason: "ReconcilerError", Message: "Error seen: something went wrong"},
+			},
+		},
+		{
+			name:    "14. Pod unschedulable - reason and message mirrored verbatim",
+			sandbox: sbWithMode(sandboxv1beta1.SandboxOperatingModeRunning),
+			svc:     &corev1.Service{},
+			pod: ownedPod(&corev1.Pod{Status: corev1.PodStatus{
+				Phase: corev1.PodPending,
+				Conditions: []corev1.PodCondition{
+					{
+						Type:    corev1.PodScheduled,
+						Status:  corev1.ConditionFalse,
+						Reason:  corev1.PodReasonUnschedulable,
+						Message: "0/3 nodes are available: 3 Insufficient cpu.",
+					},
+				},
+			}}),
+			expectedConditions: []metav1.Condition{
+				{Type: "Suspended", Status: "False", ObservedGeneration: gen, Reason: "NotSuspended", Message: "Sandbox is not suspended"},
+				{Type: "PodScheduled", Status: "False", ObservedGeneration: gen, Reason: "Unschedulable", Message: "0/3 nodes are available: 3 Insufficient cpu."},
+				{Type: "Ready", Status: "False", ObservedGeneration: gen, Reason: "DependenciesNotReady", Message: "Pod exists with phase: Pending; Service Exists"},
+			},
+		},
+		{
+			name:    "15. Pod scheduling gated - reason passed through",
+			sandbox: sbWithMode(sandboxv1beta1.SandboxOperatingModeRunning),
+			svc:     &corev1.Service{},
+			pod: ownedPod(&corev1.Pod{Status: corev1.PodStatus{
+				Phase: corev1.PodPending,
+				Conditions: []corev1.PodCondition{
+					{
+						Type:    corev1.PodScheduled,
+						Status:  corev1.ConditionFalse,
+						Reason:  corev1.PodReasonSchedulingGated,
+						Message: "Scheduling is blocked due to non-empty scheduling gates",
+					},
+				},
+			}}),
+			expectedConditions: []metav1.Condition{
+				{Type: "Suspended", Status: "False", ObservedGeneration: gen, Reason: "NotSuspended", Message: "Sandbox is not suspended"},
+				{Type: "PodScheduled", Status: "False", ObservedGeneration: gen, Reason: "SchedulingGated", Message: "Scheduling is blocked due to non-empty scheduling gates"},
+				{Type: "Ready", Status: "False", ObservedGeneration: gen, Reason: "DependenciesNotReady", Message: "Pod exists with phase: Pending; Service Exists"},
+			},
+		},
+		{
+			name:    "16. Pod not scheduled with empty reason - fallback reason keeps condition valid",
+			sandbox: sbWithMode(sandboxv1beta1.SandboxOperatingModeRunning),
+			svc:     &corev1.Service{},
+			pod: ownedPod(&corev1.Pod{Status: corev1.PodStatus{
+				Phase: corev1.PodPending,
+				Conditions: []corev1.PodCondition{
+					{
+						Type:   corev1.PodScheduled,
+						Status: corev1.ConditionFalse,
+					},
+				},
+			}}),
+			expectedConditions: []metav1.Condition{
+				{Type: "Suspended", Status: "False", ObservedGeneration: gen, Reason: "NotSuspended", Message: "Sandbox is not suspended"},
+				{Type: "PodScheduled", Status: "False", ObservedGeneration: gen, Reason: "PodSchedulingUnknown"},
+				{Type: "Ready", Status: "False", ObservedGeneration: gen, Reason: "DependenciesNotReady", Message: "Pod exists with phase: Pending; Service Exists"},
+			},
+		},
+		{
+			name:    "16. Multiple owned Pods message excludes joined transient errors",
+			sandbox: sbWithMode(sandboxv1beta1.SandboxOperatingModeRunning),
+			err: errors.Join(
+				errors.New("failed to reconcile PVC: temporary error"),
+				&multipleSandboxPodsError{count: 2},
+			),
+			expectedConditions: []metav1.Condition{
+				{Type: "Suspended", Status: "False", ObservedGeneration: gen, Reason: "NotSuspended", Message: "Sandbox is not suspended"},
+				{Type: "Ready", Status: "False", ObservedGeneration: gen, Reason: "MultiplePods", Message: "multiple Pods (2) are controlled by this Sandbox; refusing to choose or create a Pod"},
+			},
+		},
+		{
+			// A permanent apiserver Invalid error (e.g. a derived Service name over
+			// the 63-character limit) is reported as InvalidConfiguration, not the
+			// generic ReconcilerError, so operators get an actionable reason.
+			name:    "17. Invalid child-resource name reports InvalidConfiguration",
+			sandbox: sbWithMode(sandboxv1beta1.SandboxOperatingModeRunning),
+			err:     invalidNameErr,
+			expectedConditions: []metav1.Condition{
+				{Type: "Suspended", Status: "False", ObservedGeneration: gen, Reason: "NotSuspended", Message: "Sandbox is not suspended"},
+				{Type: "Ready", Status: "False", ObservedGeneration: gen, Reason: "InvalidConfiguration", Message: invalidNameErr.Error()},
+			},
+		},
+		{
+			name:    "18. Container waiting on image pull names the container and reason",
+			sandbox: sbWithMode(sandboxv1beta1.SandboxOperatingModeRunning),
+			pod:     ownedPod(podWithContainerState(corev1.PodPending, false, waitingContainer("app", "ImagePullBackOff", 0, ""))),
+			expectedConditions: []metav1.Condition{
+				{Type: "Suspended", Status: "False", ObservedGeneration: gen, Reason: "NotSuspended", Message: "Sandbox is not suspended"},
+				{Type: "PodScheduled", Status: "Unknown", ObservedGeneration: gen, Reason: "PodSchedulingUnknown", Message: "Pod has not reported a PodScheduled condition yet"},
+				{Type: "Ready", Status: "False", ObservedGeneration: gen, Reason: "DependenciesNotReady", Message: `Pod exists with phase: Pending; container "app" is waiting: ImagePullBackOff`},
+			},
+		},
+		{
+			name:    "19. Init container failure is reported before container state",
+			sandbox: sbWithMode(sandboxv1beta1.SandboxOperatingModeRunning),
+			pod: ownedPod(func() *corev1.Pod {
+				pod := podWithContainerState(corev1.PodPending, false, waitingContainer("app", "PodInitializing", 0, ""))
+				pod.Status.InitContainerStatuses = []corev1.ContainerStatus{waitingContainer("setup", "CreateContainerConfigError", 0, "")}
+				return pod
+			}()),
+			expectedConditions: []metav1.Condition{
+				{Type: "Suspended", Status: "False", ObservedGeneration: gen, Reason: "NotSuspended", Message: "Sandbox is not suspended"},
+				{Type: "PodScheduled", Status: "Unknown", ObservedGeneration: gen, Reason: "PodSchedulingUnknown", Message: "Pod has not reported a PodScheduled condition yet"},
+				{Type: "Ready", Status: "False", ObservedGeneration: gen, Reason: "DependenciesNotReady", Message: `Pod exists with phase: Pending; init container "setup" is waiting: CreateContainerConfigError`},
+			},
+		},
+		{
+			name:    "20. CrashLoopBackOff reports last exit without the restart count or kubelet message",
+			sandbox: sbWithMode(sandboxv1beta1.SandboxOperatingModeRunning),
+			pod:     ownedPod(podWithContainerState(corev1.PodRunning, false, waitingContainer("app", "CrashLoopBackOff", 3, "Error"))),
+			expectedConditions: []metav1.Condition{
+				{Type: "Suspended", Status: "False", ObservedGeneration: gen, Reason: "NotSuspended", Message: "Sandbox is not suspended"},
+				{Type: "PodScheduled", Status: "Unknown", ObservedGeneration: gen, Reason: "PodSchedulingUnknown", Message: "Pod has not reported a PodScheduled condition yet"},
+				{Type: "Ready", Status: "False", ObservedGeneration: gen, Reason: "DependenciesNotReady", Message: `Pod is Running but not Ready; container "app" is in CrashLoopBackOff (last exit: Error)`},
+			},
+		},
+		{
+			name:    "21. Normal container startup adds no detail",
+			sandbox: sbWithMode(sandboxv1beta1.SandboxOperatingModeRunning),
+			pod:     ownedPod(podWithContainerState(corev1.PodPending, false, waitingContainer("app", "ContainerCreating", 0, ""))),
+			expectedConditions: []metav1.Condition{
+				{Type: "Suspended", Status: "False", ObservedGeneration: gen, Reason: "NotSuspended", Message: "Sandbox is not suspended"},
+				{Type: "PodScheduled", Status: "Unknown", ObservedGeneration: gen, Reason: "PodSchedulingUnknown", Message: "Pod has not reported a PodScheduled condition yet"},
+				{Type: "Ready", Status: "False", ObservedGeneration: gen, Reason: "DependenciesNotReady", Message: "Pod exists with phase: Pending"},
+			},
+		},
+		{
+			name:    "22. Container state of a Pod the Sandbox does not own is not reported",
+			sandbox: sbWithMode(sandboxv1beta1.SandboxOperatingModeRunning),
+			pod:     podWithContainerState(corev1.PodPending, false, waitingContainer("app", "ImagePullBackOff", 0, "")),
+			expectedConditions: []metav1.Condition{
+				{Type: "Suspended", Status: "False", ObservedGeneration: gen, Reason: "NotSuspended", Message: "Sandbox is not suspended"},
+				{Type: "Ready", Status: "False", ObservedGeneration: gen, Reason: "DependenciesNotReady", Message: "Pod exists with phase: Pending"},
+			},
+		},
+		{
+			name:    "23. CrashLoopBackOff without a last exit reason omits the detail",
+			sandbox: sbWithMode(sandboxv1beta1.SandboxOperatingModeRunning),
+			pod:     ownedPod(podWithContainerState(corev1.PodRunning, false, waitingContainer("app", "CrashLoopBackOff", 4, ""))),
+			expectedConditions: []metav1.Condition{
+				{Type: "Suspended", Status: "False", ObservedGeneration: gen, Reason: "NotSuspended", Message: "Sandbox is not suspended"},
+				{Type: "PodScheduled", Status: "Unknown", ObservedGeneration: gen, Reason: "PodSchedulingUnknown", Message: "Pod has not reported a PodScheduled condition yet"},
+				{Type: "Ready", Status: "False", ObservedGeneration: gen, Reason: "DependenciesNotReady", Message: `Pod is Running but not Ready; container "app" is in CrashLoopBackOff`},
+			},
+		},
+		{
+			name:    "24. Terminating unscheduled pod reports PodTerminating on PodScheduled",
+			sandbox: sbWithMode(sandboxv1beta1.SandboxOperatingModeRunning),
+			svc:     &corev1.Service{},
+			pod: ownedPod(&corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					DeletionTimestamp: new(metav1.Now()),
+				},
+				Status: corev1.PodStatus{
+					Phase: corev1.PodPending,
+					Conditions: []corev1.PodCondition{
+						{
+							Type:    corev1.PodScheduled,
+							Status:  corev1.ConditionFalse,
+							Reason:  corev1.PodReasonUnschedulable,
+							Message: "0/3 nodes are available: 3 Insufficient cpu.",
+						},
+					},
+				},
+			}),
+			expectedConditions: []metav1.Condition{
+				{Type: "Suspended", Status: "False", ObservedGeneration: gen, Reason: "NotSuspended", Message: "Sandbox is not suspended"},
+				{Type: "PodScheduled", Status: "False", ObservedGeneration: gen, Reason: "PodTerminating", Message: "Pod is terminating"},
+				{Type: "Ready", Status: "False", ObservedGeneration: gen, Reason: "DependenciesNotReady", Message: "Pod exists with phase: Pending; Service Exists"},
+			},
+		},
+		{
+			name:    "25. Terminating scheduled pod keeps PodScheduled=True",
+			sandbox: sbWithMode(sandboxv1beta1.SandboxOperatingModeRunning),
+			svc:     &corev1.Service{},
+			pod: ownedPod(&corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					DeletionTimestamp: new(metav1.Now()),
+				},
+				Status: corev1.PodStatus{
+					Phase: corev1.PodRunning,
+					Conditions: []corev1.PodCondition{
+						{Type: corev1.PodScheduled, Status: corev1.ConditionTrue},
+					},
+				},
+			}),
+			expectedConditions: []metav1.Condition{
+				{Type: "Suspended", Status: "False", ObservedGeneration: gen, Reason: "NotSuspended", Message: "Sandbox is not suspended"},
+				{Type: "PodScheduled", Status: "True", ObservedGeneration: gen, Reason: "PodScheduled"},
+				{Type: "Ready", Status: "False", ObservedGeneration: gen, Reason: "DependenciesNotReady", Message: "Pod is Running but not Ready; Service Exists"},
 			},
 		},
 	}
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			conditions := r.computeConditions(tc.sandbox, tc.err, tc.svc, tc.pod)
+			conditions := r.computeConditions(tc.sandbox, tc.err, tc.svc, tc.pod, tc.podErr)
 			opts := []cmp.Option{
 				cmpopts.IgnoreFields(metav1.Condition{}, "LastTransitionTime"),
 			}
@@ -237,6 +710,68 @@ func TestComputeConditions(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestReconcileInvalidServiceNameSurfacesConditionWithoutRequeue is a regression
+// test for a Sandbox whose name yields a Service name over Kubernetes'
+// 63-character limit. The apiserver permanently rejects the Service create, and
+// the controller must surface that as Ready=False/InvalidConfiguration WITHOUT
+// returning the error from Reconcile -- returning it would trigger a
+// rate-limited requeue and error-level logging on a create that can never
+// succeed, hot-looping until the Sandbox is recreated.
+func TestReconcileInvalidServiceNameSurfacesConditionWithoutRequeue(t *testing.T) {
+	sandbox := &sandboxv1beta1.Sandbox{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:       overlongSandboxName,
+			Namespace:  "default",
+			UID:        sandboxUID,
+			Generation: 1,
+		},
+		Spec: sandboxv1beta1.SandboxSpec{
+			SandboxBlueprint: sandboxv1beta1.SandboxBlueprint{
+				Service: ptr.To(true), // nolint:modernize
+				PodTemplate: sandboxv1beta1.PodTemplate{
+					Spec: corev1.PodSpec{
+						Containers: []corev1.Container{{Name: "main"}},
+					},
+				},
+			},
+			OperatingMode: sandboxv1beta1.SandboxOperatingModeRunning,
+		},
+	}
+
+	// The fake client does not enforce apiserver name validation, so inject the
+	// Service name-length rejection the real apiserver would return -- and only
+	// for names over the limit, so the test proves it is the overlong derived
+	// name (not just any Service create) that trips the permanent-failure path.
+	fc := interceptor.NewClient(newFakeClient(sandbox), interceptor.Funcs{
+		Create: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
+			if svc, ok := obj.(*corev1.Service); ok && len(svc.Name) > 63 {
+				return invalidServiceNameError(svc.Name)
+			}
+			return c.Create(ctx, obj, opts...)
+		},
+	})
+
+	r := &SandboxReconciler{
+		Client: fc,
+		Scheme: Scheme,
+		Tracer: asmetrics.NewNoOp(),
+	}
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: sandbox.Name, Namespace: sandbox.Namespace}}
+
+	res, err := r.Reconcile(t.Context(), req)
+	require.NoError(t, err, "permanent Invalid error must not be returned from Reconcile (would hot-loop)")
+	require.Zero(t, res.RequeueAfter, "must not schedule a requeue for a permanent misconfiguration")
+
+	updated := &sandboxv1beta1.Sandbox{}
+	require.NoError(t, r.Get(t.Context(), req.NamespacedName, updated))
+	ready := meta.FindStatusCondition(updated.Status.Conditions, string(sandboxv1beta1.SandboxConditionReady))
+	require.NotNil(t, ready)
+	require.Equal(t, metav1.ConditionFalse, ready.Status)
+	require.Equal(t, sandboxv1beta1.SandboxReasonInvalidConfiguration, ready.Reason)
+	require.Contains(t, ready.Message, "must be no more than 63 characters")
+	require.Empty(t, updated.Status.Service, "a rejected Service create must not be reflected in status.Service")
 }
 
 func TestResolvePodName(t *testing.T) {
@@ -302,21 +837,34 @@ func TestReconcile(t *testing.T) {
 		{
 			name: "minimal sandbox spec creates Pod but not Service by default",
 			// Input sandbox spec
-			sandboxSpec: sandboxv1beta1.SandboxSpec{
-				PodTemplate: sandboxv1beta1.PodTemplate{
-					Spec: corev1.PodSpec{
-						Containers: []corev1.Container{
-							{
-								Name: "test-container",
-							},
+			sandboxSpec: sandboxv1beta1.SandboxSpec{SandboxBlueprint: sandboxv1beta1.SandboxBlueprint{PodTemplate: sandboxv1beta1.PodTemplate{
+				Spec: corev1.PodSpec{
+					Containers: []corev1.Container{
+						{
+							Name: "test-container",
 						},
 					},
 				},
+			}},
 			},
 			// Verify Sandbox status
 			wantStatus: sandboxv1beta1.SandboxStatus{
-				LabelSelector: "agents.x-k8s.io/sandbox-name-hash=" + nameHash,
+				LabelSelector: sandboxv1beta1.SandboxNameHashLabel + "=" + nameHash,
 				Conditions: []metav1.Condition{
+					{
+						Type:               "Suspended",
+						Status:             "False",
+						ObservedGeneration: 1,
+						Reason:             "NotSuspended",
+						Message:            "Sandbox is not suspended",
+					},
+					{
+						Type:               "PodScheduled",
+						Status:             "Unknown",
+						ObservedGeneration: 1,
+						Reason:             sandboxv1beta1.SandboxReasonPodSchedulingUnknown,
+						Message:            "Pod has not reported a PodScheduled condition yet",
+					},
 					{
 						Type:               "Ready",
 						Status:             "False",
@@ -334,7 +882,7 @@ func TestReconcile(t *testing.T) {
 						Namespace:       sandboxNs,
 						ResourceVersion: "1",
 						Labels: map[string]string{
-							"agents.x-k8s.io/sandbox-name-hash": nameHash,
+							sandboxv1beta1.SandboxNameHashLabel: nameHash,
 						},
 						OwnerReferences: []metav1.OwnerReference{sandboxControllerRef(sandboxName)},
 					},
@@ -351,8 +899,7 @@ func TestReconcile(t *testing.T) {
 		{
 			name: "minimal sandbox spec with Pod and Service",
 			// Input sandbox spec
-			sandboxSpec: sandboxv1beta1.SandboxSpec{
-				Service: new(true),
+			sandboxSpec: sandboxv1beta1.SandboxSpec{SandboxBlueprint: sandboxv1beta1.SandboxBlueprint{Service: new(true),
 				PodTemplate: sandboxv1beta1.PodTemplate{
 					Spec: corev1.PodSpec{
 						Containers: []corev1.Container{
@@ -361,14 +908,28 @@ func TestReconcile(t *testing.T) {
 							},
 						},
 					},
-				},
+				}},
 			},
 			// Verify Sandbox status
 			wantStatus: sandboxv1beta1.SandboxStatus{
 				Service:       sandboxName,
 				ServiceFQDN:   "sandbox-name.sandbox-ns.svc.cluster.local",
-				LabelSelector: "agents.x-k8s.io/sandbox-name-hash=" + nameHash,
+				LabelSelector: sandboxv1beta1.SandboxNameHashLabel + "=" + nameHash,
 				Conditions: []metav1.Condition{
+					{
+						Type:               string(sandboxv1beta1.SandboxConditionSuspended),
+						Status:             metav1.ConditionFalse,
+						ObservedGeneration: 1,
+						Reason:             "NotSuspended",
+						Message:            "Sandbox is not suspended",
+					},
+					{
+						Type:               string(sandboxv1beta1.SandboxConditionPodScheduled),
+						Status:             metav1.ConditionUnknown,
+						ObservedGeneration: 1,
+						Reason:             sandboxv1beta1.SandboxReasonPodSchedulingUnknown,
+						Message:            "Pod has not reported a PodScheduled condition yet",
+					},
 					{
 						Type:               string(sandboxv1beta1.SandboxConditionReady),
 						Status:             metav1.ConditionFalse,
@@ -386,7 +947,7 @@ func TestReconcile(t *testing.T) {
 						Namespace:       sandboxNs,
 						ResourceVersion: "1",
 						Labels: map[string]string{
-							"agents.x-k8s.io/sandbox-name-hash": nameHash,
+							sandboxv1beta1.SandboxNameHashLabel: nameHash,
 						},
 						OwnerReferences: []metav1.OwnerReference{sandboxControllerRef(sandboxName)},
 					},
@@ -405,13 +966,13 @@ func TestReconcile(t *testing.T) {
 						Namespace:       sandboxNs,
 						ResourceVersion: "1",
 						Labels: map[string]string{
-							"agents.x-k8s.io/sandbox-name-hash": nameHash,
+							sandboxv1beta1.SandboxNameHashLabel: nameHash,
 						},
 						OwnerReferences: []metav1.OwnerReference{sandboxControllerRef(sandboxName)},
 					},
 					Spec: corev1.ServiceSpec{
 						Selector: map[string]string{
-							"agents.x-k8s.io/sandbox-name-hash": nameHash,
+							sandboxv1beta1.SandboxNameHashLabel: nameHash,
 						},
 						ClusterIP: "None",
 					},
@@ -421,8 +982,7 @@ func TestReconcile(t *testing.T) {
 		{
 			name: "sandbox spec with PVC, Pod, and Service",
 			// Input sandbox spec
-			sandboxSpec: sandboxv1beta1.SandboxSpec{
-				Service: new(true),
+			sandboxSpec: sandboxv1beta1.SandboxSpec{SandboxBlueprint: sandboxv1beta1.SandboxBlueprint{Service: new(true),
 				PodTemplate: sandboxv1beta1.PodTemplate{
 					Spec: corev1.PodSpec{
 						Containers: []corev1.Container{
@@ -456,14 +1016,28 @@ func TestReconcile(t *testing.T) {
 							},
 						},
 					},
-				},
+				}},
 			},
 			// Verify Sandbox status
 			wantStatus: sandboxv1beta1.SandboxStatus{
 				Service:       sandboxName,
 				ServiceFQDN:   "sandbox-name.sandbox-ns.svc.cluster.local",
-				LabelSelector: "agents.x-k8s.io/sandbox-name-hash=" + nameHash,
+				LabelSelector: sandboxv1beta1.SandboxNameHashLabel + "=" + nameHash,
 				Conditions: []metav1.Condition{
+					{
+						Type:               string(sandboxv1beta1.SandboxConditionSuspended),
+						Status:             metav1.ConditionFalse,
+						ObservedGeneration: 1,
+						Reason:             "NotSuspended",
+						Message:            "Sandbox is not suspended",
+					},
+					{
+						Type:               string(sandboxv1beta1.SandboxConditionPodScheduled),
+						Status:             metav1.ConditionUnknown,
+						ObservedGeneration: 1,
+						Reason:             sandboxv1beta1.SandboxReasonPodSchedulingUnknown,
+						Message:            "Pod has not reported a PodScheduled condition yet",
+					},
 					{
 						Type:               string(sandboxv1beta1.SandboxConditionReady),
 						Status:             metav1.ConditionFalse,
@@ -481,7 +1055,7 @@ func TestReconcile(t *testing.T) {
 						Namespace:       sandboxNs,
 						ResourceVersion: "1",
 						Labels: map[string]string{
-							"agents.x-k8s.io/sandbox-name-hash": nameHash,
+							sandboxv1beta1.SandboxNameHashLabel: nameHash,
 							"custom-label":                      "label-val",
 						},
 						Annotations: map[string]string{
@@ -517,13 +1091,13 @@ func TestReconcile(t *testing.T) {
 						Namespace:       sandboxNs,
 						ResourceVersion: "1",
 						Labels: map[string]string{
-							"agents.x-k8s.io/sandbox-name-hash": nameHash,
+							sandboxv1beta1.SandboxNameHashLabel: nameHash,
 						},
 						OwnerReferences: []metav1.OwnerReference{sandboxControllerRef(sandboxName)},
 					},
 					Spec: corev1.ServiceSpec{
 						Selector: map[string]string{
-							"agents.x-k8s.io/sandbox-name-hash": nameHash,
+							sandboxv1beta1.SandboxNameHashLabel: nameHash,
 						},
 						ClusterIP: "None",
 					},
@@ -534,7 +1108,7 @@ func TestReconcile(t *testing.T) {
 						Name:      "my-pvc-sandbox-name",
 						Namespace: sandboxNs,
 						Labels: map[string]string{
-							"agents.x-k8s.io/sandbox-name-hash": nameHash,
+							sandboxv1beta1.SandboxNameHashLabel: nameHash,
 							"custom-label":                      "label-val",
 						},
 						Annotations:     map[string]string{"custom-annotation": "anno-val"},
@@ -560,7 +1134,7 @@ func TestReconcile(t *testing.T) {
 						Name:      sandboxName,
 						Namespace: sandboxNs,
 						Labels: map[string]string{
-							"agents.x-k8s.io/sandbox-name-hash":  nameHash,
+							sandboxv1beta1.SandboxNameHashLabel:  nameHash,
 							sandboxv1beta1.SandboxAdoptableLabel: "true",
 						},
 					},
@@ -572,26 +1146,39 @@ func TestReconcile(t *testing.T) {
 						PodIPs: []corev1.PodIP{{IP: "10.244.0.5"}, {IP: "fd00::5"}},
 						Phase:  corev1.PodRunning,
 						Conditions: []corev1.PodCondition{
+							{Type: corev1.PodScheduled, Status: corev1.ConditionTrue},
 							{Type: corev1.PodReady, Status: corev1.ConditionTrue},
 						},
 					},
 				},
 			},
-			sandboxSpec: sandboxv1beta1.SandboxSpec{
-				Service: new(true),
+			sandboxSpec: sandboxv1beta1.SandboxSpec{SandboxBlueprint: sandboxv1beta1.SandboxBlueprint{Service: new(true),
 				PodTemplate: sandboxv1beta1.PodTemplate{
 					Spec: corev1.PodSpec{
 						Containers: []corev1.Container{{Name: "test-container"}},
 					},
-				},
+				}},
 			},
 			wantStatus: sandboxv1beta1.SandboxStatus{
 				Service:       sandboxName,
 				ServiceFQDN:   "sandbox-name.sandbox-ns.svc.cluster.local",
-				LabelSelector: "agents.x-k8s.io/sandbox-name-hash=" + nameHash,
+				LabelSelector: sandboxv1beta1.SandboxNameHashLabel + "=" + nameHash,
 				PodIPs:        []string{"10.244.0.5", "fd00::5"},
 				NodeName:      "node-1",
 				Conditions: []metav1.Condition{
+					{
+						Type:               "Suspended",
+						Status:             "False",
+						ObservedGeneration: 1,
+						Reason:             "NotSuspended",
+						Message:            "Sandbox is not suspended",
+					},
+					{
+						Type:               "PodScheduled",
+						Status:             "True",
+						ObservedGeneration: 1,
+						Reason:             sandboxv1beta1.SandboxReasonPodScheduled,
+					},
 					{
 						Type:               "Ready",
 						Status:             "True",
@@ -609,13 +1196,13 @@ func TestReconcile(t *testing.T) {
 						Namespace:       sandboxNs,
 						ResourceVersion: "1",
 						Labels: map[string]string{
-							"agents.x-k8s.io/sandbox-name-hash": nameHash,
+							sandboxv1beta1.SandboxNameHashLabel: nameHash,
 						},
 						OwnerReferences: []metav1.OwnerReference{sandboxControllerRef(sandboxName)},
 					},
 					Spec: corev1.ServiceSpec{
 						Selector: map[string]string{
-							"agents.x-k8s.io/sandbox-name-hash": nameHash,
+							sandboxv1beta1.SandboxNameHashLabel: nameHash,
 						},
 						ClusterIP: "None",
 					},
@@ -630,7 +1217,7 @@ func TestReconcile(t *testing.T) {
 						Name:      sandboxName,
 						Namespace: sandboxNs,
 						Labels: map[string]string{
-							"agents.x-k8s.io/sandbox-name-hash": nameHash,
+							sandboxv1beta1.SandboxNameHashLabel: nameHash,
 						},
 					},
 					Spec: corev1.PodSpec{
@@ -640,25 +1227,38 @@ func TestReconcile(t *testing.T) {
 						PodIPs: []corev1.PodIP{{IP: "10.244.0.5"}, {IP: "fd00::5"}},
 						Phase:  corev1.PodRunning,
 						Conditions: []corev1.PodCondition{
+							{Type: corev1.PodScheduled, Status: corev1.ConditionTrue},
 							{Type: corev1.PodReady, Status: corev1.ConditionTrue},
 						},
 					},
 				},
 			},
-			sandboxSpec: sandboxv1beta1.SandboxSpec{
-				Service: new(true),
+			sandboxSpec: sandboxv1beta1.SandboxSpec{SandboxBlueprint: sandboxv1beta1.SandboxBlueprint{Service: new(true),
 				PodTemplate: sandboxv1beta1.PodTemplate{
 					Spec: corev1.PodSpec{
 						Containers: []corev1.Container{{Name: "test-container"}},
 					},
-				},
+				}},
 			},
 			wantStatus: sandboxv1beta1.SandboxStatus{
 				Service:       sandboxName,
 				ServiceFQDN:   "sandbox-name.sandbox-ns.svc.cluster.local",
-				LabelSelector: "agents.x-k8s.io/sandbox-name-hash=" + nameHash,
+				LabelSelector: sandboxv1beta1.SandboxNameHashLabel + "=" + nameHash,
 				PodIPs:        []string{"10.244.0.5", "fd00::5"},
 				Conditions: []metav1.Condition{
+					{
+						Type:               "Suspended",
+						Status:             "False",
+						ObservedGeneration: 1,
+						Reason:             "NotSuspended",
+						Message:            "Sandbox is not suspended",
+					},
+					{
+						Type:               "PodScheduled",
+						Status:             "True",
+						ObservedGeneration: 1,
+						Reason:             sandboxv1beta1.SandboxReasonPodScheduled,
+					},
 					{
 						Type:               "Ready",
 						Status:             "True",
@@ -675,13 +1275,13 @@ func TestReconcile(t *testing.T) {
 						Namespace:       sandboxNs,
 						ResourceVersion: "1",
 						Labels: map[string]string{
-							"agents.x-k8s.io/sandbox-name-hash": nameHash,
+							sandboxv1beta1.SandboxNameHashLabel: nameHash,
 						},
 						OwnerReferences: []metav1.OwnerReference{sandboxControllerRef(sandboxName)},
 					},
 					Spec: corev1.ServiceSpec{
 						Selector: map[string]string{
-							"agents.x-k8s.io/sandbox-name-hash": nameHash,
+							sandboxv1beta1.SandboxNameHashLabel: nameHash,
 						},
 						ClusterIP: "None",
 					},
@@ -696,7 +1296,7 @@ func TestReconcile(t *testing.T) {
 						Name:      sandboxName,
 						Namespace: sandboxNs,
 						Labels: map[string]string{
-							"agents.x-k8s.io/sandbox-name-hash":  nameHash,
+							sandboxv1beta1.SandboxNameHashLabel:  nameHash,
 							sandboxv1beta1.SandboxAdoptableLabel: "true",
 						},
 					},
@@ -708,23 +1308,36 @@ func TestReconcile(t *testing.T) {
 						PodIPs: []corev1.PodIP{{IP: "10.244.0.5"}},
 						Phase:  corev1.PodRunning,
 						Conditions: []corev1.PodCondition{
+							{Type: corev1.PodScheduled, Status: corev1.ConditionTrue},
 							{Type: corev1.PodReady, Status: corev1.ConditionTrue},
 						},
 					},
 				},
 			},
-			sandboxSpec: sandboxv1beta1.SandboxSpec{
-				PodTemplate: sandboxv1beta1.PodTemplate{
-					Spec: corev1.PodSpec{
-						Containers: []corev1.Container{{Name: "test-container"}},
-					},
+			sandboxSpec: sandboxv1beta1.SandboxSpec{SandboxBlueprint: sandboxv1beta1.SandboxBlueprint{PodTemplate: sandboxv1beta1.PodTemplate{
+				Spec: corev1.PodSpec{
+					Containers: []corev1.Container{{Name: "test-container"}},
 				},
+			}},
 			},
 			wantStatus: sandboxv1beta1.SandboxStatus{
-				LabelSelector: "agents.x-k8s.io/sandbox-name-hash=" + nameHash,
+				LabelSelector: sandboxv1beta1.SandboxNameHashLabel + "=" + nameHash,
 				PodIPs:        []string{"10.244.0.5"},
 				NodeName:      "node-2",
 				Conditions: []metav1.Condition{
+					{
+						Type:               "Suspended",
+						Status:             "False",
+						ObservedGeneration: 1,
+						Reason:             "NotSuspended",
+						Message:            "Sandbox is not suspended",
+					},
+					{
+						Type:               "PodScheduled",
+						Status:             "True",
+						ObservedGeneration: 1,
+						Reason:             sandboxv1beta1.SandboxReasonPodScheduled,
+					},
 					{
 						Type:               "Ready",
 						Status:             "True",
@@ -754,20 +1367,18 @@ func TestReconcile(t *testing.T) {
 					},
 				},
 			},
-			sandboxSpec: sandboxv1beta1.SandboxSpec{
-				PodTemplate: sandboxv1beta1.PodTemplate{
-					Spec: corev1.PodSpec{
-						Containers: []corev1.Container{
-							{
-								Name: "test-container",
-							},
+			sandboxSpec: sandboxv1beta1.SandboxSpec{SandboxBlueprint: sandboxv1beta1.SandboxBlueprint{PodTemplate: sandboxv1beta1.PodTemplate{
+				Spec: corev1.PodSpec{
+					Containers: []corev1.Container{
+						{
+							Name: "test-container",
 						},
 					},
 				},
-				Lifecycle: sandboxv1beta1.Lifecycle{
-					ShutdownTime:   new(metav1.NewTime(time.Now().Add(-1 * time.Hour))),
-					ShutdownPolicy: ptr.To(sandboxv1beta1.ShutdownPolicyRetain),
-				},
+			}}, Lifecycle: sandboxv1beta1.Lifecycle{
+				ShutdownTime:   new(metav1.NewTime(time.Now().Add(-1 * time.Hour))),
+				ShutdownPolicy: ptr.To(sandboxv1beta1.ShutdownPolicyRetain),
+			},
 			},
 			wantStatus: sandboxv1beta1.SandboxStatus{
 				Conditions: []metav1.Condition{
@@ -807,20 +1418,18 @@ func TestReconcile(t *testing.T) {
 			sandboxAnnotations: map[string]string{
 				sandboxv1beta1.SandboxPodNameAnnotation: "warmpool-abc-xyz",
 			},
-			sandboxSpec: sandboxv1beta1.SandboxSpec{
-				PodTemplate: sandboxv1beta1.PodTemplate{
-					Spec: corev1.PodSpec{
-						Containers: []corev1.Container{
-							{
-								Name: "test-container",
-							},
+			sandboxSpec: sandboxv1beta1.SandboxSpec{SandboxBlueprint: sandboxv1beta1.SandboxBlueprint{PodTemplate: sandboxv1beta1.PodTemplate{
+				Spec: corev1.PodSpec{
+					Containers: []corev1.Container{
+						{
+							Name: "test-container",
 						},
 					},
 				},
-				Lifecycle: sandboxv1beta1.Lifecycle{
-					ShutdownTime:   new(metav1.NewTime(time.Now().Add(-1 * time.Hour))),
-					ShutdownPolicy: ptr.To(sandboxv1beta1.ShutdownPolicyRetain),
-				},
+			}}, Lifecycle: sandboxv1beta1.Lifecycle{
+				ShutdownTime:   new(metav1.NewTime(time.Now().Add(-1 * time.Hour))),
+				ShutdownPolicy: ptr.To(sandboxv1beta1.ShutdownPolicyRetain),
+			},
 			},
 			wantStatus: sandboxv1beta1.SandboxStatus{
 				Conditions: []metav1.Condition{
@@ -857,20 +1466,18 @@ func TestReconcile(t *testing.T) {
 					},
 				},
 			},
-			sandboxSpec: sandboxv1beta1.SandboxSpec{
-				PodTemplate: sandboxv1beta1.PodTemplate{
-					Spec: corev1.PodSpec{
-						Containers: []corev1.Container{
-							{
-								Name: "test-container",
-							},
+			sandboxSpec: sandboxv1beta1.SandboxSpec{SandboxBlueprint: sandboxv1beta1.SandboxBlueprint{PodTemplate: sandboxv1beta1.PodTemplate{
+				Spec: corev1.PodSpec{
+					Containers: []corev1.Container{
+						{
+							Name: "test-container",
 						},
 					},
 				},
-				Lifecycle: sandboxv1beta1.Lifecycle{
-					ShutdownTime:   new(metav1.NewTime(time.Now().Add(-30 * time.Minute))),
-					ShutdownPolicy: ptr.To(sandboxv1beta1.ShutdownPolicyDelete),
-				},
+			}}, Lifecycle: sandboxv1beta1.Lifecycle{
+				ShutdownTime:   new(metav1.NewTime(time.Now().Add(-30 * time.Minute))),
+				ShutdownPolicy: ptr.To(sandboxv1beta1.ShutdownPolicyDelete),
+			},
 			},
 			wantDeletedObjs: []client.Object{
 				&corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: sandboxName, Namespace: sandboxNs}},
@@ -907,16 +1514,14 @@ func TestReconcile(t *testing.T) {
 					},
 				},
 			},
-			sandboxSpec: sandboxv1beta1.SandboxSpec{
-				PodTemplate: sandboxv1beta1.PodTemplate{
-					Spec: corev1.PodSpec{
-						Containers: []corev1.Container{{Name: "test-container"}},
-					},
+			sandboxSpec: sandboxv1beta1.SandboxSpec{SandboxBlueprint: sandboxv1beta1.SandboxBlueprint{PodTemplate: sandboxv1beta1.PodTemplate{
+				Spec: corev1.PodSpec{
+					Containers: []corev1.Container{{Name: "test-container"}},
 				},
-				Lifecycle: sandboxv1beta1.Lifecycle{
-					ShutdownTime:   new(metav1.NewTime(time.Now().Add(-1 * time.Hour))),
-					ShutdownPolicy: ptr.To(sandboxv1beta1.ShutdownPolicyRetain),
-				},
+			}}, Lifecycle: sandboxv1beta1.Lifecycle{
+				ShutdownTime:   new(metav1.NewTime(time.Now().Add(-1 * time.Hour))),
+				ShutdownPolicy: ptr.To(sandboxv1beta1.ShutdownPolicyRetain),
+			},
 			},
 			wantStatus: sandboxv1beta1.SandboxStatus{
 				Conditions: []metav1.Condition{
@@ -956,16 +1561,14 @@ func TestReconcile(t *testing.T) {
 					},
 				},
 			},
-			sandboxSpec: sandboxv1beta1.SandboxSpec{
-				PodTemplate: sandboxv1beta1.PodTemplate{
-					Spec: corev1.PodSpec{
-						Containers: []corev1.Container{{Name: "test-container"}},
-					},
+			sandboxSpec: sandboxv1beta1.SandboxSpec{SandboxBlueprint: sandboxv1beta1.SandboxBlueprint{PodTemplate: sandboxv1beta1.PodTemplate{
+				Spec: corev1.PodSpec{
+					Containers: []corev1.Container{{Name: "test-container"}},
 				},
-				Lifecycle: sandboxv1beta1.Lifecycle{
-					ShutdownTime:   new(metav1.NewTime(time.Now().Add(-1 * time.Hour))),
-					ShutdownPolicy: ptr.To(sandboxv1beta1.ShutdownPolicyRetain),
-				},
+			}}, Lifecycle: sandboxv1beta1.Lifecycle{
+				ShutdownTime:   new(metav1.NewTime(time.Now().Add(-1 * time.Hour))),
+				ShutdownPolicy: ptr.To(sandboxv1beta1.ShutdownPolicyRetain),
+			},
 			},
 			wantStatus: sandboxv1beta1.SandboxStatus{
 				Conditions: []metav1.Condition{
@@ -987,16 +1590,14 @@ func TestReconcile(t *testing.T) {
 		},
 		{
 			name: "sandbox expired with no matching pod or service",
-			sandboxSpec: sandboxv1beta1.SandboxSpec{
-				PodTemplate: sandboxv1beta1.PodTemplate{
-					Spec: corev1.PodSpec{
-						Containers: []corev1.Container{{Name: "test-container"}},
-					},
+			sandboxSpec: sandboxv1beta1.SandboxSpec{SandboxBlueprint: sandboxv1beta1.SandboxBlueprint{PodTemplate: sandboxv1beta1.PodTemplate{
+				Spec: corev1.PodSpec{
+					Containers: []corev1.Container{{Name: "test-container"}},
 				},
-				Lifecycle: sandboxv1beta1.Lifecycle{
-					ShutdownTime:   new(metav1.NewTime(time.Now().Add(-1 * time.Hour))),
-					ShutdownPolicy: ptr.To(sandboxv1beta1.ShutdownPolicyRetain),
-				},
+			}}, Lifecycle: sandboxv1beta1.Lifecycle{
+				ShutdownTime:   new(metav1.NewTime(time.Now().Add(-1 * time.Hour))),
+				ShutdownPolicy: ptr.To(sandboxv1beta1.ShutdownPolicyRetain),
+			},
 			},
 			wantStatus: sandboxv1beta1.SandboxStatus{
 				Conditions: []metav1.Condition{
@@ -1006,6 +1607,92 @@ func TestReconcile(t *testing.T) {
 						ObservedGeneration: 1,
 						Reason:             "SandboxExpired",
 						Message:            "Sandbox has expired",
+					},
+				},
+			},
+		},
+		{
+			// Regression: while the Pod is still terminating (kept alive here by a
+			// finalizer), Suspended must be False/PodTerminating — not True — and
+			// lastTransitionTime must not be stamped prematurely. This exercises the
+			// real reconcilePod path (which the computeSuspendedCondition unit test
+			// bypasses by forcing a non-nil pod).
+			name: "suspend with a still-terminating pod reports Suspended=False/PodTerminating",
+			initialObjs: []runtime.Object{
+				&corev1.Pod{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:            sandboxName,
+						Namespace:       sandboxNs,
+						Finalizers:      []string{"agents.x-k8s.io/test-hold"},
+						Labels:          map[string]string{sandboxv1beta1.SandboxNameHashLabel: nameHash},
+						OwnerReferences: []metav1.OwnerReference{sandboxControllerRef(sandboxName)},
+					},
+					Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "test-container"}}},
+				},
+			},
+			sandboxSpec: sandboxv1beta1.SandboxSpec{
+				OperatingMode: sandboxv1beta1.SandboxOperatingModeSuspended,
+				SandboxBlueprint: sandboxv1beta1.SandboxBlueprint{
+					PodTemplate: sandboxv1beta1.PodTemplate{
+						Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "test-container"}}},
+					},
+				},
+			},
+			wantStatus: sandboxv1beta1.SandboxStatus{
+				LabelSelector: sandboxv1beta1.SandboxNameHashLabel + "=" + nameHash,
+				Conditions: []metav1.Condition{
+					{
+						Type:               "Suspended",
+						Status:             "False",
+						ObservedGeneration: 1,
+						Reason:             "PodTerminating",
+						Message:            "Pod is terminating. Sandbox is suspending",
+					},
+					{
+						Type:               "PodScheduled",
+						Status:             "Unknown",
+						ObservedGeneration: 1,
+						Reason:             sandboxv1beta1.SandboxReasonPodSchedulingUnknown,
+						Message:            "Pod has not reported a PodScheduled condition yet",
+					},
+					{
+						Type:               "Ready",
+						Status:             "False",
+						ObservedGeneration: 1,
+						Reason:             sandboxv1beta1.SandboxReasonSuspended,
+						Message:            "Sandbox is suspending",
+					},
+				},
+			},
+			wantSurvivingObjs: []client.Object{
+				&corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: sandboxName, Namespace: sandboxNs}},
+			},
+		},
+		{
+			name: "suspend with no pod reports Suspended=True/PodTerminated",
+			sandboxSpec: sandboxv1beta1.SandboxSpec{
+				OperatingMode: sandboxv1beta1.SandboxOperatingModeSuspended,
+				SandboxBlueprint: sandboxv1beta1.SandboxBlueprint{
+					PodTemplate: sandboxv1beta1.PodTemplate{
+						Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "test-container"}}},
+					},
+				},
+			},
+			wantStatus: sandboxv1beta1.SandboxStatus{
+				Conditions: []metav1.Condition{
+					{
+						Type:               "Suspended",
+						Status:             "True",
+						ObservedGeneration: 1,
+						Reason:             "PodTerminated",
+						Message:            "Pod has been terminated. Sandbox is suspended",
+					},
+					{
+						Type:               "Ready",
+						Status:             "False",
+						ObservedGeneration: 1,
+						Reason:             sandboxv1beta1.SandboxReasonSuspended,
+						Message:            "Sandbox is suspended",
 					},
 				},
 			},
@@ -1039,7 +1726,7 @@ func TestReconcile(t *testing.T) {
 				reconcileCount = 1
 			}
 			var err error
-			for i := 0; i < reconcileCount; i++ {
+			for range reconcileCount {
 				_, err = r.Reconcile(t.Context(), ctrl.Request{
 					NamespacedName: types.NamespacedName{
 						Name:      sandboxName,
@@ -1088,31 +1775,31 @@ func TestReconcilePod(t *testing.T) {
 	sandboxName := "sandbox-name"
 	sandboxNs := "sandbox-ns"
 	nameHash := "name-hash"
+	// Resource names can be 253 characters, well past the 63 character label value limit.
+	longClaimName := strings.Repeat("c", 253)
 	sandboxObj := &sandboxv1beta1.Sandbox{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      sandboxName,
 			Namespace: sandboxNs,
 			UID:       sandboxUID,
 		},
-		Spec: sandboxv1beta1.SandboxSpec{
-			OperatingMode: sandboxv1beta1.SandboxOperatingModeRunning,
-			PodTemplate: sandboxv1beta1.PodTemplate{
-				Spec: corev1.PodSpec{
-					Containers: []corev1.Container{
-						{
-							Name: "test-container",
-						},
-					},
-				},
-				ObjectMeta: sandboxv1beta1.PodMetadata{
-					Labels: map[string]string{
-						"custom-label": "label-val",
-					},
-					Annotations: map[string]string{
-						"custom-annotation": "anno-val",
+		Spec: sandboxv1beta1.SandboxSpec{SandboxBlueprint: sandboxv1beta1.SandboxBlueprint{PodTemplate: sandboxv1beta1.PodTemplate{
+			Spec: corev1.PodSpec{
+				Containers: []corev1.Container{
+					{
+						Name: "test-container",
 					},
 				},
 			},
+			ObjectMeta: sandboxv1beta1.PodMetadata{
+				Labels: map[string]string{
+					"custom-label": "label-val",
+				},
+				Annotations: map[string]string{
+					"custom-annotation": "anno-val",
+				},
+			},
+		}}, OperatingMode: sandboxv1beta1.SandboxOperatingModeRunning,
 		},
 	}
 	testCases := []struct {
@@ -1123,6 +1810,10 @@ func TestReconcilePod(t *testing.T) {
 		expectErr              bool
 		wantSandboxAnnotations map[string]string
 		wantPodSurvives        string // if set, verify this pod still exists after reconcile
+		// wantPodDeleting: reconcilePod is expected to return a still-terminating Pod
+		// (non-nil) and the Pod should exist in the cluster with a DeletionTimestamp set.
+		// Used for the suspend path, where the Pod is deleted but not yet gone.
+		wantPodDeleting bool
 	}{
 		{
 			name: "updates label and owner reference if Pod already exists",
@@ -1152,7 +1843,7 @@ func TestReconcilePod(t *testing.T) {
 					Namespace:       sandboxNs,
 					ResourceVersion: "2",
 					Labels: map[string]string{
-						"agents.x-k8s.io/sandbox-name-hash":  nameHash,
+						sandboxv1beta1.SandboxNameHashLabel:  nameHash,
 						"custom-label":                       "label-val",
 						sandboxv1beta1.SandboxAdoptableLabel: "true",
 					},
@@ -1171,9 +1862,8 @@ func TestReconcilePod(t *testing.T) {
 					},
 				},
 			},
-			wantSandboxAnnotations: map[string]string{
-				sandboxv1beta1.SandboxPodNameAnnotation: sandboxName,
-			},
+			// Reconciling an existing pod must not write the pod name annotation on the Sandbox as it is no longer written by the controller.
+			wantSandboxAnnotations: map[string]string{},
 		},
 		{
 			name: "persists owner reference when adopting unowned pod whose labels are already correct",
@@ -1184,7 +1874,7 @@ func TestReconcilePod(t *testing.T) {
 						Namespace:       sandboxNs,
 						ResourceVersion: "1",
 						Labels: map[string]string{
-							"agents.x-k8s.io/sandbox-name-hash":  nameHash,
+							sandboxv1beta1.SandboxNameHashLabel:  nameHash,
 							"custom-label":                       "label-val",
 							sandboxv1beta1.SandboxAdoptableLabel: "true",
 						},
@@ -1208,7 +1898,7 @@ func TestReconcilePod(t *testing.T) {
 					Namespace:       sandboxNs,
 					ResourceVersion: "2",
 					Labels: map[string]string{
-						"agents.x-k8s.io/sandbox-name-hash":  nameHash,
+						sandboxv1beta1.SandboxNameHashLabel:  nameHash,
 						"custom-label":                       "label-val",
 						sandboxv1beta1.SandboxAdoptableLabel: "true",
 					},
@@ -1223,9 +1913,6 @@ func TestReconcilePod(t *testing.T) {
 					Containers: []corev1.Container{{Name: "test-container"}},
 				},
 			},
-			wantSandboxAnnotations: map[string]string{
-				sandboxv1beta1.SandboxPodNameAnnotation: sandboxName,
-			},
 		},
 		{
 			name: "adopts unowned pod carrying legacy tracking label when adoptable label is absent",
@@ -1236,7 +1923,7 @@ func TestReconcilePod(t *testing.T) {
 						Namespace:       sandboxNs,
 						ResourceVersion: "1",
 						Labels: map[string]string{
-							"agents.x-k8s.io/sandbox-name-hash": nameHash,
+							sandboxv1beta1.SandboxNameHashLabel: nameHash,
 							"custom-label":                      "label-val",
 						},
 						Annotations: map[string]string{
@@ -1257,7 +1944,7 @@ func TestReconcilePod(t *testing.T) {
 					Namespace:       sandboxNs,
 					ResourceVersion: "2",
 					Labels: map[string]string{
-						"agents.x-k8s.io/sandbox-name-hash": nameHash,
+						sandboxv1beta1.SandboxNameHashLabel: nameHash,
 						"custom-label":                      "label-val",
 					},
 					Annotations: map[string]string{
@@ -1271,9 +1958,6 @@ func TestReconcilePod(t *testing.T) {
 					Containers: []corev1.Container{{Name: "test-container"}},
 				},
 			},
-			wantSandboxAnnotations: map[string]string{
-				sandboxv1beta1.SandboxPodNameAnnotation: sandboxName,
-			},
 		},
 		{
 			name:    "reconcilePod creates a new Pod",
@@ -1284,7 +1968,7 @@ func TestReconcilePod(t *testing.T) {
 					Namespace:       sandboxNs,
 					ResourceVersion: "1",
 					Labels: map[string]string{
-						"agents.x-k8s.io/sandbox-name-hash": nameHash,
+						sandboxv1beta1.SandboxNameHashLabel: nameHash,
 						"custom-label":                      "label-val",
 					},
 					Annotations: map[string]string{
@@ -1302,9 +1986,8 @@ func TestReconcilePod(t *testing.T) {
 					},
 				},
 			},
-			wantSandboxAnnotations: map[string]string{
-				sandboxv1beta1.SandboxPodNameAnnotation: sandboxName,
-			},
+			// Reconciling a new pod must not write the pod name annotation on the Sandbox as it is no longer written by the controller.
+			wantSandboxAnnotations: map[string]string{},
 		},
 		{
 			name: "drops user-supplied system-reserved labels and annotations to prevent hijacking",
@@ -1314,27 +1997,26 @@ func TestReconcilePod(t *testing.T) {
 					Namespace: sandboxNs,
 					UID:       sandboxUID,
 				},
-				Spec: sandboxv1beta1.SandboxSpec{
-					OperatingMode: sandboxv1beta1.SandboxOperatingModeRunning,
-					PodTemplate: sandboxv1beta1.PodTemplate{
-						Spec: corev1.PodSpec{
-							Containers: []corev1.Container{{Name: "test-container"}},
+				Spec: sandboxv1beta1.SandboxSpec{SandboxBlueprint: sandboxv1beta1.SandboxBlueprint{PodTemplate: sandboxv1beta1.PodTemplate{
+					Spec: corev1.PodSpec{
+						Containers: []corev1.Container{{Name: "test-container"}},
+					},
+					ObjectMeta: sandboxv1beta1.PodMetadata{
+						Labels: map[string]string{
+							// Attacker attempts to hijack another Sandbox's routing label
+							// and to spoof an extensions-prefixed system label.
+							sandboxv1beta1.SandboxNameHashLabel:          "malicious-hijacked-hash",
+							extensionsv1beta1.SandboxIDLabel:             "malicious-claim-uid",
+							"extensions.agents.x-k8s.io/warm-pool-spoof": "evil",
+							"custom-label": "label-val",
 						},
-						ObjectMeta: sandboxv1beta1.PodMetadata{
-							Labels: map[string]string{
-								// Attacker attempts to hijack another Sandbox's routing label
-								// and to spoof an extensions-prefixed system label.
-								"agents.x-k8s.io/sandbox-name-hash":          "malicious-hijacked-hash",
-								"extensions.agents.x-k8s.io/warm-pool-spoof": "evil",
-								"custom-label": "label-val",
-							},
-							Annotations: map[string]string{
-								"agents.x-k8s.io/pod-name":       "malicious-pod-name",
-								asmetrics.TraceContextAnnotation: "spoofed-trace",
-								"custom-annotation":              "anno-val",
-							},
+						Annotations: map[string]string{
+							"agents.x-k8s.io/pod-name":       "malicious-pod-name",
+							asmetrics.TraceContextAnnotation: "spoofed-trace",
+							"custom-annotation":              "anno-val",
 						},
 					},
+				}}, OperatingMode: sandboxv1beta1.SandboxOperatingModeRunning,
 				},
 			},
 			wantPod: &corev1.Pod{
@@ -1344,7 +2026,7 @@ func TestReconcilePod(t *testing.T) {
 					ResourceVersion: "1",
 					Labels: map[string]string{
 						// System label is set by the controller, not the attacker's value.
-						"agents.x-k8s.io/sandbox-name-hash": nameHash,
+						sandboxv1beta1.SandboxNameHashLabel: nameHash,
 						"custom-label":                      "label-val",
 					},
 					Annotations: map[string]string{
@@ -1358,9 +2040,6 @@ func TestReconcilePod(t *testing.T) {
 					Containers: []corev1.Container{{Name: "test-container"}},
 				},
 			},
-			wantSandboxAnnotations: map[string]string{
-				sandboxv1beta1.SandboxPodNameAnnotation: sandboxName,
-			},
 		},
 		{
 			name: "scrubs stale system labels/annotations recorded by an older controller",
@@ -1371,7 +2050,7 @@ func TestReconcilePod(t *testing.T) {
 						Namespace:       sandboxNs,
 						ResourceVersion: "1",
 						Labels: map[string]string{
-							"agents.x-k8s.io/sandbox-name-hash": nameHash,
+							sandboxv1beta1.SandboxNameHashLabel: nameHash,
 							"custom-label":                      "label-val",
 							// A system label an older controller propagated and recorded.
 							"agents.x-k8s.io/evil": "x",
@@ -1398,7 +2077,7 @@ func TestReconcilePod(t *testing.T) {
 					Namespace:       sandboxNs,
 					ResourceVersion: "2",
 					Labels: map[string]string{
-						"agents.x-k8s.io/sandbox-name-hash": nameHash,
+						sandboxv1beta1.SandboxNameHashLabel: nameHash,
 						"custom-label":                      "label-val",
 					},
 					Annotations: map[string]string{
@@ -1412,9 +2091,6 @@ func TestReconcilePod(t *testing.T) {
 					Containers: []corev1.Container{{Name: "test-container"}},
 				},
 			},
-			wantSandboxAnnotations: map[string]string{
-				sandboxv1beta1.SandboxPodNameAnnotation: sandboxName,
-			},
 		},
 		{
 			name: "does not propagate system labels from Sandbox metadata to Pod",
@@ -1427,12 +2103,10 @@ func TestReconcilePod(t *testing.T) {
 						sandboxv1beta1.SandboxWarmPoolLabel: "pool-hash",
 					},
 				},
-				Spec: sandboxv1beta1.SandboxSpec{
-					OperatingMode: sandboxv1beta1.SandboxOperatingModeRunning,
-					PodTemplate: sandboxv1beta1.PodTemplate{
-						Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: "test-container"}}},
-						ObjectMeta: sandboxv1beta1.PodMetadata{Labels: map[string]string{"custom-label": "label-val"}},
-					},
+				Spec: sandboxv1beta1.SandboxSpec{SandboxBlueprint: sandboxv1beta1.SandboxBlueprint{PodTemplate: sandboxv1beta1.PodTemplate{
+					Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: "test-container"}}},
+					ObjectMeta: sandboxv1beta1.PodMetadata{Labels: map[string]string{"custom-label": "label-val"}},
+				}}, OperatingMode: sandboxv1beta1.SandboxOperatingModeRunning,
 				},
 			},
 			wantPod: &corev1.Pod{
@@ -1441,7 +2115,7 @@ func TestReconcilePod(t *testing.T) {
 					Namespace:       sandboxNs,
 					ResourceVersion: "1",
 					Labels: map[string]string{
-						"agents.x-k8s.io/sandbox-name-hash": nameHash,
+						sandboxv1beta1.SandboxNameHashLabel: nameHash,
 						"custom-label":                      "label-val",
 					},
 					Annotations: map[string]string{
@@ -1451,7 +2125,6 @@ func TestReconcilePod(t *testing.T) {
 				},
 				Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "test-container"}}},
 			},
-			wantSandboxAnnotations: map[string]string{sandboxv1beta1.SandboxPodNameAnnotation: sandboxName},
 		},
 		{
 			name: "does not propagate system labels from Sandbox PodTemplate to Pod",
@@ -1461,17 +2134,15 @@ func TestReconcilePod(t *testing.T) {
 					Namespace: sandboxNs,
 					UID:       sandboxUID,
 				},
-				Spec: sandboxv1beta1.SandboxSpec{
-					OperatingMode: sandboxv1beta1.SandboxOperatingModeRunning,
-					PodTemplate: sandboxv1beta1.PodTemplate{
-						Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "test-container"}}},
-						ObjectMeta: sandboxv1beta1.PodMetadata{
-							Labels: map[string]string{
-								"custom-label":                      "label-val",
-								sandboxv1beta1.SandboxWarmPoolLabel: "pool-hash",
-							},
+				Spec: sandboxv1beta1.SandboxSpec{SandboxBlueprint: sandboxv1beta1.SandboxBlueprint{PodTemplate: sandboxv1beta1.PodTemplate{
+					Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "test-container"}}},
+					ObjectMeta: sandboxv1beta1.PodMetadata{
+						Labels: map[string]string{
+							"custom-label":                      "label-val",
+							sandboxv1beta1.SandboxWarmPoolLabel: "pool-hash",
 						},
 					},
+				}}, OperatingMode: sandboxv1beta1.SandboxOperatingModeRunning,
 				},
 			},
 			wantPod: &corev1.Pod{
@@ -1480,7 +2151,7 @@ func TestReconcilePod(t *testing.T) {
 					Namespace:       sandboxNs,
 					ResourceVersion: "1",
 					Labels: map[string]string{
-						"agents.x-k8s.io/sandbox-name-hash": nameHash,
+						sandboxv1beta1.SandboxNameHashLabel: nameHash,
 						"custom-label":                      "label-val",
 					},
 					Annotations: map[string]string{
@@ -1490,7 +2161,40 @@ func TestReconcilePod(t *testing.T) {
 				},
 				Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "test-container"}}},
 			},
-			wantSandboxAnnotations: map[string]string{sandboxv1beta1.SandboxPodNameAnnotation: sandboxName},
+		},
+		{
+			name: "does not propagate template-ref-hash from Sandbox metadata to Pod",
+			sandbox: &sandboxv1beta1.Sandbox{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      sandboxName,
+					Namespace: sandboxNs,
+					UID:       sandboxUID,
+					Labels: map[string]string{
+						sandboxv1beta1.SandboxTemplateRefHashLabel: "da1fd924",
+					},
+				},
+				Spec: sandboxv1beta1.SandboxSpec{SandboxBlueprint: sandboxv1beta1.SandboxBlueprint{PodTemplate: sandboxv1beta1.PodTemplate{
+					Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: "test-container"}}},
+					ObjectMeta: sandboxv1beta1.PodMetadata{Labels: map[string]string{"custom-label": "label-val"}},
+				}}, OperatingMode: sandboxv1beta1.SandboxOperatingModeRunning,
+				},
+			},
+			wantPod: &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:            sandboxName,
+					Namespace:       sandboxNs,
+					ResourceVersion: "1",
+					Labels: map[string]string{
+						sandboxv1beta1.SandboxNameHashLabel: nameHash,
+						"custom-label":                      "label-val",
+					},
+					Annotations: map[string]string{
+						"agents.x-k8s.io/propagated-labels": "custom-label",
+					},
+					OwnerReferences: []metav1.OwnerReference{sandboxControllerRef(sandboxName)},
+				},
+				Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "test-container"}}},
+			},
 		},
 		{
 			name: "propagates warm pool label from Sandbox owner reference to Pod",
@@ -1504,20 +2208,18 @@ func TestReconcilePod(t *testing.T) {
 					},
 					OwnerReferences: []metav1.OwnerReference{
 						{
-							APIVersion: "extensions.agents.x-k8s.io/v1beta1",
-							Kind:       "SandboxWarmPool",
+							APIVersion: extensionsv1beta1.GroupVersion.String(),
+							Kind:       extensionsv1beta1.SandboxWarmPoolKind,
 							Name:       "my-warm-pool",
 							UID:        "pool-uid",
 							Controller: new(true),
 						},
 					},
 				},
-				Spec: sandboxv1beta1.SandboxSpec{
-					OperatingMode: sandboxv1beta1.SandboxOperatingModeRunning,
-					PodTemplate: sandboxv1beta1.PodTemplate{
-						Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: "test-container"}}},
-						ObjectMeta: sandboxv1beta1.PodMetadata{Labels: map[string]string{"custom-label": "label-val"}},
-					},
+				Spec: sandboxv1beta1.SandboxSpec{SandboxBlueprint: sandboxv1beta1.SandboxBlueprint{PodTemplate: sandboxv1beta1.PodTemplate{
+					Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: "test-container"}}},
+					ObjectMeta: sandboxv1beta1.PodMetadata{Labels: map[string]string{"custom-label": "label-val"}},
+				}}, OperatingMode: sandboxv1beta1.SandboxOperatingModeRunning,
 				},
 			},
 			wantPod: &corev1.Pod{
@@ -1526,7 +2228,7 @@ func TestReconcilePod(t *testing.T) {
 					Namespace:       sandboxNs,
 					ResourceVersion: "1",
 					Labels: map[string]string{
-						"agents.x-k8s.io/sandbox-name-hash": nameHash,
+						sandboxv1beta1.SandboxNameHashLabel: nameHash,
 						sandboxv1beta1.SandboxWarmPoolLabel: NameHash("my-warm-pool"),
 						"custom-label":                      "label-val",
 					},
@@ -1537,7 +2239,6 @@ func TestReconcilePod(t *testing.T) {
 				},
 				Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "test-container"}}},
 			},
-			wantSandboxAnnotations: map[string]string{sandboxv1beta1.SandboxPodNameAnnotation: sandboxName},
 		},
 		{
 			name: "removes warm pool label from Pod when Sandbox is no longer owned by SandboxWarmPool",
@@ -1548,7 +2249,7 @@ func TestReconcilePod(t *testing.T) {
 						Namespace:       sandboxNs,
 						ResourceVersion: "1",
 						Labels: map[string]string{
-							"agents.x-k8s.io/sandbox-name-hash":  nameHash,
+							sandboxv1beta1.SandboxNameHashLabel:  nameHash,
 							sandboxv1beta1.SandboxWarmPoolLabel:  "pool-hash",
 							"custom-label":                       "label-val",
 							sandboxv1beta1.SandboxAdoptableLabel: "true",
@@ -1568,12 +2269,10 @@ func TestReconcilePod(t *testing.T) {
 					Namespace: sandboxNs,
 					UID:       sandboxUID,
 				},
-				Spec: sandboxv1beta1.SandboxSpec{
-					OperatingMode: sandboxv1beta1.SandboxOperatingModeRunning,
-					PodTemplate: sandboxv1beta1.PodTemplate{
-						Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: "test-container"}}},
-						ObjectMeta: sandboxv1beta1.PodMetadata{Labels: map[string]string{"custom-label": "label-val"}},
-					},
+				Spec: sandboxv1beta1.SandboxSpec{SandboxBlueprint: sandboxv1beta1.SandboxBlueprint{PodTemplate: sandboxv1beta1.PodTemplate{
+					Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: "test-container"}}},
+					ObjectMeta: sandboxv1beta1.PodMetadata{Labels: map[string]string{"custom-label": "label-val"}},
+				}}, OperatingMode: sandboxv1beta1.SandboxOperatingModeRunning,
 				},
 			},
 			wantPod: &corev1.Pod{
@@ -1582,7 +2281,7 @@ func TestReconcilePod(t *testing.T) {
 					Namespace:       sandboxNs,
 					ResourceVersion: "2",
 					Labels: map[string]string{
-						"agents.x-k8s.io/sandbox-name-hash":  nameHash,
+						sandboxv1beta1.SandboxNameHashLabel:  nameHash,
 						"custom-label":                       "label-val",
 						sandboxv1beta1.SandboxAdoptableLabel: "true",
 					},
@@ -1595,9 +2294,6 @@ func TestReconcilePod(t *testing.T) {
 					Containers: []corev1.Container{{Name: "test-container"}},
 				},
 			},
-			wantSandboxAnnotations: map[string]string{
-				sandboxv1beta1.SandboxPodNameAnnotation: sandboxName,
-			},
 		},
 		{
 			name: "adds warm pool label to existing Pod when Sandbox is owned by SandboxWarmPool",
@@ -1608,7 +2304,7 @@ func TestReconcilePod(t *testing.T) {
 						Namespace:       sandboxNs,
 						ResourceVersion: "1",
 						Labels: map[string]string{
-							"agents.x-k8s.io/sandbox-name-hash":  nameHash,
+							sandboxv1beta1.SandboxNameHashLabel:  nameHash,
 							"custom-label":                       "label-val",
 							sandboxv1beta1.SandboxAdoptableLabel: "true",
 						},
@@ -1631,20 +2327,18 @@ func TestReconcilePod(t *testing.T) {
 					},
 					OwnerReferences: []metav1.OwnerReference{
 						{
-							APIVersion: "extensions.agents.x-k8s.io/v1beta1",
-							Kind:       "SandboxWarmPool",
+							APIVersion: extensionsv1beta1.GroupVersion.String(),
+							Kind:       extensionsv1beta1.SandboxWarmPoolKind,
 							Name:       "my-warm-pool",
 							UID:        "pool-uid",
 							Controller: new(true),
 						},
 					},
 				},
-				Spec: sandboxv1beta1.SandboxSpec{
-					OperatingMode: sandboxv1beta1.SandboxOperatingModeRunning,
-					PodTemplate: sandboxv1beta1.PodTemplate{
-						Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: "test-container"}}},
-						ObjectMeta: sandboxv1beta1.PodMetadata{Labels: map[string]string{"custom-label": "label-val"}},
-					},
+				Spec: sandboxv1beta1.SandboxSpec{SandboxBlueprint: sandboxv1beta1.SandboxBlueprint{PodTemplate: sandboxv1beta1.PodTemplate{
+					Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: "test-container"}}},
+					ObjectMeta: sandboxv1beta1.PodMetadata{Labels: map[string]string{"custom-label": "label-val"}},
+				}}, OperatingMode: sandboxv1beta1.SandboxOperatingModeRunning,
 				},
 			},
 			wantPod: &corev1.Pod{
@@ -1653,7 +2347,7 @@ func TestReconcilePod(t *testing.T) {
 					Namespace:       sandboxNs,
 					ResourceVersion: "2",
 					Labels: map[string]string{
-						"agents.x-k8s.io/sandbox-name-hash":  nameHash,
+						sandboxv1beta1.SandboxNameHashLabel:  nameHash,
 						sandboxv1beta1.SandboxWarmPoolLabel:  NameHash("my-warm-pool"),
 						"custom-label":                       "label-val",
 						sandboxv1beta1.SandboxAdoptableLabel: "true",
@@ -1667,18 +2361,546 @@ func TestReconcilePod(t *testing.T) {
 					Containers: []corev1.Container{{Name: "test-container"}},
 				},
 			},
-			wantSandboxAnnotations: map[string]string{
-				sandboxv1beta1.SandboxPodNameAnnotation: sandboxName,
+		},
+		{
+			name: "propagates template-ref-hash label from Sandbox labels to new Pod",
+			sandbox: &sandboxv1beta1.Sandbox{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      sandboxName,
+					Namespace: sandboxNs,
+					UID:       sandboxUID,
+					Labels: map[string]string{
+						sandboxv1beta1.SandboxTemplateRefHashLabel: "da1fd924",
+					},
+					OwnerReferences: []metav1.OwnerReference{
+						{
+							APIVersion: extensionsv1beta1.GroupVersion.String(),
+							Kind:       extensionsv1beta1.SandboxClaimKind,
+							Name:       "my-claim",
+							UID:        "claim-uid",
+							Controller: new(true),
+						},
+					},
+				},
+				Spec: sandboxv1beta1.SandboxSpec{SandboxBlueprint: sandboxv1beta1.SandboxBlueprint{PodTemplate: sandboxv1beta1.PodTemplate{
+					Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: "test-container"}}},
+					ObjectMeta: sandboxv1beta1.PodMetadata{Labels: map[string]string{"custom-label": "label-val"}},
+				}}, OperatingMode: sandboxv1beta1.SandboxOperatingModeRunning,
+				},
+			},
+			wantPod: &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:            sandboxName,
+					Namespace:       sandboxNs,
+					ResourceVersion: "1",
+					Labels: map[string]string{
+						sandboxv1beta1.SandboxNameHashLabel:        nameHash,
+						"custom-label":                             "label-val",
+						sandboxv1beta1.SandboxTemplateRefHashLabel: "da1fd924",
+					},
+					Annotations: map[string]string{
+						"agents.x-k8s.io/propagated-labels":          "custom-label",
+						extensionsv1beta1.SandboxClaimNameAnnotation: "my-claim",
+					},
+					OwnerReferences: []metav1.OwnerReference{sandboxControllerRef(sandboxName)},
+				},
+				Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "test-container"}}},
 			},
 		},
 		{
-			name: "delete pod if mode is Suspended",
+			name: "adds template-ref-hash label to existing Pod during reconciliation",
 			initialObjs: []runtime.Object{
 				&corev1.Pod{
 					ObjectMeta: metav1.ObjectMeta{
 						Name:            sandboxName,
 						Namespace:       sandboxNs,
 						ResourceVersion: "1",
+						Labels: map[string]string{
+							sandboxv1beta1.SandboxNameHashLabel: nameHash,
+							"custom-label":                      "label-val",
+						},
+						Annotations: map[string]string{
+							"agents.x-k8s.io/propagated-labels": "custom-label",
+						},
+					},
+					Spec: corev1.PodSpec{
+						Containers: []corev1.Container{{Name: "test-container"}},
+					},
+				},
+			},
+			sandbox: &sandboxv1beta1.Sandbox{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      sandboxName,
+					Namespace: sandboxNs,
+					UID:       sandboxUID,
+					Labels: map[string]string{
+						sandboxv1beta1.SandboxTemplateRefHashLabel: "da1fd924",
+					},
+					OwnerReferences: []metav1.OwnerReference{
+						{
+							APIVersion: extensionsv1beta1.GroupVersion.String(),
+							Kind:       extensionsv1beta1.SandboxClaimKind,
+							Name:       "my-claim",
+							UID:        "claim-uid",
+							Controller: new(true),
+						},
+					},
+				},
+				Spec: sandboxv1beta1.SandboxSpec{SandboxBlueprint: sandboxv1beta1.SandboxBlueprint{PodTemplate: sandboxv1beta1.PodTemplate{
+					Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: "test-container"}}},
+					ObjectMeta: sandboxv1beta1.PodMetadata{Labels: map[string]string{"custom-label": "label-val"}},
+				}}, OperatingMode: sandboxv1beta1.SandboxOperatingModeRunning,
+				},
+			},
+			wantPod: &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:            sandboxName,
+					Namespace:       sandboxNs,
+					ResourceVersion: "2",
+					Labels: map[string]string{
+						sandboxv1beta1.SandboxNameHashLabel:        nameHash,
+						"custom-label":                             "label-val",
+						sandboxv1beta1.SandboxTemplateRefHashLabel: "da1fd924",
+					},
+					Annotations: map[string]string{
+						"agents.x-k8s.io/propagated-labels":          "custom-label",
+						extensionsv1beta1.SandboxClaimNameAnnotation: "my-claim",
+					},
+					OwnerReferences: []metav1.OwnerReference{sandboxControllerRef(sandboxName)},
+				},
+				Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "test-container"}}},
+			},
+		},
+		{
+			name: "propagates claim UID label from Sandbox labels to new Pod",
+			sandbox: &sandboxv1beta1.Sandbox{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      sandboxName,
+					Namespace: sandboxNs,
+					UID:       sandboxUID,
+					Labels: map[string]string{
+						extensionsv1beta1.SandboxIDLabel: "claim-uid",
+					},
+					OwnerReferences: []metav1.OwnerReference{
+						{
+							APIVersion: extensionsv1beta1.GroupVersion.String(),
+							Kind:       extensionsv1beta1.SandboxClaimKind,
+							Name:       "my-claim",
+							UID:        "claim-uid",
+							Controller: new(true),
+						},
+					},
+				},
+				Spec: sandboxv1beta1.SandboxSpec{SandboxBlueprint: sandboxv1beta1.SandboxBlueprint{PodTemplate: sandboxv1beta1.PodTemplate{
+					Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: "test-container"}}},
+					ObjectMeta: sandboxv1beta1.PodMetadata{Labels: map[string]string{"custom-label": "label-val"}},
+				}}, OperatingMode: sandboxv1beta1.SandboxOperatingModeRunning,
+				},
+			},
+			wantPod: &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:            sandboxName,
+					Namespace:       sandboxNs,
+					ResourceVersion: "1",
+					Labels: map[string]string{
+						sandboxv1beta1.SandboxNameHashLabel: nameHash,
+						"custom-label":                      "label-val",
+						extensionsv1beta1.SandboxIDLabel:    "claim-uid",
+					},
+					Annotations: map[string]string{
+						"agents.x-k8s.io/propagated-labels":          "custom-label",
+						extensionsv1beta1.SandboxClaimNameAnnotation: "my-claim",
+					},
+					OwnerReferences: []metav1.OwnerReference{sandboxControllerRef(sandboxName)},
+				},
+				Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "test-container"}}},
+			},
+			wantSandboxAnnotations: map[string]string{},
+		},
+		{
+			name: "adds claim UID label to existing Pod during reconciliation",
+			initialObjs: []runtime.Object{
+				&corev1.Pod{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:            sandboxName,
+						Namespace:       sandboxNs,
+						ResourceVersion: "1",
+						Labels: map[string]string{
+							sandboxv1beta1.SandboxNameHashLabel: nameHash,
+							"custom-label":                      "label-val",
+						},
+						Annotations: map[string]string{
+							"agents.x-k8s.io/propagated-labels": "custom-label",
+						},
+						OwnerReferences: []metav1.OwnerReference{sandboxControllerRef(sandboxName)},
+					},
+					Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "test-container"}}},
+				},
+			},
+			sandbox: &sandboxv1beta1.Sandbox{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      sandboxName,
+					Namespace: sandboxNs,
+					UID:       sandboxUID,
+					Labels: map[string]string{
+						extensionsv1beta1.SandboxIDLabel: "claim-uid",
+					},
+					OwnerReferences: []metav1.OwnerReference{
+						{
+							APIVersion: extensionsv1beta1.GroupVersion.String(),
+							Kind:       extensionsv1beta1.SandboxClaimKind,
+							Name:       "my-claim",
+							UID:        "claim-uid",
+							Controller: new(true),
+						},
+					},
+				},
+				Spec: sandboxv1beta1.SandboxSpec{SandboxBlueprint: sandboxv1beta1.SandboxBlueprint{PodTemplate: sandboxv1beta1.PodTemplate{
+					Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: "test-container"}}},
+					ObjectMeta: sandboxv1beta1.PodMetadata{Labels: map[string]string{"custom-label": "label-val"}},
+				}}, OperatingMode: sandboxv1beta1.SandboxOperatingModeRunning,
+				},
+			},
+			wantPod: &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:            sandboxName,
+					Namespace:       sandboxNs,
+					ResourceVersion: "2",
+					Labels: map[string]string{
+						sandboxv1beta1.SandboxNameHashLabel: nameHash,
+						"custom-label":                      "label-val",
+						extensionsv1beta1.SandboxIDLabel:    "claim-uid",
+					},
+					Annotations: map[string]string{
+						"agents.x-k8s.io/propagated-labels":          "custom-label",
+						extensionsv1beta1.SandboxClaimNameAnnotation: "my-claim",
+					},
+					OwnerReferences: []metav1.OwnerReference{sandboxControllerRef(sandboxName)},
+				},
+				Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "test-container"}}},
+			},
+			wantSandboxAnnotations: map[string]string{},
+		},
+		{
+			name: "both warm-pool-sandbox and template-ref-hash coexist on Pod",
+			sandbox: &sandboxv1beta1.Sandbox{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      sandboxName,
+					Namespace: sandboxNs,
+					UID:       sandboxUID,
+					Labels: map[string]string{
+						sandboxv1beta1.SandboxWarmPoolLabel:        NameHash("my-warm-pool"),
+						sandboxv1beta1.SandboxTemplateRefHashLabel: "da1fd924",
+					},
+					OwnerReferences: []metav1.OwnerReference{
+						{
+							APIVersion: extensionsv1beta1.GroupVersion.String(),
+							Kind:       extensionsv1beta1.SandboxWarmPoolKind,
+							Name:       "my-warm-pool",
+							UID:        "pool-uid",
+							Controller: new(true),
+						},
+					},
+				},
+				Spec: sandboxv1beta1.SandboxSpec{SandboxBlueprint: sandboxv1beta1.SandboxBlueprint{PodTemplate: sandboxv1beta1.PodTemplate{
+					Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: "test-container"}}},
+					ObjectMeta: sandboxv1beta1.PodMetadata{Labels: map[string]string{"custom-label": "label-val"}},
+				}}, OperatingMode: sandboxv1beta1.SandboxOperatingModeRunning,
+				},
+			},
+			wantPod: &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:            sandboxName,
+					Namespace:       sandboxNs,
+					ResourceVersion: "1",
+					Labels: map[string]string{
+						sandboxv1beta1.SandboxNameHashLabel:        nameHash,
+						"custom-label":                             "label-val",
+						sandboxv1beta1.SandboxWarmPoolLabel:        NameHash("my-warm-pool"),
+						sandboxv1beta1.SandboxTemplateRefHashLabel: "da1fd924",
+					},
+					Annotations: map[string]string{
+						"agents.x-k8s.io/propagated-labels": "custom-label",
+					},
+					OwnerReferences: []metav1.OwnerReference{sandboxControllerRef(sandboxName)},
+				},
+				Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "test-container"}}},
+			},
+		},
+		{
+			name: "removes template-ref-hash label from Pod when Sandbox is not owned by extensions controller",
+			initialObjs: []runtime.Object{
+				&corev1.Pod{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:            sandboxName,
+						Namespace:       sandboxNs,
+						ResourceVersion: "1",
+						Labels: map[string]string{
+							sandboxv1beta1.SandboxNameHashLabel:        nameHash,
+							"custom-label":                             "label-val",
+							sandboxv1beta1.SandboxTemplateRefHashLabel: "da1fd924",
+						},
+						Annotations: map[string]string{
+							"agents.x-k8s.io/propagated-labels": "custom-label",
+						},
+					},
+					Spec: corev1.PodSpec{
+						Containers: []corev1.Container{{Name: "test-container"}},
+					},
+				},
+			},
+			sandbox: &sandboxv1beta1.Sandbox{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      sandboxName,
+					Namespace: sandboxNs,
+					UID:       sandboxUID,
+				},
+				Spec: sandboxv1beta1.SandboxSpec{SandboxBlueprint: sandboxv1beta1.SandboxBlueprint{PodTemplate: sandboxv1beta1.PodTemplate{
+					Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: "test-container"}}},
+					ObjectMeta: sandboxv1beta1.PodMetadata{Labels: map[string]string{"custom-label": "label-val"}},
+				}}, OperatingMode: sandboxv1beta1.SandboxOperatingModeRunning,
+				},
+			},
+			wantPod: &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:            sandboxName,
+					Namespace:       sandboxNs,
+					ResourceVersion: "2",
+					Labels: map[string]string{
+						sandboxv1beta1.SandboxNameHashLabel: nameHash,
+						"custom-label":                      "label-val",
+					},
+					Annotations: map[string]string{
+						"agents.x-k8s.io/propagated-labels": "custom-label",
+					},
+					OwnerReferences: []metav1.OwnerReference{sandboxControllerRef(sandboxName)},
+				},
+				Spec: corev1.PodSpec{
+					Containers: []corev1.Container{{Name: "test-container"}},
+				},
+			},
+		},
+		{
+			name: "removes template-ref-hash label from Pod when absent from Sandbox labels but still extensions-owned",
+			initialObjs: []runtime.Object{
+				&corev1.Pod{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:            sandboxName,
+						Namespace:       sandboxNs,
+						ResourceVersion: "1",
+						Labels: map[string]string{
+							sandboxv1beta1.SandboxNameHashLabel:        nameHash,
+							"custom-label":                             "label-val",
+							sandboxv1beta1.SandboxTemplateRefHashLabel: "da1fd924",
+						},
+						Annotations: map[string]string{
+							"agents.x-k8s.io/propagated-labels": "custom-label",
+						},
+					},
+					Spec: corev1.PodSpec{
+						Containers: []corev1.Container{{Name: "test-container"}},
+					},
+				},
+			},
+			sandbox: &sandboxv1beta1.Sandbox{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      sandboxName,
+					Namespace: sandboxNs,
+					UID:       sandboxUID,
+					OwnerReferences: []metav1.OwnerReference{
+						{
+							APIVersion: extensionsv1beta1.GroupVersion.String(),
+							Kind:       extensionsv1beta1.SandboxClaimKind,
+							Name:       "my-claim",
+							UID:        "claim-uid",
+							Controller: new(true),
+						},
+					},
+				},
+				Spec: sandboxv1beta1.SandboxSpec{SandboxBlueprint: sandboxv1beta1.SandboxBlueprint{PodTemplate: sandboxv1beta1.PodTemplate{
+					Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: "test-container"}}},
+					ObjectMeta: sandboxv1beta1.PodMetadata{Labels: map[string]string{"custom-label": "label-val"}},
+				}}, OperatingMode: sandboxv1beta1.SandboxOperatingModeRunning,
+				},
+			},
+			wantPod: &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:            sandboxName,
+					Namespace:       sandboxNs,
+					ResourceVersion: "2",
+					Labels: map[string]string{
+						sandboxv1beta1.SandboxNameHashLabel: nameHash,
+						"custom-label":                      "label-val",
+					},
+					Annotations: map[string]string{
+						"agents.x-k8s.io/propagated-labels":          "custom-label",
+						extensionsv1beta1.SandboxClaimNameAnnotation: "my-claim",
+					},
+					OwnerReferences: []metav1.OwnerReference{sandboxControllerRef(sandboxName)},
+				},
+				Spec: corev1.PodSpec{
+					Containers: []corev1.Container{{Name: "test-container"}},
+				},
+			},
+		},
+		{
+			name: "sets full claim name annotation on new Pod and ignores a template value for it",
+			sandbox: &sandboxv1beta1.Sandbox{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      sandboxName,
+					Namespace: sandboxNs,
+					UID:       sandboxUID,
+					OwnerReferences: []metav1.OwnerReference{
+						{
+							APIVersion: extensionsv1beta1.GroupVersion.String(),
+							Kind:       extensionsv1beta1.SandboxClaimKind,
+							Name:       longClaimName,
+							UID:        "claim-uid",
+							Controller: new(true),
+						},
+					},
+				},
+				Spec: sandboxv1beta1.SandboxSpec{SandboxBlueprint: sandboxv1beta1.SandboxBlueprint{PodTemplate: sandboxv1beta1.PodTemplate{
+					Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "test-container"}}},
+					ObjectMeta: sandboxv1beta1.PodMetadata{Annotations: map[string]string{
+						"custom-annotation":                          "anno-val",
+						extensionsv1beta1.SandboxClaimNameAnnotation: "spoofed",
+					}},
+				}}, OperatingMode: sandboxv1beta1.SandboxOperatingModeRunning,
+				},
+			},
+			wantPod: &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:            sandboxName,
+					Namespace:       sandboxNs,
+					ResourceVersion: "1",
+					Labels:          map[string]string{"agents.x-k8s.io/sandbox-name-hash": nameHash},
+					Annotations: map[string]string{
+						"custom-annotation":                          "anno-val",
+						"agents.x-k8s.io/propagated-annotations":     "custom-annotation",
+						extensionsv1beta1.SandboxClaimNameAnnotation: longClaimName,
+					},
+					OwnerReferences: []metav1.OwnerReference{sandboxControllerRef(sandboxName)},
+				},
+				Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "test-container"}}},
+			},
+		},
+		{
+			name: "replaces a stale claim name annotation on existing Pod",
+			initialObjs: []runtime.Object{
+				&corev1.Pod{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:            sandboxName,
+						Namespace:       sandboxNs,
+						ResourceVersion: "1",
+						Labels:          map[string]string{"agents.x-k8s.io/sandbox-name-hash": nameHash},
+						Annotations:     map[string]string{extensionsv1beta1.SandboxClaimNameAnnotation: "old-claim"},
+						OwnerReferences: []metav1.OwnerReference{sandboxControllerRef(sandboxName)},
+					},
+					Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "test-container"}}},
+				},
+			},
+			sandbox: &sandboxv1beta1.Sandbox{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      sandboxName,
+					Namespace: sandboxNs,
+					UID:       sandboxUID,
+					OwnerReferences: []metav1.OwnerReference{
+						{
+							APIVersion: extensionsv1beta1.GroupVersion.String(),
+							Kind:       extensionsv1beta1.SandboxClaimKind,
+							Name:       "my-claim",
+							UID:        "claim-uid",
+							Controller: new(true),
+						},
+					},
+				},
+				Spec: sandboxv1beta1.SandboxSpec{SandboxBlueprint: sandboxv1beta1.SandboxBlueprint{PodTemplate: sandboxv1beta1.PodTemplate{
+					Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "test-container"}}},
+				}}, OperatingMode: sandboxv1beta1.SandboxOperatingModeRunning,
+				},
+			},
+			wantPod: &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:            sandboxName,
+					Namespace:       sandboxNs,
+					ResourceVersion: "2",
+					Labels:          map[string]string{"agents.x-k8s.io/sandbox-name-hash": nameHash},
+					Annotations:     map[string]string{extensionsv1beta1.SandboxClaimNameAnnotation: "my-claim"},
+					OwnerReferences: []metav1.OwnerReference{sandboxControllerRef(sandboxName)},
+				},
+				Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "test-container"}}},
+			},
+		},
+		{
+			name: "removes claim name annotation from existing Pod when a warm pool owns the Sandbox",
+			initialObjs: []runtime.Object{
+				&corev1.Pod{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:            sandboxName,
+						Namespace:       sandboxNs,
+						ResourceVersion: "1",
+						Labels:          map[string]string{"agents.x-k8s.io/sandbox-name-hash": nameHash},
+						Annotations: map[string]string{
+							"custom-annotation":                          "anno-val",
+							"agents.x-k8s.io/propagated-annotations":     "custom-annotation",
+							extensionsv1beta1.SandboxClaimNameAnnotation: "my-claim",
+						},
+						OwnerReferences: []metav1.OwnerReference{sandboxControllerRef(sandboxName)},
+					},
+					Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "test-container"}}},
+				},
+			},
+			sandbox: &sandboxv1beta1.Sandbox{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      sandboxName,
+					Namespace: sandboxNs,
+					UID:       sandboxUID,
+					OwnerReferences: []metav1.OwnerReference{
+						{
+							APIVersion: extensionsv1beta1.GroupVersion.String(),
+							Kind:       extensionsv1beta1.SandboxWarmPoolKind,
+							Name:       "my-warm-pool",
+							UID:        "pool-uid",
+							Controller: new(true),
+						},
+					},
+				},
+				Spec: sandboxv1beta1.SandboxSpec{SandboxBlueprint: sandboxv1beta1.SandboxBlueprint{PodTemplate: sandboxv1beta1.PodTemplate{
+					Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: "test-container"}}},
+					ObjectMeta: sandboxv1beta1.PodMetadata{Annotations: map[string]string{"custom-annotation": "anno-val"}},
+				}}, OperatingMode: sandboxv1beta1.SandboxOperatingModeRunning,
+				},
+			},
+			wantPod: &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:            sandboxName,
+					Namespace:       sandboxNs,
+					ResourceVersion: "2",
+					Labels:          map[string]string{"agents.x-k8s.io/sandbox-name-hash": nameHash},
+					Annotations: map[string]string{
+						"custom-annotation":                      "anno-val",
+						"agents.x-k8s.io/propagated-annotations": "custom-annotation",
+					},
+					OwnerReferences: []metav1.OwnerReference{sandboxControllerRef(sandboxName)},
+				},
+				Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "test-container"}}},
+			},
+		},
+		{
+			// Suspend deletes the owned Pod but keeps reporting it (as terminating)
+			// until it is actually gone. The finalizer keeps the fake-client Pod alive
+			// with a DeletionTimestamp after Delete, mimicking a real termination grace
+			// period; reconcilePod returns the (still-present) Pod so the Suspended
+			// condition can report PodTerminating.
+			name: "marks owned pod for deletion when mode is Suspended (still terminating)",
+			initialObjs: []runtime.Object{
+				&corev1.Pod{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:            sandboxName,
+						Namespace:       sandboxNs,
+						ResourceVersion: "1",
+						Finalizers:      []string{"agents.x-k8s.io/test-hold"},
 						OwnerReferences: []metav1.OwnerReference{sandboxControllerRef(sandboxName)},
 					},
 				},
@@ -1693,7 +2915,7 @@ func TestReconcilePod(t *testing.T) {
 					OperatingMode: sandboxv1beta1.SandboxOperatingModeSuspended,
 				},
 			},
-			wantPod: nil,
+			wantPodDeleting: true,
 		},
 		{
 			name: "no-op if mode is Suspended and pod does not exist",
@@ -1738,17 +2960,15 @@ func TestReconcilePod(t *testing.T) {
 						sandboxv1beta1.SandboxPodNameAnnotation: "adopted-pod-name",
 					},
 				},
-				Spec: sandboxv1beta1.SandboxSpec{
-					OperatingMode: sandboxv1beta1.SandboxOperatingModeRunning,
-					PodTemplate: sandboxv1beta1.PodTemplate{
-						Spec: corev1.PodSpec{
-							Containers: []corev1.Container{
-								{
-									Name: "test-container",
-								},
+				Spec: sandboxv1beta1.SandboxSpec{SandboxBlueprint: sandboxv1beta1.SandboxBlueprint{PodTemplate: sandboxv1beta1.PodTemplate{
+					Spec: corev1.PodSpec{
+						Containers: []corev1.Container{
+							{
+								Name: "test-container",
 							},
 						},
 					},
+				}}, OperatingMode: sandboxv1beta1.SandboxOperatingModeRunning,
 				},
 			},
 			wantPod: &corev1.Pod{
@@ -1757,7 +2977,7 @@ func TestReconcilePod(t *testing.T) {
 					Namespace:       sandboxNs,
 					ResourceVersion: "2",
 					Labels: map[string]string{
-						sandboxLabel:                         nameHash,
+						sandboxv1beta1.SandboxNameHashLabel:  nameHash,
 						sandboxv1beta1.SandboxAdoptableLabel: "true",
 					},
 					OwnerReferences: []metav1.OwnerReference{sandboxControllerRef(sandboxName)},
@@ -1842,7 +3062,26 @@ func TestReconcilePod(t *testing.T) {
 					OperatingMode: sandboxv1beta1.SandboxOperatingModeSuspended,
 				},
 			},
-			wantPod:                nil,
+			wantPod: &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:            "victim-pod",
+					Namespace:       sandboxNs,
+					ResourceVersion: "1",
+					OwnerReferences: []metav1.OwnerReference{
+						{
+							APIVersion:         "apps/v1",
+							Kind:               "Deployment",
+							Name:               "other-deployment",
+							UID:                "other-uid",
+							Controller:         new(true),
+							BlockOwnerDeletion: new(true),
+						},
+					},
+				},
+				Spec: corev1.PodSpec{
+					Containers: []corev1.Container{{Name: "c"}},
+				},
+			},
 			expectErr:              false,
 			wantSandboxAnnotations: map[string]string{"other-annotation": "keep-me"},
 			wantPodSurvives:        "victim-pod",
@@ -1874,7 +3113,16 @@ func TestReconcilePod(t *testing.T) {
 					OperatingMode: sandboxv1beta1.SandboxOperatingModeSuspended,
 				},
 			},
-			wantPod:                nil,
+			wantPod: &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:            "unowned-pod",
+					Namespace:       sandboxNs,
+					ResourceVersion: "1",
+				},
+				Spec: corev1.PodSpec{
+					Containers: []corev1.Container{{Name: "c"}},
+				},
+			},
 			expectErr:              false,
 			wantSandboxAnnotations: map[string]string{"other-annotation": "keep-me"},
 			wantPodSurvives:        "unowned-pod",
@@ -1887,6 +3135,7 @@ func TestReconcilePod(t *testing.T) {
 						Name:            "owned-pod",
 						Namespace:       sandboxNs,
 						ResourceVersion: "1",
+						Finalizers:      []string{"agents.x-k8s.io/test-hold"},
 						OwnerReferences: []metav1.OwnerReference{sandboxControllerRef(sandboxName)},
 					},
 					Spec: corev1.PodSpec{
@@ -1908,9 +3157,12 @@ func TestReconcilePod(t *testing.T) {
 					OperatingMode: sandboxv1beta1.SandboxOperatingModeSuspended,
 				},
 			},
-			wantPod:                nil,
-			expectErr:              false,
-			wantSandboxAnnotations: map[string]string{"other-annotation": "keep-me"},
+			wantPodDeleting: true,
+			expectErr:       false,
+			wantSandboxAnnotations: map[string]string{
+				"other-annotation":                      "keep-me",
+				sandboxv1beta1.SandboxPodNameAnnotation: "owned-pod",
+			},
 		},
 		{
 			name: "refuses to adopt annotated pod owned by a different controller",
@@ -1944,13 +3196,11 @@ func TestReconcilePod(t *testing.T) {
 						sandboxv1beta1.SandboxPodNameAnnotation: "foreign-pod",
 					},
 				},
-				Spec: sandboxv1beta1.SandboxSpec{
-					OperatingMode: sandboxv1beta1.SandboxOperatingModeRunning,
-					PodTemplate: sandboxv1beta1.PodTemplate{
-						Spec: corev1.PodSpec{
-							Containers: []corev1.Container{{Name: "test-container"}},
-						},
+				Spec: sandboxv1beta1.SandboxSpec{SandboxBlueprint: sandboxv1beta1.SandboxBlueprint{PodTemplate: sandboxv1beta1.PodTemplate{
+					Spec: corev1.PodSpec{
+						Containers: []corev1.Container{{Name: "test-container"}},
 					},
+				}}, OperatingMode: sandboxv1beta1.SandboxOperatingModeRunning,
 				},
 			},
 			wantPod:                nil,
@@ -1981,7 +3231,13 @@ func TestReconcilePod(t *testing.T) {
 					OperatingMode: sandboxv1beta1.SandboxOperatingModeSuspended,
 				},
 			},
-			wantPod:                nil,
+			wantPod: &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:            "annotated-pod-name",
+					Namespace:       sandboxNs,
+					ResourceVersion: "1",
+				},
+			},
 			expectErr:              false,
 			wantSandboxAnnotations: map[string]string{"other-annotation": "other-value"},
 			wantPodSurvives:        "annotated-pod-name",
@@ -1995,10 +3251,10 @@ func TestReconcilePod(t *testing.T) {
 						Namespace:       sandboxNs,
 						ResourceVersion: "1",
 						Labels: map[string]string{
-							sandboxLabel:                   nameHash,
-							"remove-label":                 "value",
-							"keep-label":                   "value",
-							"agents.x-k8s.io/system-label": "value",
+							sandboxv1beta1.SandboxNameHashLabel: nameHash,
+							"remove-label":                      "value",
+							"keep-label":                        "value",
+							"agents.x-k8s.io/system-label":      "value",
 						},
 						Annotations: map[string]string{
 							"remove-annotation":                      "value",
@@ -2020,21 +3276,19 @@ func TestReconcilePod(t *testing.T) {
 					Namespace: sandboxNs,
 					UID:       sandboxUID,
 				},
-				Spec: sandboxv1beta1.SandboxSpec{
-					OperatingMode: sandboxv1beta1.SandboxOperatingModeRunning,
-					PodTemplate: sandboxv1beta1.PodTemplate{
-						ObjectMeta: sandboxv1beta1.PodMetadata{
-							Labels: map[string]string{
-								"keep-label": "value",
-							},
-							Annotations: map[string]string{
-								"keep-annotation": "value",
-							},
+				Spec: sandboxv1beta1.SandboxSpec{SandboxBlueprint: sandboxv1beta1.SandboxBlueprint{PodTemplate: sandboxv1beta1.PodTemplate{
+					ObjectMeta: sandboxv1beta1.PodMetadata{
+						Labels: map[string]string{
+							"keep-label": "value",
 						},
-						Spec: corev1.PodSpec{
-							Containers: []corev1.Container{{Name: "test-container"}},
+						Annotations: map[string]string{
+							"keep-annotation": "value",
 						},
 					},
+					Spec: corev1.PodSpec{
+						Containers: []corev1.Container{{Name: "test-container"}},
+					},
+				}}, OperatingMode: sandboxv1beta1.SandboxOperatingModeRunning,
 				},
 			},
 			wantPod: &corev1.Pod{
@@ -2043,9 +3297,9 @@ func TestReconcilePod(t *testing.T) {
 					Namespace:       sandboxNs,
 					ResourceVersion: "2",
 					Labels: map[string]string{
-						sandboxLabel:                   nameHash,
-						"keep-label":                   "value",
-						"agents.x-k8s.io/system-label": "value",
+						sandboxv1beta1.SandboxNameHashLabel: nameHash,
+						"keep-label":                        "value",
+						"agents.x-k8s.io/system-label":      "value",
 					},
 					Annotations: map[string]string{
 						"keep-annotation":                        "value",
@@ -2058,9 +3312,6 @@ func TestReconcilePod(t *testing.T) {
 				Spec: corev1.PodSpec{
 					Containers: []corev1.Container{{Name: "test-container"}},
 				},
-			},
-			wantSandboxAnnotations: map[string]string{
-				sandboxv1beta1.SandboxPodNameAnnotation: sandboxName,
 			},
 		},
 		{
@@ -2086,18 +3337,465 @@ func TestReconcilePod(t *testing.T) {
 						sandboxv1beta1.SandboxPodNameAnnotation: "adopted-pod-name",
 					},
 				},
-				Spec: sandboxv1beta1.SandboxSpec{
-					OperatingMode: sandboxv1beta1.SandboxOperatingModeRunning,
-					PodTemplate: sandboxv1beta1.PodTemplate{
-						Spec: corev1.PodSpec{
-							Containers: []corev1.Container{{Name: "test-container"}},
-						},
+				Spec: sandboxv1beta1.SandboxSpec{SandboxBlueprint: sandboxv1beta1.SandboxBlueprint{PodTemplate: sandboxv1beta1.PodTemplate{
+					Spec: corev1.PodSpec{
+						Containers: []corev1.Container{{Name: "test-container"}},
 					},
+				}}, OperatingMode: sandboxv1beta1.SandboxOperatingModeRunning,
 				},
 			},
 			wantPod:                nil,
 			expectErr:              true,
 			wantSandboxAnnotations: map[string]string{sandboxv1beta1.SandboxPodNameAnnotation: "adopted-pod-name"},
+		},
+		{
+			name:        "propagates and normalizes created-by label value go-client",
+			initialObjs: []runtime.Object{},
+			sandbox: func() *sandboxv1beta1.Sandbox {
+				sb := sandboxObj.DeepCopy()
+				sb.Labels = map[string]string{
+					sandboxv1beta1.CreatedByLabel: "go-client",
+				}
+				return sb
+			}(),
+			wantPod: &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:            sandboxName,
+					Namespace:       sandboxNs,
+					ResourceVersion: "1",
+					Labels: map[string]string{
+						sandboxv1beta1.SandboxNameHashLabel: nameHash,
+						"custom-label":                      "label-val",
+						sandboxv1beta1.CreatedByLabel:       "go-client",
+					},
+					Annotations: map[string]string{
+						"custom-annotation":                      "anno-val",
+						"agents.x-k8s.io/propagated-labels":      "custom-label",
+						"agents.x-k8s.io/propagated-annotations": "custom-annotation",
+					},
+					OwnerReferences: []metav1.OwnerReference{sandboxControllerRef(sandboxName)},
+				},
+				Spec: corev1.PodSpec{
+					Containers: []corev1.Container{{Name: "test-container"}},
+				},
+			},
+		},
+		{
+			name:        "normalizes invalid created-by label to unknown",
+			initialObjs: []runtime.Object{},
+			sandbox: func() *sandboxv1beta1.Sandbox {
+				sb := sandboxObj.DeepCopy()
+				sb.Labels = map[string]string{
+					sandboxv1beta1.CreatedByLabel: "invalid-user-value-which-is-too-long-or-custom",
+				}
+				return sb
+			}(),
+			wantPod: &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:            sandboxName,
+					Namespace:       sandboxNs,
+					ResourceVersion: "1",
+					Labels: map[string]string{
+						sandboxv1beta1.SandboxNameHashLabel: nameHash,
+						"custom-label":                      "label-val",
+						sandboxv1beta1.CreatedByLabel:       "unknown",
+					},
+					Annotations: map[string]string{
+						"custom-annotation":                      "anno-val",
+						"agents.x-k8s.io/propagated-labels":      "custom-label",
+						"agents.x-k8s.io/propagated-annotations": "custom-annotation",
+					},
+					OwnerReferences: []metav1.OwnerReference{sandboxControllerRef(sandboxName)},
+				},
+				Spec: corev1.PodSpec{
+					Containers: []corev1.Container{{Name: "test-container"}},
+				},
+			},
+		},
+		{
+			name: "updates and normalizes created-by label on existing Pod",
+			initialObjs: []runtime.Object{
+				&corev1.Pod{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:            sandboxName,
+						Namespace:       sandboxNs,
+						ResourceVersion: "1",
+						Labels: map[string]string{
+							sandboxv1beta1.SandboxNameHashLabel:  nameHash,
+							"custom-label":                       "label-val",
+							sandboxv1beta1.SandboxAdoptableLabel: "true",
+							sandboxv1beta1.CreatedByLabel:        "controller",
+						},
+						Annotations: map[string]string{
+							"custom-annotation":                      "anno-val",
+							"agents.x-k8s.io/propagated-labels":      "custom-label",
+							"agents.x-k8s.io/propagated-annotations": "custom-annotation",
+						},
+					},
+					Spec: corev1.PodSpec{
+						Containers: []corev1.Container{{Name: "test-container"}},
+					},
+				},
+			},
+			sandbox: func() *sandboxv1beta1.Sandbox {
+				sb := sandboxObj.DeepCopy()
+				sb.Labels = map[string]string{
+					sandboxv1beta1.CreatedByLabel: "python-client",
+				}
+				return sb
+			}(),
+			wantPod: &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:            sandboxName,
+					Namespace:       sandboxNs,
+					ResourceVersion: "2",
+					Labels: map[string]string{
+						sandboxv1beta1.SandboxNameHashLabel:  nameHash,
+						"custom-label":                       "label-val",
+						sandboxv1beta1.SandboxAdoptableLabel: "true",
+						sandboxv1beta1.CreatedByLabel:        "python-client",
+					},
+					Annotations: map[string]string{
+						"custom-annotation":                      "anno-val",
+						"agents.x-k8s.io/propagated-labels":      "custom-label",
+						"agents.x-k8s.io/propagated-annotations": "custom-annotation",
+					},
+					OwnerReferences: []metav1.OwnerReference{sandboxControllerRef(sandboxName)},
+				},
+				Spec: corev1.PodSpec{
+					Containers: []corev1.Container{{Name: "test-container"}},
+				},
+			},
+		},
+		{
+			name: "removes created-by label from existing Pod when Sandbox lacks it",
+			initialObjs: []runtime.Object{
+				&corev1.Pod{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:            sandboxName,
+						Namespace:       sandboxNs,
+						ResourceVersion: "1",
+						Labels: map[string]string{
+							sandboxv1beta1.SandboxNameHashLabel:  nameHash,
+							"custom-label":                       "label-val",
+							sandboxv1beta1.SandboxAdoptableLabel: "true",
+							sandboxv1beta1.CreatedByLabel:        "go-client",
+						},
+						Annotations: map[string]string{
+							"custom-annotation":                      "anno-val",
+							"agents.x-k8s.io/propagated-labels":      "custom-label",
+							"agents.x-k8s.io/propagated-annotations": "custom-annotation",
+						},
+					},
+					Spec: corev1.PodSpec{
+						Containers: []corev1.Container{{Name: "test-container"}},
+					},
+				},
+			},
+			sandbox: sandboxObj,
+			wantPod: &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:            sandboxName,
+					Namespace:       sandboxNs,
+					ResourceVersion: "2",
+					Labels: map[string]string{
+						sandboxv1beta1.SandboxNameHashLabel:  nameHash,
+						"custom-label":                       "label-val",
+						sandboxv1beta1.SandboxAdoptableLabel: "true",
+					},
+					Annotations: map[string]string{
+						"custom-annotation":                      "anno-val",
+						"agents.x-k8s.io/propagated-labels":      "custom-label",
+						"agents.x-k8s.io/propagated-annotations": "custom-annotation",
+					},
+					OwnerReferences: []metav1.OwnerReference{sandboxControllerRef(sandboxName)},
+				},
+				Spec: corev1.PodSpec{
+					Containers: []corev1.Container{{Name: "test-container"}},
+				},
+			},
+		},
+		{
+			name: "Failed pod with default Retain policy is retained",
+			initialObjs: []runtime.Object{
+				&corev1.Pod{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:            sandboxName,
+						Namespace:       sandboxNs,
+						ResourceVersion: "1",
+						Labels: map[string]string{
+							sandboxv1beta1.SandboxNameHashLabel: nameHash,
+						},
+						OwnerReferences: []metav1.OwnerReference{sandboxControllerRef(sandboxName)},
+					},
+					Spec: corev1.PodSpec{
+						Containers: []corev1.Container{{Name: "test-container"}},
+					},
+					Status: corev1.PodStatus{Phase: corev1.PodFailed},
+				},
+			},
+			sandbox: sandboxObj,
+			wantPod: &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:            sandboxName,
+					Namespace:       sandboxNs,
+					ResourceVersion: "2",
+					Labels: map[string]string{
+						sandboxv1beta1.SandboxNameHashLabel: nameHash,
+						"custom-label":                      "label-val",
+					},
+					Annotations: map[string]string{
+						"custom-annotation":                      "anno-val",
+						"agents.x-k8s.io/propagated-labels":      "custom-label",
+						"agents.x-k8s.io/propagated-annotations": "custom-annotation",
+					},
+					OwnerReferences: []metav1.OwnerReference{sandboxControllerRef(sandboxName)},
+				},
+				Spec: corev1.PodSpec{
+					Containers: []corev1.Container{{Name: "test-container"}},
+				},
+				Status: corev1.PodStatus{Phase: corev1.PodFailed},
+			},
+		},
+		{
+			name: "Failed pod with Recreate policy is deleted and annotation cleared",
+			initialObjs: []runtime.Object{
+				&corev1.Pod{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:            sandboxName,
+						Namespace:       sandboxNs,
+						ResourceVersion: "1",
+						Labels: map[string]string{
+							sandboxv1beta1.SandboxNameHashLabel: nameHash,
+						},
+						OwnerReferences: []metav1.OwnerReference{sandboxControllerRef(sandboxName)},
+					},
+					Spec: corev1.PodSpec{
+						Containers: []corev1.Container{{Name: "test-container"}},
+					},
+					Status: corev1.PodStatus{Phase: corev1.PodFailed},
+				},
+			},
+			sandbox: &sandboxv1beta1.Sandbox{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      sandboxName,
+					Namespace: sandboxNs,
+					UID:       sandboxUID,
+					Annotations: map[string]string{
+						sandboxv1beta1.SandboxPodNameAnnotation: sandboxName,
+						"other-annotation":                      "keep-me",
+					},
+				},
+				Spec: sandboxv1beta1.SandboxSpec{SandboxBlueprint: sandboxv1beta1.SandboxBlueprint{
+					FailedPodPolicy: sandboxv1beta1.FailedPodPolicyRecreate,
+					PodTemplate: sandboxv1beta1.PodTemplate{
+						Spec: corev1.PodSpec{
+							Containers: []corev1.Container{{Name: "test-container"}},
+						},
+					}}, OperatingMode: sandboxv1beta1.SandboxOperatingModeRunning,
+				},
+			},
+			wantPod: nil,
+			wantSandboxAnnotations: map[string]string{
+				"other-annotation": "keep-me",
+			},
+		},
+		{
+			name: "Failed pod already being deleted for Recreate clears annotation without deleting again",
+			initialObjs: []runtime.Object{
+				&corev1.Pod{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:              sandboxName,
+						Namespace:         sandboxNs,
+						ResourceVersion:   "1",
+						DeletionTimestamp: new(metav1.NewTime(time.Now())),
+						Finalizers:        []string{"test-finalizer"},
+						Labels: map[string]string{
+							sandboxv1beta1.SandboxNameHashLabel: nameHash,
+						},
+						OwnerReferences: []metav1.OwnerReference{sandboxControllerRef(sandboxName)},
+					},
+					Spec: corev1.PodSpec{
+						Containers: []corev1.Container{{Name: "test-container"}},
+					},
+					Status: corev1.PodStatus{Phase: corev1.PodFailed},
+				},
+			},
+			sandbox: &sandboxv1beta1.Sandbox{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      sandboxName,
+					Namespace: sandboxNs,
+					UID:       sandboxUID,
+					Annotations: map[string]string{
+						sandboxv1beta1.SandboxPodNameAnnotation: sandboxName,
+						"other-annotation":                      "keep-me",
+					},
+				},
+				Spec: sandboxv1beta1.SandboxSpec{SandboxBlueprint: sandboxv1beta1.SandboxBlueprint{
+					FailedPodPolicy: sandboxv1beta1.FailedPodPolicyRecreate,
+					PodTemplate: sandboxv1beta1.PodTemplate{
+						Spec: corev1.PodSpec{
+							Containers: []corev1.Container{{Name: "test-container"}},
+						},
+					}}, OperatingMode: sandboxv1beta1.SandboxOperatingModeRunning,
+				},
+			},
+			wantPod:         nil,
+			wantPodSurvives: sandboxName,
+			wantSandboxAnnotations: map[string]string{
+				"other-annotation": "keep-me",
+			},
+		},
+		{
+			name: "Failed pod with Recreate policy owned by another controller is not deleted",
+			initialObjs: []runtime.Object{
+				&corev1.Pod{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:            sandboxName,
+						Namespace:       sandboxNs,
+						ResourceVersion: "1",
+						OwnerReferences: []metav1.OwnerReference{
+							{
+								APIVersion:         "apps/v1",
+								Kind:               "Deployment",
+								Name:               "other-deployment",
+								UID:                "other-uid",
+								Controller:         new(true),
+								BlockOwnerDeletion: new(true),
+							},
+						},
+					},
+					Spec: corev1.PodSpec{
+						Containers: []corev1.Container{{Name: "test-container"}},
+					},
+					Status: corev1.PodStatus{Phase: corev1.PodFailed},
+				},
+			},
+			sandbox: &sandboxv1beta1.Sandbox{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      sandboxName,
+					Namespace: sandboxNs,
+					UID:       sandboxUID,
+					Annotations: map[string]string{
+						sandboxv1beta1.SandboxPodNameAnnotation: sandboxName,
+					},
+				},
+				Spec: sandboxv1beta1.SandboxSpec{SandboxBlueprint: sandboxv1beta1.SandboxBlueprint{
+					FailedPodPolicy: sandboxv1beta1.FailedPodPolicyRecreate,
+					PodTemplate: sandboxv1beta1.PodTemplate{
+						Spec: corev1.PodSpec{
+							Containers: []corev1.Container{{Name: "test-container"}},
+						},
+					}}, OperatingMode: sandboxv1beta1.SandboxOperatingModeRunning,
+				},
+			},
+			wantPod:                nil,
+			expectErr:              true,
+			wantPodSurvives:        sandboxName,
+			wantSandboxAnnotations: map[string]string{
+				// owned-by-other path clears the pod-name annotation
+			},
+		},
+		{
+			name: "Succeeded pod with Recreate policy is retained",
+			initialObjs: []runtime.Object{
+				&corev1.Pod{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:            sandboxName,
+						Namespace:       sandboxNs,
+						ResourceVersion: "1",
+						Labels: map[string]string{
+							sandboxv1beta1.SandboxNameHashLabel: nameHash,
+						},
+						OwnerReferences: []metav1.OwnerReference{sandboxControllerRef(sandboxName)},
+					},
+					Spec: corev1.PodSpec{
+						Containers: []corev1.Container{{Name: "test-container"}},
+					},
+					Status: corev1.PodStatus{Phase: corev1.PodSucceeded},
+				},
+			},
+			sandbox: &sandboxv1beta1.Sandbox{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      sandboxName,
+					Namespace: sandboxNs,
+					UID:       sandboxUID,
+				},
+				Spec: sandboxv1beta1.SandboxSpec{SandboxBlueprint: sandboxv1beta1.SandboxBlueprint{
+					FailedPodPolicy: sandboxv1beta1.FailedPodPolicyRecreate,
+					PodTemplate: sandboxv1beta1.PodTemplate{
+						Spec: corev1.PodSpec{
+							Containers: []corev1.Container{{Name: "test-container"}},
+						},
+						ObjectMeta: sandboxv1beta1.PodMetadata{
+							Labels: map[string]string{
+								"custom-label": "label-val",
+							},
+							Annotations: map[string]string{
+								"custom-annotation": "anno-val",
+							},
+						},
+					}}, OperatingMode: sandboxv1beta1.SandboxOperatingModeRunning,
+				},
+			},
+			wantPod: &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:            sandboxName,
+					Namespace:       sandboxNs,
+					ResourceVersion: "2",
+					Labels: map[string]string{
+						sandboxv1beta1.SandboxNameHashLabel: nameHash,
+						"custom-label":                      "label-val",
+					},
+					Annotations: map[string]string{
+						"custom-annotation":                      "anno-val",
+						"agents.x-k8s.io/propagated-labels":      "custom-label",
+						"agents.x-k8s.io/propagated-annotations": "custom-annotation",
+					},
+					OwnerReferences: []metav1.OwnerReference{sandboxControllerRef(sandboxName)},
+				},
+				Spec: corev1.PodSpec{
+					Containers: []corev1.Container{{Name: "test-container"}},
+				},
+				Status: corev1.PodStatus{Phase: corev1.PodSucceeded},
+			},
+		},
+		{
+			// Suspended is evaluated before FailedPodPolicy, so a Failed pod
+			// under Recreate still takes the suspend delete path: the pod is
+			// marked for deletion and returned (annotation kept) rather than
+			// being cleared for recreate.
+			name: "Failed pod with Recreate policy while Suspended uses suspend delete path",
+			initialObjs: []runtime.Object{
+				&corev1.Pod{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:            sandboxName,
+						Namespace:       sandboxNs,
+						ResourceVersion: "1",
+						Finalizers:      []string{"agents.x-k8s.io/test-hold"},
+						OwnerReferences: []metav1.OwnerReference{sandboxControllerRef(sandboxName)},
+					},
+					Status: corev1.PodStatus{Phase: corev1.PodFailed},
+				},
+			},
+			sandbox: &sandboxv1beta1.Sandbox{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      sandboxName,
+					Namespace: sandboxNs,
+					UID:       sandboxUID,
+					Annotations: map[string]string{
+						sandboxv1beta1.SandboxPodNameAnnotation: sandboxName,
+					},
+				},
+				Spec: sandboxv1beta1.SandboxSpec{
+					SandboxBlueprint: sandboxv1beta1.SandboxBlueprint{FailedPodPolicy: sandboxv1beta1.FailedPodPolicyRecreate},
+					OperatingMode:    sandboxv1beta1.SandboxOperatingModeSuspended,
+				},
+			},
+			wantPodDeleting: true,
+			wantSandboxAnnotations: map[string]string{
+				sandboxv1beta1.SandboxPodNameAnnotation: sandboxName,
+			},
 		},
 	}
 
@@ -2112,7 +3810,7 @@ func TestReconcilePod(t *testing.T) {
 				ClusterDomain: "cluster.local",
 			}
 
-			pod, err := r.reconcilePod(t.Context(), sandbox, nameHash)
+			pod, _, err := r.reconcilePod(t.Context(), sandbox, nameHash, nil)
 			if tc.expectErr {
 				require.Error(t, err)
 				// Verify that any initially unowned Pod remains unowned (never adopted)
@@ -2129,29 +3827,39 @@ func TestReconcilePod(t *testing.T) {
 			} else {
 				require.NoError(t, err)
 			}
-			require.Equal(t, tc.wantPod, pod)
-
-			// Validate the Pod from the "cluster" (fake client)
-			if tc.wantPod != nil {
+			if tc.wantPodDeleting {
+				// reconcilePod returns the still-terminating Pod (pre-delete snapshot),
+				// and the Pod still exists in the cluster marked for deletion.
+				require.NotNil(t, pod, "expected reconcilePod to return the terminating pod")
 				livePod := &corev1.Pod{}
 				err = r.Get(t.Context(), types.NamespacedName{Name: pod.Name, Namespace: pod.Namespace}, livePod)
-				require.NoError(t, err)
-				require.Equal(t, tc.wantPod, livePod)
-			} else if !tc.expectErr {
-				if tc.wantPodSurvives != "" {
-					// Pod should still exist (ownership check blocked deletion)
+				require.NoError(t, err, "expected the terminating pod to still exist")
+				require.NotNil(t, livePod.DeletionTimestamp, "expected the pod to be marked for deletion")
+			} else {
+				require.Equal(t, tc.wantPod, pod)
+
+				// Validate the Pod from the "cluster" (fake client)
+				if tc.wantPod != nil {
 					livePod := &corev1.Pod{}
-					err = r.Get(t.Context(), types.NamespacedName{Name: tc.wantPodSurvives, Namespace: sandboxNs}, livePod)
-					require.NoError(t, err, "expected pod %q to survive but it was deleted", tc.wantPodSurvives)
-				} else {
-					// When wantPod is nil and no error expected, verify pod doesn't exist
-					livePod := &corev1.Pod{}
-					podName := sandboxName
-					if annotatedPod, exists := tc.sandbox.Annotations[sandboxv1beta1.SandboxPodNameAnnotation]; exists && annotatedPod != "" {
-						podName = annotatedPod
+					err = r.Get(t.Context(), types.NamespacedName{Name: pod.Name, Namespace: pod.Namespace}, livePod)
+					require.NoError(t, err)
+					require.Equal(t, tc.wantPod, livePod)
+				} else if !tc.expectErr {
+					if tc.wantPodSurvives != "" {
+						// Pod should still exist (ownership check blocked deletion)
+						livePod := &corev1.Pod{}
+						err = r.Get(t.Context(), types.NamespacedName{Name: tc.wantPodSurvives, Namespace: sandboxNs}, livePod)
+						require.NoError(t, err, "expected pod %q to survive but it was deleted", tc.wantPodSurvives)
+					} else {
+						// When wantPod is nil and no error expected, verify pod doesn't exist
+						livePod := &corev1.Pod{}
+						podName := sandboxName
+						if annotatedPod, exists := tc.sandbox.Annotations[sandboxv1beta1.SandboxPodNameAnnotation]; exists && annotatedPod != "" {
+							podName = annotatedPod
+						}
+						err = r.Get(t.Context(), types.NamespacedName{Name: podName, Namespace: sandboxNs}, livePod)
+						require.True(t, k8serrors.IsNotFound(err))
 					}
-					err = r.Get(t.Context(), types.NamespacedName{Name: podName, Namespace: sandboxNs}, livePod)
-					require.True(t, k8serrors.IsNotFound(err))
 				}
 			}
 
@@ -2169,6 +3877,947 @@ func TestReconcilePod(t *testing.T) {
 	}
 }
 
+func TestReconcilePodRecoversOwnedPodWhenTrackedPodIsMissing(t *testing.T) {
+	const (
+		sandboxName = "sandbox-name"
+		sandboxNs   = "sandbox-ns"
+		nameHash    = "name-hash"
+		survivor    = "warm-pod-survivor"
+	)
+
+	sandbox := &sandboxv1beta1.Sandbox{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      sandboxName,
+			Namespace: sandboxNs,
+			UID:       sandboxUID,
+			Annotations: map[string]string{
+				sandboxv1beta1.SandboxPodNameAnnotation: "warm-pod-missing",
+			},
+		},
+		Spec: sandboxv1beta1.SandboxSpec{
+			SandboxBlueprint: sandboxv1beta1.SandboxBlueprint{
+				PodTemplate: sandboxv1beta1.PodTemplate{
+					Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "test-container"}}},
+				},
+			},
+			OperatingMode: sandboxv1beta1.SandboxOperatingModeRunning,
+		},
+	}
+	ownedSurvivor := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:            survivor,
+			Namespace:       sandboxNs,
+			Labels:          map[string]string{sandboxv1beta1.SandboxNameHashLabel: nameHash},
+			OwnerReferences: []metav1.OwnerReference{sandboxControllerRef(sandboxName)},
+		},
+		Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "test-container"}}},
+	}
+
+	r := &SandboxReconciler{
+		Client:        newFakeClient(sandbox, ownedSurvivor),
+		Scheme:        Scheme,
+		Tracer:        asmetrics.NewNoOp(),
+		ClusterDomain: "cluster.local",
+	}
+
+	pod, _, err := r.reconcilePod(t.Context(), sandbox.DeepCopy(), nameHash, nil)
+	require.NoError(t, err)
+	require.NotNil(t, pod)
+	assert.Equal(t, survivor, pod.Name)
+
+	createdPod := &corev1.Pod{}
+	err = r.Get(t.Context(), types.NamespacedName{Name: sandboxName, Namespace: sandboxNs}, createdPod)
+	require.True(t, k8serrors.IsNotFound(err), "must not create a second Pod when an owned survivor exists")
+
+	liveSandbox := &sandboxv1beta1.Sandbox{}
+	require.NoError(t, r.Get(t.Context(), client.ObjectKeyFromObject(sandbox), liveSandbox))
+	assert.Empty(t, liveSandbox.Annotations[sandboxv1beta1.SandboxPodNameAnnotation])
+}
+
+func TestReconcilePodPrefersOwnedPodOverStaleAdoptionTarget(t *testing.T) {
+	const (
+		sandboxName = "sandbox-name"
+		sandboxNs   = "sandbox-ns"
+		nameHash    = "name-hash"
+		survivor    = "owned-survivor"
+		staleTarget = "stale-adoption-target"
+	)
+
+	sandbox := &sandboxv1beta1.Sandbox{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      sandboxName,
+			Namespace: sandboxNs,
+			UID:       sandboxUID,
+			Annotations: map[string]string{
+				sandboxv1beta1.SandboxPodNameAnnotation: staleTarget,
+			},
+		},
+		Spec: sandboxv1beta1.SandboxSpec{
+			SandboxBlueprint: sandboxv1beta1.SandboxBlueprint{
+				PodTemplate: sandboxv1beta1.PodTemplate{
+					Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "test-container"}}},
+				},
+			},
+			OperatingMode: sandboxv1beta1.SandboxOperatingModeRunning,
+		},
+	}
+	ownedSurvivor := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:            survivor,
+			Namespace:       sandboxNs,
+			Labels:          map[string]string{sandboxv1beta1.SandboxNameHashLabel: nameHash},
+			OwnerReferences: []metav1.OwnerReference{sandboxControllerRef(sandboxName)},
+		},
+		Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "test-container"}}},
+	}
+	staleAdoptionTarget := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      staleTarget,
+			Namespace: sandboxNs,
+			Labels:    map[string]string{sandboxv1beta1.SandboxAdoptableLabel: "true"},
+		},
+		Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "test-container"}}},
+	}
+
+	r := &SandboxReconciler{
+		Client:        newFakeClient(sandbox, ownedSurvivor, staleAdoptionTarget),
+		Scheme:        Scheme,
+		Tracer:        asmetrics.NewNoOp(),
+		ClusterDomain: "cluster.local",
+	}
+
+	pod, _, err := r.reconcilePod(t.Context(), sandbox.DeepCopy(), nameHash, nil)
+	require.NoError(t, err)
+	require.NotNil(t, pod)
+	assert.Equal(t, survivor, pod.Name)
+
+	liveTarget := &corev1.Pod{}
+	require.NoError(t, r.Get(t.Context(), types.NamespacedName{Name: staleTarget, Namespace: sandboxNs}, liveTarget))
+	assert.Empty(t, liveTarget.OwnerReferences, "stale target must not be adopted when an owned Pod already exists")
+
+	liveSandbox := &sandboxv1beta1.Sandbox{}
+	require.NoError(t, r.Get(t.Context(), client.ObjectKeyFromObject(sandbox), liveSandbox))
+	assert.Empty(t, liveSandbox.Annotations[sandboxv1beta1.SandboxPodNameAnnotation])
+}
+
+func TestReconcilePodFailsClosedForMultipleOwnedPods(t *testing.T) {
+	const (
+		sandboxName = "sandbox-name"
+		sandboxNs   = "sandbox-ns"
+		nameHash    = "name-hash"
+	)
+
+	sandbox := &sandboxv1beta1.Sandbox{
+		ObjectMeta: metav1.ObjectMeta{Name: sandboxName, Namespace: sandboxNs, UID: sandboxUID},
+		Spec: sandboxv1beta1.SandboxSpec{
+			SandboxBlueprint: sandboxv1beta1.SandboxBlueprint{
+				PodTemplate: sandboxv1beta1.PodTemplate{
+					Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "test-container"}}},
+				},
+			},
+			OperatingMode: sandboxv1beta1.SandboxOperatingModeRunning,
+		},
+	}
+	ownedPod := func(name string) *corev1.Pod {
+		return &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:            name,
+				Namespace:       sandboxNs,
+				Labels:          map[string]string{sandboxv1beta1.SandboxNameHashLabel: nameHash},
+				OwnerReferences: []metav1.OwnerReference{sandboxControllerRef(sandboxName)},
+			},
+			Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "test-container"}}},
+		}
+	}
+	first := ownedPod("owned-pod-a")
+	second := ownedPod("owned-pod-b")
+	r := &SandboxReconciler{
+		Client:        newFakeClient(sandbox, first, second),
+		Scheme:        Scheme,
+		Tracer:        asmetrics.NewNoOp(),
+		ClusterDomain: "cluster.local",
+	}
+
+	pod, _, err := r.reconcilePod(t.Context(), sandbox.DeepCopy(), nameHash, nil)
+	require.Error(t, err)
+	assert.Nil(t, pod)
+	assert.Contains(t, err.Error(), "multiple Pods")
+
+	createdPod := &corev1.Pod{}
+	err = r.Get(t.Context(), types.NamespacedName{Name: sandboxName, Namespace: sandboxNs}, createdPod)
+	require.True(t, k8serrors.IsNotFound(err), "must not create another Pod while ownership is ambiguous")
+	for _, name := range []string{first.Name, second.Name} {
+		livePod := &corev1.Pod{}
+		require.NoError(t, r.Get(t.Context(), types.NamespacedName{Name: name, Namespace: sandboxNs}, livePod))
+	}
+}
+
+func TestReconcileChildResourcesSurfacesMultipleOwnedPods(t *testing.T) {
+	const (
+		sandboxName = "sandbox-name"
+		sandboxNs   = "sandbox-ns"
+	)
+	nameHash := NameHash(sandboxName)
+	sandbox := &sandboxv1beta1.Sandbox{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:       sandboxName,
+			Namespace:  sandboxNs,
+			UID:        sandboxUID,
+			Generation: 3,
+		},
+		Spec: sandboxv1beta1.SandboxSpec{
+			SandboxBlueprint: sandboxv1beta1.SandboxBlueprint{
+				PodTemplate: sandboxv1beta1.PodTemplate{
+					Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "test-container"}}},
+				},
+			},
+			OperatingMode: sandboxv1beta1.SandboxOperatingModeRunning,
+		},
+	}
+	ownedPod := func(name string) *corev1.Pod {
+		return &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:            name,
+				Namespace:       sandboxNs,
+				Labels:          map[string]string{sandboxv1beta1.SandboxNameHashLabel: nameHash},
+				OwnerReferences: []metav1.OwnerReference{sandboxControllerRef(sandboxName)},
+			},
+		}
+	}
+	recorder := events.NewFakeRecorder(2)
+	r := &SandboxReconciler{
+		Client:        newFakeClient(sandbox, ownedPod("owned-pod-a"), ownedPod("owned-pod-b")),
+		Scheme:        Scheme,
+		Recorder:      recorder,
+		Tracer:        asmetrics.NewNoOp(),
+		ClusterDomain: "cluster.local",
+	}
+
+	_, _, err := r.reconcileChildResources(t.Context(), sandbox, nil)
+	require.NoError(t, err)
+	ready := meta.FindStatusCondition(sandbox.Status.Conditions, string(sandboxv1beta1.SandboxConditionReady))
+	require.NotNil(t, ready)
+	assert.Equal(t, metav1.ConditionFalse, ready.Status)
+	assert.Equal(t, sandboxv1beta1.SandboxReasonMultiplePods, ready.Reason)
+	assert.Contains(t, ready.Message, "multiple Pods (2)")
+	assert.Nil(t, sandbox.Status.PodIPs)
+	assert.Empty(t, sandbox.Status.NodeName)
+
+	service := &corev1.Service{}
+	err = r.Get(t.Context(), types.NamespacedName{Name: sandboxName, Namespace: sandboxNs}, service)
+	require.True(t, k8serrors.IsNotFound(err), "must not create a routing Service for an ambiguous Pod mapping")
+
+	select {
+	case event := <-recorder.Events:
+		assert.Contains(t, event, corev1.EventTypeWarning)
+		assert.Contains(t, event, sandboxv1beta1.SandboxReasonMultiplePods)
+	default:
+		t.Fatal("expected a warning Event for the Pod mapping conflict")
+	}
+
+	// The conflict is watch-driven and does not return an error or emit a new
+	// Event on every reconcile while the Ready condition already reports it.
+	_, _, err = r.reconcileChildResources(t.Context(), sandbox, nil)
+	require.NoError(t, err)
+	select {
+	case event := <-recorder.Events:
+		t.Fatalf("unexpected duplicate Event: %s", event)
+	default:
+	}
+}
+
+func TestSandboxOwnedPodsRequiresOwnerUID(t *testing.T) {
+	sandbox := &sandboxv1beta1.Sandbox{ObjectMeta: metav1.ObjectMeta{UID: sandboxUID}}
+	pods := []corev1.Pod{
+		{ObjectMeta: metav1.ObjectMeta{Name: "owned", OwnerReferences: []metav1.OwnerReference{sandboxControllerRef("sandbox")}}},
+		{ObjectMeta: metav1.ObjectMeta{Name: "old-incarnation", OwnerReferences: []metav1.OwnerReference{{UID: "old-sandbox-uid", Controller: new(true)}}}},
+		{ObjectMeta: metav1.ObjectMeta{Name: "unowned"}},
+	}
+
+	owned := sandboxOwnedPods(pods, sandbox)
+	require.Len(t, owned, 1)
+	assert.Equal(t, "owned", owned[0].Name)
+}
+
+func TestReconcilePodWaitsForOwnedTerminatingPod(t *testing.T) {
+	const (
+		sandboxName = "sandbox-name"
+		sandboxNs   = "sandbox-ns"
+		nameHash    = "name-hash"
+	)
+
+	sandbox := &sandboxv1beta1.Sandbox{
+		ObjectMeta: metav1.ObjectMeta{Name: sandboxName, Namespace: sandboxNs, UID: sandboxUID},
+		Spec: sandboxv1beta1.SandboxSpec{
+			SandboxBlueprint: sandboxv1beta1.SandboxBlueprint{
+				PodTemplate: sandboxv1beta1.PodTemplate{
+					Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "test-container"}}},
+				},
+			},
+			OperatingMode: sandboxv1beta1.SandboxOperatingModeRunning,
+		},
+	}
+	deletionTime := metav1.Now()
+	terminatingPod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              "terminating-owned-pod",
+			Namespace:         sandboxNs,
+			Labels:            map[string]string{sandboxv1beta1.SandboxNameHashLabel: nameHash},
+			OwnerReferences:   []metav1.OwnerReference{sandboxControllerRef(sandboxName)},
+			Finalizers:        []string{"agents.x-k8s.io/test-hold"},
+			DeletionTimestamp: &deletionTime,
+		},
+		Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "test-container"}}},
+	}
+	r := &SandboxReconciler{
+		Client:        newFakeClient(sandbox, terminatingPod),
+		Scheme:        Scheme,
+		Tracer:        asmetrics.NewNoOp(),
+		ClusterDomain: "cluster.local",
+	}
+
+	pod, _, err := r.reconcilePod(t.Context(), sandbox.DeepCopy(), nameHash, nil)
+	require.NoError(t, err)
+	require.NotNil(t, pod)
+	assert.Equal(t, terminatingPod.Name, pod.Name)
+
+	createdPod := &corev1.Pod{}
+	err = r.Get(t.Context(), types.NamespacedName{Name: sandboxName, Namespace: sandboxNs}, createdPod)
+	require.True(t, k8serrors.IsNotFound(err), "must wait for the owned terminating Pod instead of overlapping it")
+}
+
+func TestRecreateBackoffDelayDoublesAndCaps(t *testing.T) {
+	key := types.NamespacedName{Namespace: "ns", Name: "sb"}
+	now := time.Date(2026, 8, 16, 12, 0, 0, 0, time.UTC)
+	b := recreateBackoff{now: func() time.Time { return now }}
+
+	require.Zero(t, b.delay(key))
+
+	b.recordFailure(key, "pod-1")
+	require.Equal(t, recreateBackoffBase, b.delay(key))
+
+	now = now.Add(recreateBackoffBase)
+	require.Zero(t, b.delay(key))
+
+	b.recordFailure(key, "pod-2")
+	require.Equal(t, 2*recreateBackoffBase, b.delay(key))
+
+	// Advance through several failures until the cap is hit.
+	for range 10 {
+		now = now.Add(b.delay(key))
+		b.recordFailure(key, "another-pod")
+	}
+	require.Equal(t, recreateBackoffMax, b.delay(key))
+}
+
+func TestRecreateBackoffClearRestartsDelay(t *testing.T) {
+	key := types.NamespacedName{Namespace: "ns", Name: "sb"}
+	now := time.Date(2026, 8, 16, 12, 0, 0, 0, time.UTC)
+	b := recreateBackoff{now: func() time.Time { return now }}
+
+	b.recordFailure(key, "pod-1")
+	require.Equal(t, recreateBackoffBase, b.delay(key))
+
+	b.clear(key)
+	require.Zero(t, b.delay(key))
+
+	b.recordFailure(key, "pod-2")
+	require.Equal(t, recreateBackoffBase, b.delay(key), "clear should restart at the base delay")
+}
+
+func TestRecreateBackoffRunningObservationUsesControllerTime(t *testing.T) {
+	key := types.NamespacedName{Namespace: "ns", Name: "sb"}
+	now := time.Date(2026, 8, 16, 12, 0, 0, 0, time.UTC)
+	b := recreateBackoff{now: func() time.Time { return now }}
+	b.recordFailure(key, "failed-pod")
+
+	require.Equal(t, recreateBackoffResetAfter, b.observeRunning(key, "replacement-pod"))
+	now = now.Add(4 * time.Minute)
+	require.Equal(t, recreateBackoffResetAfter-4*time.Minute, b.observeRunning(key, "replacement-pod"))
+
+	b.resetRunningObservation(key)
+	now = now.Add(time.Minute)
+	require.Equal(t, recreateBackoffResetAfter, b.observeRunning(key, "replacement-pod"),
+		"a non-Running observation must restart the stable-Running window")
+}
+
+func TestRecreateBackoffRunningObservationRestartsForNewPodUID(t *testing.T) {
+	key := types.NamespacedName{Namespace: "ns", Name: "sb"}
+	now := time.Date(2026, 8, 16, 12, 0, 0, 0, time.UTC)
+	b := recreateBackoff{now: func() time.Time { return now }}
+	b.recordFailure(key, "failed-pod")
+	b.observeRunning(key, "replacement-1")
+	now = now.Add(4 * time.Minute)
+
+	require.Equal(t, recreateBackoffResetAfter, b.observeRunning(key, "replacement-2"),
+		"a different replacement Pod must get its own stable-Running window")
+}
+
+func TestReconcileFailedPodPolicyRetain(t *testing.T) {
+	for _, policy := range []sandboxv1beta1.FailedPodPolicy{"", sandboxv1beta1.FailedPodPolicyRetain} {
+		t.Run(string(policy), func(t *testing.T) {
+			sandbox, failedPod := recreatePolicySandboxAndFailedPod()
+			sandbox.Spec.FailedPodPolicy = policy
+			r := SandboxReconciler{
+				Client:        newFakeClient(failedPod, sandbox),
+				Scheme:        Scheme,
+				Tracer:        asmetrics.NewNoOp(),
+				ClusterDomain: "cluster.local",
+			}
+
+			pod, requeueAfter, err := r.reconcilePod(t.Context(), sandbox, NameHash(sandbox.Name), nil)
+			require.NoError(t, err)
+			require.NotNil(t, pod)
+			require.Zero(t, requeueAfter)
+			require.Equal(t, failedPod.UID, pod.UID)
+			require.Equal(t, corev1.PodFailed, pod.Status.Phase)
+
+			livePod := &corev1.Pod{}
+			require.NoError(t, r.Get(t.Context(), client.ObjectKeyFromObject(failedPod), livePod))
+			require.Equal(t, failedPod.UID, livePod.UID)
+			require.True(t, livePod.DeletionTimestamp.IsZero())
+		})
+	}
+}
+
+func TestReconcileFailedPodPolicyRecreateCreatesReplacement(t *testing.T) {
+	sandboxName := "sandbox-name"
+	sandboxNs := "sandbox-ns"
+	nameHash := "name-hash"
+
+	sandbox := &sandboxv1beta1.Sandbox{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      sandboxName,
+			Namespace: sandboxNs,
+			UID:       sandboxUID,
+			Annotations: map[string]string{
+				sandboxv1beta1.SandboxPodNameAnnotation: sandboxName,
+			},
+		},
+		Spec: sandboxv1beta1.SandboxSpec{SandboxBlueprint: sandboxv1beta1.SandboxBlueprint{
+			FailedPodPolicy: sandboxv1beta1.FailedPodPolicyRecreate,
+			PodTemplate: sandboxv1beta1.PodTemplate{
+				Spec: corev1.PodSpec{
+					Containers: []corev1.Container{{Name: "test-container"}},
+				},
+				ObjectMeta: sandboxv1beta1.PodMetadata{
+					Labels: map[string]string{"custom-label": "label-val"},
+				},
+			}}, OperatingMode: sandboxv1beta1.SandboxOperatingModeRunning,
+		},
+	}
+	failedPod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:            sandboxName,
+			Namespace:       sandboxNs,
+			UID:             "failed-pod-uid",
+			ResourceVersion: "1",
+			Labels:          map[string]string{sandboxv1beta1.SandboxNameHashLabel: nameHash},
+			OwnerReferences: []metav1.OwnerReference{sandboxControllerRef(sandboxName)},
+		},
+		Spec:   corev1.PodSpec{Containers: []corev1.Container{{Name: "test-container"}}},
+		Status: corev1.PodStatus{Phase: corev1.PodFailed},
+	}
+
+	tracer := &mockTracer{}
+	recorder := events.NewFakeRecorder(2)
+	now := time.Date(2026, 8, 16, 12, 0, 0, 0, time.UTC)
+	r := SandboxReconciler{
+		Client:        newFakeClient(failedPod, sandbox),
+		Scheme:        Scheme,
+		Recorder:      recorder,
+		Tracer:        tracer,
+		ClusterDomain: "cluster.local",
+	}
+	r.recreateBackoff.now = func() time.Time { return now }
+
+	pod, requeueAfter, err := r.reconcilePod(t.Context(), sandbox, nameHash, nil)
+	require.NoError(t, err)
+	require.Nil(t, pod)
+	require.Equal(t, recreateBackoffBase, requeueAfter)
+	require.Contains(t, tracer.events, mockTracerEvent{
+		name: "FailedPodDeletedForRecreate",
+		attrs: map[string]string{
+			"pod.Name": sandboxName,
+		},
+	})
+	event := drainEvent(t, recorder)
+	assert.Contains(t, event, corev1.EventTypeNormal)
+	assert.Contains(t, event, recreateBackoffEventReason)
+	assert.Contains(t, event, recreateBackoffBase.String())
+
+	livePod := &corev1.Pod{}
+	err = r.Get(t.Context(), types.NamespacedName{Name: sandboxName, Namespace: sandboxNs}, livePod)
+	require.True(t, k8serrors.IsNotFound(err))
+
+	liveSandbox := &sandboxv1beta1.Sandbox{}
+	require.NoError(t, r.Get(t.Context(), types.NamespacedName{Name: sandboxName, Namespace: sandboxNs}, liveSandbox))
+	_, hasAnnotation := liveSandbox.Annotations[sandboxv1beta1.SandboxPodNameAnnotation]
+	require.False(t, hasAnnotation)
+
+	// Create is gated by recreate backoff until the delay elapses.
+	replacement, requeueAfter, err := r.reconcilePod(t.Context(), liveSandbox, nameHash, nil)
+	require.NoError(t, err)
+	require.Nil(t, replacement)
+	require.Equal(t, recreateBackoffBase, requeueAfter)
+	assertNoEvent(t, recorder)
+
+	now = now.Add(recreateBackoffBase)
+	replacement, requeueAfter, err = r.reconcilePod(t.Context(), liveSandbox, nameHash, nil)
+	require.NoError(t, err)
+	require.Zero(t, requeueAfter)
+	require.NotNil(t, replacement)
+	require.Equal(t, sandboxName, replacement.Name)
+	require.Equal(t, corev1.PodPhase(""), replacement.Status.Phase)
+	require.Equal(t, []metav1.OwnerReference{sandboxControllerRef(sandboxName)}, replacement.OwnerReferences)
+}
+
+func TestReconcileFailedPodPolicyRecreateDoesNotBumpOnDeleteNotFound(t *testing.T) {
+	sandboxName := "sandbox-name"
+	sandboxNs := "sandbox-ns"
+	nameHash := "name-hash"
+	sandbox, failedPod := recreatePolicySandboxAndFailedPod()
+	key := types.NamespacedName{Namespace: sandboxNs, Name: sandboxName}
+
+	now := time.Date(2026, 8, 16, 12, 0, 0, 0, time.UTC)
+	recorder := events.NewFakeRecorder(1)
+	r := SandboxReconciler{
+		Client: newFakeClientWithInterceptor(interceptor.Funcs{
+			Delete: func(_ context.Context, _ client.WithWatch, obj client.Object, _ ...client.DeleteOption) error {
+				return k8serrors.NewNotFound(corev1.SchemeGroupVersion.WithResource("pods").GroupResource(), obj.GetName())
+			},
+		}, failedPod, sandbox),
+		Scheme:        Scheme,
+		Recorder:      recorder,
+		Tracer:        asmetrics.NewNoOp(),
+		ClusterDomain: "cluster.local",
+	}
+	r.recreateBackoff.now = func() time.Time { return now }
+	r.recreateBackoff.recordFailure(key, "previous-pod")
+	require.Equal(t, recreateBackoffBase, r.recreateBackoff.delay(key))
+
+	pod, requeueAfter, err := r.reconcilePod(t.Context(), sandbox, nameHash, nil)
+	require.NoError(t, err)
+	require.Nil(t, pod)
+	require.Equal(t, recreateBackoffBase, requeueAfter, "NotFound delete must not double-count the failure")
+	require.Equal(t, recreateBackoffBase, r.recreateBackoff.delay(key))
+	assertNoEvent(t, recorder)
+}
+
+func TestReconcileFailedPodPolicyRecreateBackoffSurvivesBriefRunning(t *testing.T) {
+	sandboxName := "sandbox-name"
+	sandboxNs := "sandbox-ns"
+	nameHash := "name-hash"
+	sandbox, failedPod := recreatePolicySandboxAndFailedPod()
+
+	now := time.Date(2026, 8, 16, 12, 0, 0, 0, time.UTC)
+	r := SandboxReconciler{
+		Client:        newFakeClient(failedPod, sandbox),
+		Scheme:        Scheme,
+		Tracer:        asmetrics.NewNoOp(),
+		ClusterDomain: "cluster.local",
+	}
+	r.recreateBackoff.now = func() time.Time { return now }
+
+	pod, requeueAfter, err := r.reconcilePod(t.Context(), sandbox, nameHash, nil)
+	require.NoError(t, err)
+	require.Nil(t, pod)
+	require.Equal(t, recreateBackoffBase, requeueAfter)
+
+	liveSandbox := &sandboxv1beta1.Sandbox{}
+	require.NoError(t, r.Get(t.Context(), types.NamespacedName{Name: sandboxName, Namespace: sandboxNs}, liveSandbox))
+	now = now.Add(recreateBackoffBase)
+	replacement, requeueAfter, err := r.reconcilePod(t.Context(), liveSandbox, nameHash, nil)
+	require.NoError(t, err)
+	require.Zero(t, requeueAfter)
+	require.NotNil(t, replacement)
+
+	running := replacement.DeepCopy()
+	running.Status.Phase = corev1.PodRunning
+	// A long Pending or image-pull period must not count toward stable Running.
+	running.Status.StartTime = &metav1.Time{Time: now.Add(-time.Hour)}
+	require.NoError(t, r.Status().Update(t.Context(), running))
+
+	observed, requeueAfter, err := r.reconcilePod(t.Context(), liveSandbox, nameHash, nil)
+	require.NoError(t, err)
+	require.NotNil(t, observed)
+	require.Equal(t, recreateBackoffResetAfter, requeueAfter, "brief Running must not reset; requeue until decay window")
+	require.True(t, r.recreateBackoff.has(types.NamespacedName{Namespace: sandboxNs, Name: sandboxName}))
+
+	now = now.Add(time.Second)
+	failedAgain := observed.DeepCopy()
+	failedAgain.Status.Phase = corev1.PodFailed
+	require.NoError(t, r.Status().Update(t.Context(), failedAgain))
+
+	pod, requeueAfter, err = r.reconcilePod(t.Context(), liveSandbox, nameHash, nil)
+	require.NoError(t, err)
+	require.Nil(t, pod)
+	require.Equal(t, 2*recreateBackoffBase, requeueAfter, "crash after brief Running must double backoff")
+}
+
+func TestReconcileFailedPodPolicyRecreateResetsAfterStableRunning(t *testing.T) {
+	sandboxName := "sandbox-name"
+	sandboxNs := "sandbox-ns"
+	nameHash := "name-hash"
+	sandbox, failedPod := recreatePolicySandboxAndFailedPod()
+	key := types.NamespacedName{Namespace: sandboxNs, Name: sandboxName}
+
+	now := time.Date(2026, 8, 16, 12, 0, 0, 0, time.UTC)
+	r := SandboxReconciler{
+		Client:        newFakeClient(failedPod, sandbox),
+		Scheme:        Scheme,
+		Tracer:        asmetrics.NewNoOp(),
+		ClusterDomain: "cluster.local",
+	}
+	r.recreateBackoff.now = func() time.Time { return now }
+
+	_, _, err := r.reconcilePod(t.Context(), sandbox, nameHash, nil)
+	require.NoError(t, err)
+	liveSandbox := &sandboxv1beta1.Sandbox{}
+	require.NoError(t, r.Get(t.Context(), types.NamespacedName{Name: sandboxName, Namespace: sandboxNs}, liveSandbox))
+	now = now.Add(recreateBackoffBase)
+	replacement, _, err := r.reconcilePod(t.Context(), liveSandbox, nameHash, nil)
+	require.NoError(t, err)
+	require.NotNil(t, replacement)
+
+	running := replacement.DeepCopy()
+	running.Status.Phase = corev1.PodRunning
+	running.Status.StartTime = &metav1.Time{Time: now.Add(-time.Hour)}
+	require.NoError(t, r.Status().Update(t.Context(), running))
+
+	observed, requeueAfter, err := r.reconcilePod(t.Context(), liveSandbox, nameHash, nil)
+	require.NoError(t, err)
+	require.NotNil(t, observed)
+	require.Equal(t, recreateBackoffResetAfter, requeueAfter,
+		"the reset window starts when the controller first observes Running, not at Pod startTime")
+	require.True(t, r.recreateBackoff.has(key))
+
+	now = now.Add(recreateBackoffResetAfter)
+	observed, requeueAfter, err = r.reconcilePod(t.Context(), liveSandbox, nameHash, nil)
+	require.NoError(t, err)
+	require.NotNil(t, observed)
+	require.Zero(t, requeueAfter)
+	require.False(t, r.recreateBackoff.has(key), "stable Running must clear backoff")
+}
+
+func TestReconcileFailedPodPolicyRecreateDecaysOnLongLivedFailedPod(t *testing.T) {
+	sandboxName := "sandbox-name"
+	sandboxNs := "sandbox-ns"
+	nameHash := "name-hash"
+	sandbox, failedPod := recreatePolicySandboxAndFailedPod()
+	key := types.NamespacedName{Namespace: sandboxNs, Name: sandboxName}
+
+	now := time.Date(2026, 8, 16, 12, 0, 0, 0, time.UTC)
+	r := SandboxReconciler{
+		Client:        newFakeClient(failedPod, sandbox),
+		Scheme:        Scheme,
+		Tracer:        asmetrics.NewNoOp(),
+		ClusterDomain: "cluster.local",
+	}
+	r.recreateBackoff.now = func() time.Time { return now }
+	r.recreateBackoff.recordFailure(key, "first-failed-pod")
+	now = now.Add(recreateBackoffBase)
+	r.recreateBackoff.recordFailure(key, "second-failed-pod")
+	require.Equal(t, 2*recreateBackoffBase, r.recreateBackoff.delay(key))
+	r.recreateBackoff.observeRunning(key, failedPod.UID)
+	now = now.Add(recreateBackoffResetAfter)
+
+	pod, requeueAfter, err := r.reconcilePod(t.Context(), sandbox, nameHash, nil)
+	require.NoError(t, err)
+	require.Nil(t, pod)
+	require.Equal(t, recreateBackoffBase, requeueAfter, "a Pod observed Running for the decay window starts a new incident")
+}
+
+func TestReconcileFailedPodPolicyRecreateClearsBackoffOnSucceeded(t *testing.T) {
+	sandbox, pod := recreatePolicySandboxAndFailedPod()
+	pod.Status.Phase = corev1.PodSucceeded
+	key := types.NamespacedName{Namespace: sandbox.Namespace, Name: sandbox.Name}
+	r := SandboxReconciler{
+		Client:        newFakeClient(pod, sandbox),
+		Scheme:        Scheme,
+		Tracer:        asmetrics.NewNoOp(),
+		ClusterDomain: "cluster.local",
+	}
+	r.recreateBackoff.recordFailure(key, "previous-pod")
+
+	observed, requeueAfter, err := r.reconcilePod(t.Context(), sandbox, NameHash(sandbox.Name), nil)
+	require.NoError(t, err)
+	require.NotNil(t, observed)
+	require.Zero(t, requeueAfter)
+	require.False(t, r.recreateBackoff.has(key))
+}
+
+func TestReconcileClearsRecreateBackoffWhenInactive(t *testing.T) {
+	newSandbox := func(name string) *sandboxv1beta1.Sandbox {
+		return &sandboxv1beta1.Sandbox{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:       name,
+				Namespace:  "default",
+				UID:        types.UID(name),
+				Generation: 1,
+			},
+			Spec: sandboxv1beta1.SandboxSpec{
+				SandboxBlueprint: sandboxv1beta1.SandboxBlueprint{
+					PodTemplate: sandboxv1beta1.PodTemplate{
+						Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "test-container"}}},
+					},
+					FailedPodPolicy: sandboxv1beta1.FailedPodPolicyRecreate,
+				},
+				OperatingMode: sandboxv1beta1.SandboxOperatingModeRunning,
+			},
+		}
+	}
+
+	testCases := []struct {
+		name    string
+		sandbox *sandboxv1beta1.Sandbox
+	}{
+		{name: "not found"},
+		{
+			name: "deleting",
+			sandbox: func() *sandboxv1beta1.Sandbox {
+				sandbox := newSandbox("deleting")
+				deletionTime := metav1.Now()
+				sandbox.DeletionTimestamp = &deletionTime
+				sandbox.Finalizers = []string{"agents.x-k8s.io/test-hold"}
+				return sandbox
+			}(),
+		},
+		{
+			name: "policy disabled",
+			sandbox: func() *sandboxv1beta1.Sandbox {
+				sandbox := newSandbox("policy-disabled")
+				sandbox.Spec.FailedPodPolicy = sandboxv1beta1.FailedPodPolicyRetain
+				return sandbox
+			}(),
+		},
+		{
+			name: "suspended",
+			sandbox: func() *sandboxv1beta1.Sandbox {
+				sandbox := newSandbox("suspended")
+				sandbox.Spec.OperatingMode = sandboxv1beta1.SandboxOperatingModeSuspended
+				return sandbox
+			}(),
+		},
+		{
+			name: "expired and retained",
+			sandbox: func() *sandboxv1beta1.Sandbox {
+				sandbox := newSandbox("expired-retained")
+				shutdownTime := metav1.NewTime(time.Now().Add(-time.Minute))
+				sandbox.Spec.ShutdownTime = &shutdownTime
+				sandbox.Spec.ShutdownPolicy = ptr.To(sandboxv1beta1.ShutdownPolicyRetain)
+				return sandbox
+			}(),
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			key := types.NamespacedName{Namespace: "default", Name: strings.ReplaceAll(tc.name, " ", "-")}
+			var objects []runtime.Object
+			if tc.sandbox != nil {
+				key = types.NamespacedName{Namespace: tc.sandbox.Namespace, Name: tc.sandbox.Name}
+				objects = append(objects, tc.sandbox)
+			}
+			r := SandboxReconciler{
+				Client:        newFakeClient(objects...),
+				Scheme:        Scheme,
+				Tracer:        asmetrics.NewNoOp(),
+				ClusterDomain: "cluster.local",
+			}
+			r.recreateBackoff.recordFailure(key, "failed-pod")
+			require.True(t, r.recreateBackoff.has(key))
+
+			_, err := r.Reconcile(t.Context(), ctrl.Request{NamespacedName: key})
+			require.NoError(t, err)
+			require.False(t, r.recreateBackoff.has(key))
+		})
+	}
+}
+
+func recreatePolicySandboxAndFailedPod() (*sandboxv1beta1.Sandbox, *corev1.Pod) {
+	const sandboxName = "sandbox-name"
+	const sandboxNs = "sandbox-ns"
+	const nameHash = "name-hash"
+	sandbox := &sandboxv1beta1.Sandbox{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      sandboxName,
+			Namespace: sandboxNs,
+			UID:       sandboxUID,
+			Annotations: map[string]string{
+				sandboxv1beta1.SandboxPodNameAnnotation: sandboxName,
+			},
+		},
+		Spec: sandboxv1beta1.SandboxSpec{SandboxBlueprint: sandboxv1beta1.SandboxBlueprint{
+			FailedPodPolicy: sandboxv1beta1.FailedPodPolicyRecreate,
+			PodTemplate: sandboxv1beta1.PodTemplate{
+				Spec: corev1.PodSpec{
+					Containers: []corev1.Container{{Name: "test-container"}},
+				},
+				ObjectMeta: sandboxv1beta1.PodMetadata{
+					Labels: map[string]string{"custom-label": "label-val"},
+				},
+			}}, OperatingMode: sandboxv1beta1.SandboxOperatingModeRunning,
+		},
+	}
+	failedPod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:            sandboxName,
+			Namespace:       sandboxNs,
+			UID:             "failed-pod-uid",
+			ResourceVersion: "1",
+			Labels:          map[string]string{sandboxv1beta1.SandboxNameHashLabel: nameHash},
+			OwnerReferences: []metav1.OwnerReference{sandboxControllerRef(sandboxName)},
+		},
+		Spec:   corev1.PodSpec{Containers: []corev1.Container{{Name: "test-container"}}},
+		Status: corev1.PodStatus{Phase: corev1.PodFailed},
+	}
+	return sandbox, failedPod
+}
+
+func TestReconcileFailedPodPolicyRecreatePatchBehavior(t *testing.T) {
+	sandboxName := "sandbox-name"
+	sandboxNs := "sandbox-ns"
+	nameHash := "name-hash"
+
+	testCases := []struct {
+		name            string
+		sandbox         *sandboxv1beta1.Sandbox
+		failedPod       *corev1.Pod
+		wantPodPatches  int
+		wantOwnerRefs   []metav1.OwnerReference
+		assertionReason string
+	}{
+		{
+			name: "owned Failed pod skips metadata patch before delete",
+			sandbox: &sandboxv1beta1.Sandbox{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      sandboxName,
+					Namespace: sandboxNs,
+					UID:       sandboxUID,
+					Annotations: map[string]string{
+						sandboxv1beta1.SandboxPodNameAnnotation: sandboxName,
+					},
+				},
+				Spec: sandboxv1beta1.SandboxSpec{SandboxBlueprint: sandboxv1beta1.SandboxBlueprint{
+					FailedPodPolicy: sandboxv1beta1.FailedPodPolicyRecreate,
+					PodTemplate: sandboxv1beta1.PodTemplate{
+						Spec: corev1.PodSpec{
+							Containers: []corev1.Container{{Name: "test-container"}},
+						},
+						ObjectMeta: sandboxv1beta1.PodMetadata{
+							Labels: map[string]string{
+								"custom-label": "label-val",
+							},
+							Annotations: map[string]string{
+								"custom-annotation": "anno-val",
+							},
+						},
+					}}, OperatingMode: sandboxv1beta1.SandboxOperatingModeRunning,
+				},
+			},
+			failedPod: &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:            sandboxName,
+					Namespace:       sandboxNs,
+					ResourceVersion: "1",
+					Labels:          map[string]string{sandboxv1beta1.SandboxNameHashLabel: nameHash},
+					OwnerReferences: []metav1.OwnerReference{sandboxControllerRef(sandboxName)},
+				},
+				Spec:   corev1.PodSpec{Containers: []corev1.Container{{Name: "test-container"}}},
+				Status: corev1.PodStatus{Phase: corev1.PodFailed},
+			},
+			wantPodPatches:  0,
+			assertionReason: "owned Failed pod scheduled for recreate should not be metadata-patched before delete",
+		},
+		{
+			name: "adopted Failed pod is patched once to persist ownership before delete",
+			sandbox: &sandboxv1beta1.Sandbox{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      sandboxName,
+					Namespace: sandboxNs,
+					UID:       sandboxUID,
+					Annotations: map[string]string{
+						sandboxv1beta1.SandboxPodNameAnnotation: sandboxName,
+					},
+				},
+				Spec: sandboxv1beta1.SandboxSpec{SandboxBlueprint: sandboxv1beta1.SandboxBlueprint{
+					FailedPodPolicy: sandboxv1beta1.FailedPodPolicyRecreate,
+					PodTemplate: sandboxv1beta1.PodTemplate{
+						Spec: corev1.PodSpec{
+							Containers: []corev1.Container{{Name: "test-container"}},
+						},
+					}}, OperatingMode: sandboxv1beta1.SandboxOperatingModeRunning,
+				},
+			},
+			failedPod: &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:            sandboxName,
+					Namespace:       sandboxNs,
+					ResourceVersion: "1",
+					Labels:          map[string]string{sandboxv1beta1.SandboxAdoptableLabel: "true"},
+				},
+				Spec:   corev1.PodSpec{Containers: []corev1.Container{{Name: "test-container"}}},
+				Status: corev1.PodStatus{Phase: corev1.PodFailed},
+			},
+			wantPodPatches:  1,
+			wantOwnerRefs:   []metav1.OwnerReference{sandboxControllerRef(sandboxName)},
+			assertionReason: "adopted Failed pod should be patched once to persist ownership before delete",
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			podPatches := 0
+			var patchedOwnerRefs []metav1.OwnerReference
+			fakeClient := newFakeClientWithInterceptor(interceptor.Funcs{
+				Patch: func(ctx context.Context, c client.WithWatch, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
+					if pod, ok := obj.(*corev1.Pod); ok {
+						podPatches++
+						patchedOwnerRefs = append([]metav1.OwnerReference(nil), pod.OwnerReferences...)
+					}
+					return c.Patch(ctx, obj, patch, opts...)
+				},
+			}, tc.failedPod, tc.sandbox)
+
+			r := SandboxReconciler{
+				Client:        fakeClient,
+				Scheme:        Scheme,
+				Tracer:        asmetrics.NewNoOp(),
+				ClusterDomain: "cluster.local",
+			}
+
+			pod, _, err := r.reconcilePod(t.Context(), tc.sandbox, nameHash, nil)
+			require.NoError(t, err)
+			require.Nil(t, pod)
+			require.Equal(t, tc.wantPodPatches, podPatches, tc.assertionReason)
+			require.Equal(t, tc.wantOwnerRefs, patchedOwnerRefs)
+
+			livePod := &corev1.Pod{}
+			err = r.Get(t.Context(), types.NamespacedName{Name: sandboxName, Namespace: sandboxNs}, livePod)
+			require.True(t, k8serrors.IsNotFound(err), "failed pod should be deleted after reconcile")
+		})
+	}
+}
+
+func TestServicePortsForSandboxReturnsNilWithoutContainerPorts(t *testing.T) {
+	sandbox := &sandboxv1beta1.Sandbox{
+		Spec: sandboxv1beta1.SandboxSpec{
+			SandboxBlueprint: sandboxv1beta1.SandboxBlueprint{
+				PodTemplate: sandboxv1beta1.PodTemplate{
+					Spec: corev1.PodSpec{
+						Containers: []corev1.Container{{
+							Name: "main",
+						}},
+					},
+				},
+			},
+		},
+	}
+
+	require.Nil(t, servicePortsForSandbox(sandbox))
+}
+
 func TestReconcileService(t *testing.T) {
 	sandboxName := "sandbox-name"
 	sandboxNs := "sandbox-ns"
@@ -2179,11 +4828,53 @@ func TestReconcileService(t *testing.T) {
 			Namespace: sandboxNs,
 			UID:       sandboxUID,
 		},
-		Spec: sandboxv1beta1.SandboxSpec{
-			OperatingMode: sandboxv1beta1.SandboxOperatingModeRunning,
-			Service:       new(true),
-		},
+		Spec: sandboxv1beta1.SandboxSpec{SandboxBlueprint: sandboxv1beta1.SandboxBlueprint{Service: new(true)}, OperatingMode: sandboxv1beta1.SandboxOperatingModeRunning},
 	}
+	sandboxWithPodSpec := func(podSpec corev1.PodSpec) *sandboxv1beta1.Sandbox {
+		return &sandboxv1beta1.Sandbox{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      sandboxName,
+				Namespace: sandboxNs,
+				UID:       sandboxUID,
+			},
+			Spec: sandboxv1beta1.SandboxSpec{
+				SandboxBlueprint: sandboxv1beta1.SandboxBlueprint{
+					Service: new(true),
+					PodTemplate: sandboxv1beta1.PodTemplate{
+						Spec: podSpec,
+					},
+				},
+				OperatingMode: sandboxv1beta1.SandboxOperatingModeRunning,
+			},
+		}
+	}
+	sandboxWithContainers := func(containers ...corev1.Container) *sandboxv1beta1.Sandbox {
+		return sandboxWithPodSpec(corev1.PodSpec{Containers: containers})
+	}
+	sandboxWithPorts := func(containerPorts ...corev1.ContainerPort) *sandboxv1beta1.Sandbox {
+		return sandboxWithContainers(corev1.Container{
+			Name:  "main",
+			Ports: containerPorts,
+		})
+	}
+	sandboxWithNilServiceAndPorts := func(containerPorts ...corev1.ContainerPort) *sandboxv1beta1.Sandbox {
+		sandbox := sandboxWithPorts(containerPorts...)
+		sandbox.Spec.Service = nil
+		return sandbox
+	}
+	servicePortWithName := func(port int32, protocol corev1.Protocol, name string) corev1.ServicePort {
+		return corev1.ServicePort{
+			Name:       name,
+			Protocol:   protocol,
+			Port:       port,
+			TargetPort: intstr.FromInt32(port),
+		}
+	}
+	servicePort := func(port int32, protocol corev1.Protocol) corev1.ServicePort {
+		return servicePortWithName(port, protocol, fmt.Sprintf("p-%d-%s", port, strings.ToLower(string(protocol))))
+	}
+	alwaysRestart := corev1.ContainerRestartPolicyAlways
+	appProtocolHTTP := "http"
 
 	testCases := []struct {
 		name                  string
@@ -2206,14 +4897,195 @@ func TestReconcileService(t *testing.T) {
 					Namespace:       sandboxNs,
 					ResourceVersion: "1",
 					Labels: map[string]string{
-						sandboxLabel: nameHash,
+						sandboxv1beta1.SandboxNameHashLabel: nameHash,
 					},
 					OwnerReferences: []metav1.OwnerReference{sandboxControllerRef(sandboxName)},
 				},
 				Spec: corev1.ServiceSpec{
 					ClusterIP: "None",
 					Selector: map[string]string{
-						sandboxLabel: nameHash,
+						sandboxv1beta1.SandboxNameHashLabel: nameHash,
+					},
+				},
+			},
+			wantStatusService:     sandboxName,
+			wantStatusServiceFQDN: sandboxName + "." + sandboxNs + ".svc.cluster.local",
+		},
+		{
+			name: "creates a new headless service with container ports when service is true",
+			sandbox: sandboxWithPorts(corev1.ContainerPort{
+				ContainerPort: 8080,
+			}),
+			wantService: &corev1.Service{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:            sandboxName,
+					Namespace:       sandboxNs,
+					ResourceVersion: "1",
+					Labels: map[string]string{
+						sandboxv1beta1.SandboxNameHashLabel: nameHash,
+					},
+					OwnerReferences: []metav1.OwnerReference{sandboxControllerRef(sandboxName)},
+				},
+				Spec: corev1.ServiceSpec{
+					ClusterIP: "None",
+					Selector: map[string]string{
+						sandboxv1beta1.SandboxNameHashLabel: nameHash,
+					},
+					Ports: []corev1.ServicePort{
+						servicePort(8080, corev1.ProtocolTCP),
+					},
+				},
+			},
+			wantStatusService:     sandboxName,
+			wantStatusServiceFQDN: sandboxName + "." + sandboxNs + ".svc.cluster.local",
+		},
+		{
+			name: "creates a new headless service with native sidecar container ports",
+			sandbox: sandboxWithPodSpec(corev1.PodSpec{
+				Containers: []corev1.Container{{
+					Name: "main",
+				}},
+				InitContainers: []corev1.Container{
+					{
+						Name: "setup",
+						Ports: []corev1.ContainerPort{{
+							Name:          "setup",
+							ContainerPort: 7070,
+						}},
+					},
+					{
+						Name:          "proxy",
+						RestartPolicy: &alwaysRestart,
+						Ports: []corev1.ContainerPort{{
+							Name:          "metrics",
+							ContainerPort: 15020,
+						}},
+					},
+				},
+			}),
+			wantService: &corev1.Service{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:            sandboxName,
+					Namespace:       sandboxNs,
+					ResourceVersion: "1",
+					Labels: map[string]string{
+						sandboxv1beta1.SandboxNameHashLabel: nameHash,
+					},
+					OwnerReferences: []metav1.OwnerReference{sandboxControllerRef(sandboxName)},
+				},
+				Spec: corev1.ServiceSpec{
+					ClusterIP: "None",
+					Selector: map[string]string{
+						sandboxv1beta1.SandboxNameHashLabel: nameHash,
+					},
+					Ports: []corev1.ServicePort{
+						servicePortWithName(15020, corev1.ProtocolTCP, "metrics"),
+					},
+				},
+			},
+			wantStatusService:     sandboxName,
+			wantStatusServiceFQDN: sandboxName + "." + sandboxNs + ".svc.cluster.local",
+		},
+		{
+			name: "creates a new headless service with sorted unique container ports",
+			sandbox: sandboxWithPorts(
+				corev1.ContainerPort{ContainerPort: 9090, Protocol: corev1.ProtocolUDP},
+				corev1.ContainerPort{ContainerPort: 8080, Protocol: corev1.ProtocolTCP},
+				corev1.ContainerPort{Name: "http", ContainerPort: 8080},
+				corev1.ContainerPort{ContainerPort: 9090, Protocol: corev1.ProtocolTCP},
+				corev1.ContainerPort{ContainerPort: 0, Protocol: corev1.ProtocolTCP},
+			),
+			wantService: &corev1.Service{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:            sandboxName,
+					Namespace:       sandboxNs,
+					ResourceVersion: "1",
+					Labels: map[string]string{
+						sandboxv1beta1.SandboxNameHashLabel: nameHash,
+					},
+					OwnerReferences: []metav1.OwnerReference{sandboxControllerRef(sandboxName)},
+				},
+				Spec: corev1.ServiceSpec{
+					ClusterIP: "None",
+					Selector: map[string]string{
+						sandboxv1beta1.SandboxNameHashLabel: nameHash,
+					},
+					Ports: []corev1.ServicePort{
+						servicePortWithName(8080, corev1.ProtocolTCP, "http"),
+						servicePort(9090, corev1.ProtocolTCP),
+						servicePort(9090, corev1.ProtocolUDP),
+					},
+				},
+			},
+			wantStatusService:     sandboxName,
+			wantStatusServiceFQDN: sandboxName + "." + sandboxNs + ".svc.cluster.local",
+		},
+		{
+			name: "uses the first container port name when duplicate names are reused",
+			sandbox: sandboxWithContainers(
+				corev1.Container{
+					Name: "main",
+					Ports: []corev1.ContainerPort{{
+						Name:          "http",
+						ContainerPort: 9090,
+					}},
+				},
+				corev1.Container{
+					Name: "sidecar",
+					Ports: []corev1.ContainerPort{{
+						Name:          "http",
+						ContainerPort: 8080,
+					}},
+				},
+			),
+			wantService: &corev1.Service{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:            sandboxName,
+					Namespace:       sandboxNs,
+					ResourceVersion: "1",
+					Labels: map[string]string{
+						sandboxv1beta1.SandboxNameHashLabel: nameHash,
+					},
+					OwnerReferences: []metav1.OwnerReference{sandboxControllerRef(sandboxName)},
+				},
+				Spec: corev1.ServiceSpec{
+					ClusterIP: "None",
+					Selector: map[string]string{
+						sandboxv1beta1.SandboxNameHashLabel: nameHash,
+					},
+					Ports: []corev1.ServicePort{
+						servicePort(8080, corev1.ProtocolTCP),
+						servicePortWithName(9090, corev1.ProtocolTCP, "http"),
+					},
+				},
+			},
+			wantStatusService:     sandboxName,
+			wantStatusServiceFQDN: sandboxName + "." + sandboxNs + ".svc.cluster.local",
+		},
+		{
+			name: "adjusts generated service port name when it conflicts with an explicit name",
+			sandbox: sandboxWithPorts(
+				corev1.ContainerPort{Name: "p-8080-tcp", ContainerPort: 9090},
+				corev1.ContainerPort{ContainerPort: 8080},
+			),
+			wantService: &corev1.Service{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:            sandboxName,
+					Namespace:       sandboxNs,
+					ResourceVersion: "1",
+					Labels: map[string]string{
+						sandboxv1beta1.SandboxNameHashLabel: nameHash,
+					},
+					OwnerReferences: []metav1.OwnerReference{sandboxControllerRef(sandboxName)},
+				},
+				Spec: corev1.ServiceSpec{
+					ClusterIP: "None",
+					Selector: map[string]string{
+						sandboxv1beta1.SandboxNameHashLabel: nameHash,
+					},
+					Ports: []corev1.ServicePort{
+						servicePortWithName(8080, corev1.ProtocolTCP, "p-8080-tcp-2"),
+						servicePortWithName(9090, corev1.ProtocolTCP, "p-8080-tcp"),
 					},
 				},
 			},
@@ -2254,6 +5126,9 @@ func TestReconcileService(t *testing.T) {
 						Selector: map[string]string{
 							"app": "something-else",
 						},
+						Ports: []corev1.ServicePort{
+							servicePort(9090, corev1.ProtocolTCP),
+						},
 					},
 				},
 			},
@@ -2264,15 +5139,123 @@ func TestReconcileService(t *testing.T) {
 					Namespace:       sandboxNs,
 					ResourceVersion: "2",
 					Labels: map[string]string{
-						"keep":       "me",
-						sandboxLabel: nameHash,
+						"keep":                              "me",
+						sandboxv1beta1.SandboxNameHashLabel: nameHash,
 					},
 					OwnerReferences: []metav1.OwnerReference{sandboxControllerRef(sandboxName)},
 				},
 				Spec: corev1.ServiceSpec{
 					Selector: map[string]string{
-						sandboxLabel: nameHash,
+						sandboxv1beta1.SandboxNameHashLabel: nameHash,
 					},
+				},
+			},
+			wantStatusService:     sandboxName,
+			wantStatusServiceFQDN: sandboxName + "." + sandboxNs + ".svc.cluster.local",
+		},
+		{
+			name: "repairs port drift on service owned by this sandbox when service is true",
+			initialObjs: []runtime.Object{
+				&corev1.Service{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:            sandboxName,
+						Namespace:       sandboxNs,
+						ResourceVersion: "1",
+						Labels: map[string]string{
+							"keep":                              "me",
+							sandboxv1beta1.SandboxNameHashLabel: nameHash,
+						},
+						OwnerReferences: []metav1.OwnerReference{sandboxControllerRef(sandboxName)},
+					},
+					Spec: corev1.ServiceSpec{
+						Selector: map[string]string{
+							sandboxv1beta1.SandboxNameHashLabel: nameHash,
+						},
+						Ports: []corev1.ServicePort{
+							servicePort(9090, corev1.ProtocolTCP),
+						},
+					},
+				},
+			},
+			sandbox: sandboxWithPorts(corev1.ContainerPort{
+				ContainerPort: 8080,
+			}),
+			wantService: &corev1.Service{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:            sandboxName,
+					Namespace:       sandboxNs,
+					ResourceVersion: "2",
+					Labels: map[string]string{
+						"keep":                              "me",
+						sandboxv1beta1.SandboxNameHashLabel: nameHash,
+					},
+					OwnerReferences: []metav1.OwnerReference{sandboxControllerRef(sandboxName)},
+				},
+				Spec: corev1.ServiceSpec{
+					Selector: map[string]string{
+						sandboxv1beta1.SandboxNameHashLabel: nameHash,
+					},
+					Ports: []corev1.ServicePort{
+						servicePort(8080, corev1.ProtocolTCP),
+					},
+				},
+			},
+			wantStatusService:     sandboxName,
+			wantStatusServiceFQDN: sandboxName + "." + sandboxNs + ".svc.cluster.local",
+		},
+		{
+			name: "preserves unmanaged service port fields when controlled fields match",
+			initialObjs: []runtime.Object{
+				&corev1.Service{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:            sandboxName,
+						Namespace:       sandboxNs,
+						ResourceVersion: "1",
+						Labels: map[string]string{
+							sandboxv1beta1.SandboxNameHashLabel: nameHash,
+						},
+						OwnerReferences: []metav1.OwnerReference{sandboxControllerRef(sandboxName)},
+					},
+					Spec: corev1.ServiceSpec{
+						ClusterIP: "None",
+						Selector: map[string]string{
+							sandboxv1beta1.SandboxNameHashLabel: nameHash,
+						},
+						Ports: []corev1.ServicePort{{
+							Name:        "p-8080-tcp",
+							Protocol:    corev1.ProtocolTCP,
+							Port:        8080,
+							TargetPort:  intstr.FromInt32(8080),
+							AppProtocol: &appProtocolHTTP,
+						}},
+					},
+				},
+			},
+			sandbox: sandboxWithPorts(corev1.ContainerPort{
+				ContainerPort: 8080,
+			}),
+			wantService: &corev1.Service{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:            sandboxName,
+					Namespace:       sandboxNs,
+					ResourceVersion: "1",
+					Labels: map[string]string{
+						sandboxv1beta1.SandboxNameHashLabel: nameHash,
+					},
+					OwnerReferences: []metav1.OwnerReference{sandboxControllerRef(sandboxName)},
+				},
+				Spec: corev1.ServiceSpec{
+					ClusterIP: "None",
+					Selector: map[string]string{
+						sandboxv1beta1.SandboxNameHashLabel: nameHash,
+					},
+					Ports: []corev1.ServicePort{{
+						Name:        "p-8080-tcp",
+						Protocol:    corev1.ProtocolTCP,
+						Port:        8080,
+						TargetPort:  intstr.FromInt32(8080),
+						AppProtocol: &appProtocolHTTP,
+					}},
 				},
 			},
 			wantStatusService:     sandboxName,
@@ -2318,6 +5301,52 @@ func TestReconcileService(t *testing.T) {
 					},
 				},
 			},
+			sandbox: sandboxWithPorts(corev1.ContainerPort{
+				ContainerPort: 8080,
+			}),
+			wantService: &corev1.Service{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:            sandboxName,
+					Namespace:       sandboxNs,
+					ResourceVersion: "2",
+					Labels: map[string]string{
+						sandboxv1beta1.SandboxNameHashLabel:  nameHash,
+						sandboxv1beta1.SandboxAdoptableLabel: "true",
+					},
+					OwnerReferences: []metav1.OwnerReference{sandboxControllerRef(sandboxName)},
+				},
+				Spec: corev1.ServiceSpec{
+					Selector: map[string]string{
+						sandboxv1beta1.SandboxNameHashLabel: nameHash,
+					},
+					Ports: []corev1.ServicePort{
+						servicePort(8080, corev1.ProtocolTCP),
+					},
+				},
+			},
+			wantStatusService:     sandboxName,
+			wantStatusServiceFQDN: sandboxName + "." + sandboxNs + ".svc.cluster.local",
+		},
+		{
+			name: "adopts unowned headless service and clears existing ports when sandbox has none",
+			initialObjs: []runtime.Object{
+				&corev1.Service{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:            sandboxName,
+						Namespace:       sandboxNs,
+						ResourceVersion: "1",
+						Labels: map[string]string{
+							sandboxv1beta1.SandboxAdoptableLabel: "true",
+						},
+					},
+					Spec: corev1.ServiceSpec{
+						ClusterIP: "None",
+						Ports: []corev1.ServicePort{
+							servicePort(9090, corev1.ProtocolTCP),
+						},
+					},
+				},
+			},
 			sandbox: sandboxObj,
 			wantService: &corev1.Service{
 				ObjectMeta: metav1.ObjectMeta{
@@ -2325,14 +5354,15 @@ func TestReconcileService(t *testing.T) {
 					Namespace:       sandboxNs,
 					ResourceVersion: "2",
 					Labels: map[string]string{
-						"agents.x-k8s.io/sandbox-name-hash":  nameHash,
+						sandboxv1beta1.SandboxNameHashLabel:  nameHash,
 						sandboxv1beta1.SandboxAdoptableLabel: "true",
 					},
 					OwnerReferences: []metav1.OwnerReference{sandboxControllerRef(sandboxName)},
 				},
 				Spec: corev1.ServiceSpec{
+					ClusterIP: "None",
 					Selector: map[string]string{
-						"agents.x-k8s.io/sandbox-name-hash": nameHash,
+						sandboxv1beta1.SandboxNameHashLabel: nameHash,
 					},
 				},
 			},
@@ -2388,7 +5418,7 @@ func TestReconcileService(t *testing.T) {
 					Namespace:       sandboxNs,
 					ResourceVersion: "2",
 					Labels: map[string]string{
-						"agents.x-k8s.io/sandbox-name-hash":  nameHash,
+						sandboxv1beta1.SandboxNameHashLabel:  nameHash,
 						sandboxv1beta1.SandboxAdoptableLabel: "true",
 					},
 					OwnerReferences: []metav1.OwnerReference{sandboxControllerRef(sandboxName)},
@@ -2396,7 +5426,7 @@ func TestReconcileService(t *testing.T) {
 				Spec: corev1.ServiceSpec{
 					ClusterIP: "None",
 					Selector: map[string]string{
-						"agents.x-k8s.io/sandbox-name-hash": nameHash,
+						sandboxv1beta1.SandboxNameHashLabel: nameHash,
 					},
 				},
 			},
@@ -2412,13 +5442,13 @@ func TestReconcileService(t *testing.T) {
 						Namespace:       sandboxNs,
 						ResourceVersion: "1",
 						Labels: map[string]string{
-							"agents.x-k8s.io/sandbox-name-hash": nameHash,
+							sandboxv1beta1.SandboxNameHashLabel: nameHash,
 						},
 					},
 					Spec: corev1.ServiceSpec{
 						ClusterIP: "None",
 						Selector: map[string]string{
-							"agents.x-k8s.io/sandbox-name-hash": nameHash,
+							sandboxv1beta1.SandboxNameHashLabel: nameHash,
 						},
 					},
 				},
@@ -2430,14 +5460,14 @@ func TestReconcileService(t *testing.T) {
 					Namespace:       sandboxNs,
 					ResourceVersion: "2",
 					Labels: map[string]string{
-						"agents.x-k8s.io/sandbox-name-hash": nameHash,
+						sandboxv1beta1.SandboxNameHashLabel: nameHash,
 					},
 					OwnerReferences: []metav1.OwnerReference{sandboxControllerRef(sandboxName)},
 				},
 				Spec: corev1.ServiceSpec{
 					ClusterIP: "None",
 					Selector: map[string]string{
-						"agents.x-k8s.io/sandbox-name-hash": nameHash,
+						sandboxv1beta1.SandboxNameHashLabel: nameHash,
 					},
 				},
 			},
@@ -2470,31 +5500,32 @@ func TestReconcileService(t *testing.T) {
 					},
 					Spec: corev1.ServiceSpec{
 						ClusterIP: "None",
+						Ports: []corev1.ServicePort{
+							servicePort(9090, corev1.ProtocolTCP),
+						},
 					},
 				},
 			},
-			sandbox: &sandboxv1beta1.Sandbox{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      sandboxName,
-					Namespace: sandboxNs,
-					UID:       sandboxUID,
-				},
-				Spec: sandboxv1beta1.SandboxSpec{},
-			},
+			sandbox: sandboxWithNilServiceAndPorts(corev1.ContainerPort{
+				ContainerPort: 8080,
+			}),
 			wantService: &corev1.Service{
 				ObjectMeta: metav1.ObjectMeta{
 					Name:            sandboxName,
 					Namespace:       sandboxNs,
 					ResourceVersion: "2",
 					Labels: map[string]string{
-						"agents.x-k8s.io/sandbox-name-hash": nameHash,
+						sandboxv1beta1.SandboxNameHashLabel: nameHash,
 					},
 					OwnerReferences: []metav1.OwnerReference{sandboxControllerRef(sandboxName)},
 				},
 				Spec: corev1.ServiceSpec{
 					ClusterIP: "None",
 					Selector: map[string]string{
-						"agents.x-k8s.io/sandbox-name-hash": nameHash,
+						sandboxv1beta1.SandboxNameHashLabel: nameHash,
+					},
+					Ports: []corev1.ServicePort{
+						servicePort(9090, corev1.ProtocolTCP),
 					},
 				},
 			},
@@ -2545,9 +5576,7 @@ func TestReconcileService(t *testing.T) {
 					Namespace: sandboxNs,
 					UID:       sandboxUID,
 				},
-				Spec: sandboxv1beta1.SandboxSpec{
-					Service: new(false),
-				},
+				Spec: sandboxv1beta1.SandboxSpec{SandboxBlueprint: sandboxv1beta1.SandboxBlueprint{Service: new(false)}},
 			},
 			wantNilService:        true,
 			wantServiceDeleted:    true,
@@ -2571,9 +5600,7 @@ func TestReconcileService(t *testing.T) {
 					Namespace: sandboxNs,
 					UID:       sandboxUID,
 				},
-				Spec: sandboxv1beta1.SandboxSpec{
-					Service: new(false),
-				},
+				Spec: sandboxv1beta1.SandboxSpec{SandboxBlueprint: sandboxv1beta1.SandboxBlueprint{Service: new(false)}},
 			},
 			wantNilService:        true,
 			wantStatusService:     "",
@@ -2680,8 +5707,8 @@ func TestCheckOwnership(t *testing.T) {
 	}
 
 	sandboxOwnerRef := metav1.OwnerReference{
-		APIVersion:         "agents.x-k8s.io/v1beta1",
-		Kind:               "Sandbox",
+		APIVersion:         sandboxv1beta1.GroupVersion.String(),
+		Kind:               sandboxv1beta1.SandboxKind,
 		Name:               sandboxName,
 		UID:                sandboxUID,
 		Controller:         new(true),
@@ -2784,20 +5811,19 @@ func TestReconcilePVCs(t *testing.T) {
 			Namespace: sandboxNs,
 			UID:       sandboxUID,
 		},
-		Spec: sandboxv1beta1.SandboxSpec{
-			VolumeClaimTemplates: []sandboxv1beta1.PersistentVolumeClaimTemplate{
-				{
-					EmbeddedObjectMetadata: sandboxv1beta1.EmbeddedObjectMetadata{Name: pvcTemplateName},
-					Spec: corev1.PersistentVolumeClaimSpec{
-						AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
-						Resources: corev1.VolumeResourceRequirements{
-							Requests: corev1.ResourceList{
-								corev1.ResourceStorage: resource.MustParse("1Gi"),
-							},
+		Spec: sandboxv1beta1.SandboxSpec{SandboxBlueprint: sandboxv1beta1.SandboxBlueprint{VolumeClaimTemplates: []sandboxv1beta1.PersistentVolumeClaimTemplate{
+			{
+				EmbeddedObjectMetadata: sandboxv1beta1.EmbeddedObjectMetadata{Name: pvcTemplateName},
+				Spec: corev1.PersistentVolumeClaimSpec{
+					AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
+					Resources: corev1.VolumeResourceRequirements{
+						Requests: corev1.ResourceList{
+							corev1.ResourceStorage: resource.MustParse("1Gi"),
 						},
 					},
 				},
 			},
+		}},
 		},
 	}
 
@@ -2820,8 +5846,8 @@ func TestReconcilePVCs(t *testing.T) {
 						Namespace: sandboxNs,
 						OwnerReferences: []metav1.OwnerReference{
 							{
-								APIVersion:         "agents.x-k8s.io/v1beta1",
-								Kind:               "Sandbox",
+								APIVersion:         sandboxv1beta1.GroupVersion.String(),
+								Kind:               sandboxv1beta1.SandboxKind,
 								Name:               sandboxName,
 								UID:                sandboxUID,
 								Controller:         new(true),
@@ -2879,7 +5905,7 @@ func TestReconcilePVCs(t *testing.T) {
 						Name:      pvcName,
 						Namespace: sandboxNs,
 						Labels: map[string]string{
-							"agents.x-k8s.io/sandbox-name-hash": nameHash,
+							sandboxv1beta1.SandboxNameHashLabel: nameHash,
 						},
 					},
 				},
@@ -3005,6 +6031,287 @@ func TestSandboxExpiry(t *testing.T) {
 	}
 }
 
+// TestReconcileChildResourcesSuspendedForeignPodDoesNotLeakIPOrNodeName verifies
+// that when a Sandbox is suspended and a Pod with its name exists but is owned by a
+// different controller, reconcilePod surfaces that Pod (so the Suspended condition
+// can report PodNotOwned) but its runtime status (PodIPs, NodeName) must NOT leak
+// into the Sandbox's status.
+func TestReconcileChildResourcesSuspendedForeignPodDoesNotLeakIPOrNodeName(t *testing.T) {
+	sandboxName := "sandbox-unowned"
+	sandboxNs := "default"
+	nameHash := NameHash(sandboxName)
+
+	sandboxObj := &sandboxv1beta1.Sandbox{
+		ObjectMeta: metav1.ObjectMeta{Name: sandboxName, Namespace: sandboxNs, UID: "sandbox-uid-123"},
+		Spec: sandboxv1beta1.SandboxSpec{
+			// Suspended so reconcilePod surfaces the foreign pod (non-nil). In Running
+			// mode a foreign pod returns nil+err and never reaches the ownership guard.
+			OperatingMode: sandboxv1beta1.SandboxOperatingModeSuspended,
+			SandboxBlueprint: sandboxv1beta1.SandboxBlueprint{
+				PodTemplate: sandboxv1beta1.PodTemplate{
+					Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "test"}}},
+				},
+			},
+		},
+	}
+
+	foreignPod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      sandboxName,
+			Namespace: sandboxNs,
+			Labels:    map[string]string{sandboxv1beta1.SandboxNameHashLabel: nameHash},
+			OwnerReferences: []metav1.OwnerReference{
+				{APIVersion: "apps/v1", Kind: "ReplicaSet", Name: "other-rs", UID: "other-uid-999", Controller: new(true)},
+			},
+		},
+		Spec:   corev1.PodSpec{NodeName: "node-foreign", Containers: []corev1.Container{{Name: "test"}}},
+		Status: corev1.PodStatus{Phase: corev1.PodRunning, PodIPs: []corev1.PodIP{{IP: "192.168.1.100"}}},
+	}
+
+	r := &SandboxReconciler{
+		Client:        newFakeClient(sandboxObj, foreignPod),
+		Scheme:        Scheme,
+		Tracer:        asmetrics.NewNoOp(),
+		ClusterDomain: "cluster.local",
+	}
+
+	// Refusing to delete a foreign pod is a steady state, not an error.
+	_, _, err := r.reconcileChildResources(t.Context(), sandboxObj, nil)
+	require.NoError(t, err)
+
+	assert.Nil(t, sandboxObj.Status.PodIPs, "foreign pod IPs must NOT leak into sandbox status")
+	assert.Empty(t, sandboxObj.Status.NodeName, "foreign pod NodeName must NOT leak into sandbox status")
+	assert.Equal(t, sandboxv1beta1.SandboxNameHashLabel+"="+nameHash, sandboxObj.Status.LabelSelector, "LabelSelector must be set for any non-nil pod (including foreign pods)")
+
+	// Confirm we actually hit the foreign-pod path (guards against silently
+	// regressing to the pod==nil clearing, which would pass the asserts above for
+	// the wrong reason).
+	cond := meta.FindStatusCondition(sandboxObj.Status.Conditions, string(sandboxv1beta1.SandboxConditionSuspended))
+	require.NotNil(t, cond)
+	assert.Equal(t, sandboxv1beta1.SandboxReasonSuspendedPodNotOwned, cond.Reason)
+}
+
+// TestPodScheduledConditionRemovedWithPod verifies the PodScheduled condition
+// mirrors the backing pod's scheduling state while the pod exists and is
+// removed from status once the pod is gone (here via suspension), rather than
+// lingering or flipping to a misleading False.
+func TestPodScheduledConditionRemovedWithPod(t *testing.T) {
+	sandbox := &sandboxv1beta1.Sandbox{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:       "podscheduled-sandbox",
+			Namespace:  "default",
+			UID:        sandboxUID,
+			Generation: 1,
+		},
+		Spec: sandboxv1beta1.SandboxSpec{
+			SandboxBlueprint: sandboxv1beta1.SandboxBlueprint{
+				PodTemplate: sandboxv1beta1.PodTemplate{
+					Spec: corev1.PodSpec{
+						Containers: []corev1.Container{{Name: "test-container"}},
+					},
+				},
+			},
+			OperatingMode: sandboxv1beta1.SandboxOperatingModeRunning,
+		},
+	}
+
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:            sandbox.Name,
+			Namespace:       sandbox.Namespace,
+			OwnerReferences: []metav1.OwnerReference{sandboxControllerRef(sandbox.Name)},
+		},
+		Spec: corev1.PodSpec{
+			Containers: []corev1.Container{{Name: "test-container"}},
+		},
+		Status: corev1.PodStatus{
+			Phase: corev1.PodPending,
+			Conditions: []corev1.PodCondition{
+				{
+					Type:    corev1.PodScheduled,
+					Status:  corev1.ConditionFalse,
+					Reason:  corev1.PodReasonUnschedulable,
+					Message: "0/3 nodes are available: 3 Insufficient cpu.",
+				},
+			},
+		},
+	}
+
+	r := &SandboxReconciler{
+		Client: newFakeClient(sandbox, pod),
+		Scheme: Scheme,
+		Tracer: asmetrics.NewNoOp(),
+	}
+
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: sandbox.Name, Namespace: sandbox.Namespace}}
+
+	_, err := r.Reconcile(t.Context(), req)
+	require.NoError(t, err)
+
+	updatedSandbox := &sandboxv1beta1.Sandbox{}
+	require.NoError(t, r.Get(t.Context(), req.NamespacedName, updatedSandbox))
+	scheduledCondition := meta.FindStatusCondition(updatedSandbox.Status.Conditions, string(sandboxv1beta1.SandboxConditionPodScheduled))
+	require.NotNil(t, scheduledCondition)
+	require.Equal(t, metav1.ConditionFalse, scheduledCondition.Status)
+	require.Equal(t, string(corev1.PodReasonUnschedulable), scheduledCondition.Reason)
+	require.Equal(t, pod.Status.Conditions[0].Message, scheduledCondition.Message)
+
+	// Suspend the sandbox; the pod is deleted and the mirrored condition
+	// must be removed along with it.
+	updatedSandbox.Spec.OperatingMode = sandboxv1beta1.SandboxOperatingModeSuspended
+	require.NoError(t, r.Update(t.Context(), updatedSandbox))
+
+	_, err = r.Reconcile(t.Context(), req)
+	require.NoError(t, err)
+	// Second pass observes the deleted pod.
+	_, err = r.Reconcile(t.Context(), req)
+	require.NoError(t, err)
+
+	require.NoError(t, r.Get(t.Context(), req.NamespacedName, updatedSandbox))
+	require.Nil(t, meta.FindStatusCondition(updatedSandbox.Status.Conditions, string(sandboxv1beta1.SandboxConditionPodScheduled)))
+	require.NotNil(t, meta.FindStatusCondition(updatedSandbox.Status.Conditions, string(sandboxv1beta1.SandboxConditionSuspended)))
+}
+
+// TestPodScheduledConditionUnknownWhenPodLookupFails verifies that a failed Pod
+// lookup is not mistaken for a confirmed absent Pod: PodScheduled must report
+// Unknown and survive pruning, rather than being removed and implying the
+// Sandbox has no backing Pod.
+func TestPodScheduledConditionUnknownWhenPodLookupFails(t *testing.T) {
+	sandbox := &sandboxv1beta1.Sandbox{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:       "podscheduled-lookup-fail",
+			Namespace:  "default",
+			UID:        sandboxUID,
+			Generation: 1,
+		},
+		Spec: sandboxv1beta1.SandboxSpec{
+			SandboxBlueprint: sandboxv1beta1.SandboxBlueprint{
+				PodTemplate: sandboxv1beta1.PodTemplate{
+					Spec: corev1.PodSpec{
+						Containers: []corev1.Container{{Name: "test-container"}},
+					},
+				},
+			},
+			OperatingMode: sandboxv1beta1.SandboxOperatingModeRunning,
+		},
+	}
+
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:            sandbox.Name,
+			Namespace:       sandbox.Namespace,
+			OwnerReferences: []metav1.OwnerReference{sandboxControllerRef(sandbox.Name)},
+		},
+		Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "test-container"}}},
+		Status: corev1.PodStatus{
+			Phase: corev1.PodRunning,
+			Conditions: []corev1.PodCondition{
+				{Type: corev1.PodScheduled, Status: corev1.ConditionTrue},
+			},
+		},
+	}
+
+	// failPodGet toggles Pod Get failures on so the first reconcile can establish
+	// the condition and the second can observe the lookup failure.
+	failPodGet := false
+	inner := newFakeClient(sandbox, pod)
+	fc := interceptor.NewClient(inner, interceptor.Funcs{
+		Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+			if _, isPod := obj.(*corev1.Pod); isPod && failPodGet {
+				return k8serrors.NewInternalError(errors.New("pod get failed"))
+			}
+			return c.Get(ctx, key, obj, opts...)
+		},
+	})
+
+	r := &SandboxReconciler{
+		Client: fc,
+		Scheme: Scheme,
+		Tracer: asmetrics.NewNoOp(),
+	}
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: sandbox.Name, Namespace: sandbox.Namespace}}
+
+	_, err := r.Reconcile(t.Context(), req)
+	require.NoError(t, err)
+
+	updatedSandbox := &sandboxv1beta1.Sandbox{}
+	require.NoError(t, r.Get(t.Context(), req.NamespacedName, updatedSandbox))
+	scheduled := meta.FindStatusCondition(updatedSandbox.Status.Conditions, string(sandboxv1beta1.SandboxConditionPodScheduled))
+	require.NotNil(t, scheduled)
+	require.Equal(t, metav1.ConditionTrue, scheduled.Status)
+
+	// Now make the Pod lookup fail. The condition must be retained as Unknown,
+	// not pruned as it would be for a genuinely absent pod.
+	failPodGet = true
+	_, err = r.Reconcile(t.Context(), req)
+	require.Error(t, err, "reconcile must surface the pod lookup failure")
+
+	require.NoError(t, r.Get(t.Context(), req.NamespacedName, updatedSandbox))
+	scheduled = meta.FindStatusCondition(updatedSandbox.Status.Conditions, string(sandboxv1beta1.SandboxConditionPodScheduled))
+	require.NotNil(t, scheduled, "PodScheduled must be retained when the pod lookup fails")
+	require.Equal(t, metav1.ConditionUnknown, scheduled.Status)
+	require.Equal(t, sandboxv1beta1.SandboxReasonPodSchedulingUnknown, scheduled.Reason)
+}
+
+// TestSuspendedConditionUnknownWhenPodLookupFails pins the pod error reaching
+// the Pod-derived conditions. reconcileChildResources reuses err for both the
+// Pod and the Service (the Service's := only introduces svc), so passing it
+// straight through hands computeSuspendedCondition the Service error and makes
+// its pod-state-unknown branch unreachable: a suspended Sandbox whose Pod could
+// not be read then reports Suspended=True/PodTerminated, claiming the Pod is
+// gone when its state is simply unknown.
+func TestSuspendedConditionUnknownWhenPodLookupFails(t *testing.T) {
+	sandbox := &sandboxv1beta1.Sandbox{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:       "suspended-lookup-fail",
+			Namespace:  "default",
+			UID:        sandboxUID,
+			Generation: 1,
+		},
+		Spec: sandboxv1beta1.SandboxSpec{
+			SandboxBlueprint: sandboxv1beta1.SandboxBlueprint{
+				PodTemplate: sandboxv1beta1.PodTemplate{
+					Spec: corev1.PodSpec{
+						Containers: []corev1.Container{{Name: "test-container"}},
+					},
+				},
+			},
+			OperatingMode: sandboxv1beta1.SandboxOperatingModeSuspended,
+		},
+	}
+
+	fc := interceptor.NewClient(newFakeClient(sandbox), interceptor.Funcs{
+		Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+			if _, isPod := obj.(*corev1.Pod); isPod {
+				return k8serrors.NewInternalError(errors.New("pod get failed"))
+			}
+			return c.Get(ctx, key, obj, opts...)
+		},
+	})
+
+	r := &SandboxReconciler{
+		Client: fc,
+		Scheme: Scheme,
+		Tracer: asmetrics.NewNoOp(),
+	}
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: sandbox.Name, Namespace: sandbox.Namespace}}
+
+	_, err := r.Reconcile(t.Context(), req)
+	require.Error(t, err, "reconcile must surface the pod lookup failure")
+
+	updatedSandbox := &sandboxv1beta1.Sandbox{}
+	require.NoError(t, r.Get(t.Context(), req.NamespacedName, updatedSandbox))
+	suspended := meta.FindStatusCondition(updatedSandbox.Status.Conditions, string(sandboxv1beta1.SandboxConditionSuspended))
+	require.NotNil(t, suspended)
+	require.Equal(t, metav1.ConditionUnknown, suspended.Status,
+		"the pod lookup failed, so suspension cannot be confirmed")
+	require.Equal(t, sandboxv1beta1.SandboxReasonSuspendedPodStateUnknown, suspended.Reason)
+	ready := meta.FindStatusCondition(updatedSandbox.Status.Conditions, string(sandboxv1beta1.SandboxConditionReady))
+	require.NotNil(t, ready)
+	require.Equal(t, "Error seen: pod get failed: Internal error occurred: pod get failed", ready.Message,
+		"the wrapped Pod error must be routed to conditions exactly once")
+}
+
 func TestSandboxShutdownExpiryUsesTwoPassAndPreservesFinishedCondition(t *testing.T) {
 	testCases := []struct {
 		name           string
@@ -3033,17 +6340,15 @@ func TestSandboxShutdownExpiryUsesTwoPassAndPreservesFinishedCondition(t *testin
 					UID:        sandboxUID,
 					Generation: 1,
 				},
-				Spec: sandboxv1beta1.SandboxSpec{
-					Service: new(true),
+				Spec: sandboxv1beta1.SandboxSpec{SandboxBlueprint: sandboxv1beta1.SandboxBlueprint{Service: new(true),
 					PodTemplate: sandboxv1beta1.PodTemplate{
 						Spec: corev1.PodSpec{
 							Containers: []corev1.Container{{Name: "test-container"}},
 						},
-					},
-					Lifecycle: sandboxv1beta1.Lifecycle{
-						ShutdownTime:   &shutdownTime,
-						ShutdownPolicy: ptr.To(sandboxv1beta1.ShutdownPolicyRetain),
-					},
+					}}, Lifecycle: sandboxv1beta1.Lifecycle{
+					ShutdownTime:   &shutdownTime,
+					ShutdownPolicy: ptr.To(sandboxv1beta1.ShutdownPolicyRetain),
+				},
 				},
 			}
 
@@ -3085,6 +6390,7 @@ func TestSandboxShutdownExpiryUsesTwoPassAndPreservesFinishedCondition(t *testin
 			finishedCondition := meta.FindStatusCondition(updatedSandbox.Status.Conditions, string(sandboxv1beta1.SandboxConditionFinished))
 			require.NotNil(t, finishedCondition)
 			require.Equal(t, tc.finishedReason, finishedCondition.Reason)
+			require.NotNil(t, meta.FindStatusCondition(updatedSandbox.Status.Conditions, string(sandboxv1beta1.SandboxConditionPodScheduled)))
 			require.NoError(t, r.Get(t.Context(), types.NamespacedName{Name: pod.Name, Namespace: pod.Namespace}, &corev1.Pod{}))
 			require.NoError(t, r.Get(t.Context(), types.NamespacedName{Name: service.Name, Namespace: service.Namespace}, &corev1.Service{}))
 
@@ -3103,6 +6409,9 @@ func TestSandboxShutdownExpiryUsesTwoPassAndPreservesFinishedCondition(t *testin
 			finishedCondition = meta.FindStatusCondition(updatedSandbox.Status.Conditions, string(sandboxv1beta1.SandboxConditionFinished))
 			require.NotNil(t, finishedCondition)
 			require.Equal(t, tc.finishedReason, finishedCondition.Reason)
+			// Expiry removes the mirrored PodScheduled condition while
+			// Finished is preserved.
+			require.Nil(t, meta.FindStatusCondition(updatedSandbox.Status.Conditions, string(sandboxv1beta1.SandboxConditionPodScheduled)))
 			require.NoError(t, r.Get(t.Context(), types.NamespacedName{Name: pod.Name, Namespace: pod.Namespace}, &corev1.Pod{}))
 			require.NoError(t, r.Get(t.Context(), types.NamespacedName{Name: service.Name, Namespace: service.Namespace}, &corev1.Service{}))
 
@@ -3124,6 +6433,69 @@ func TestSandboxShutdownExpiryUsesTwoPassAndPreservesFinishedCondition(t *testin
 			require.Equal(t, tc.finishedReason, finishedCondition.Reason)
 		})
 	}
+}
+
+// Suspend deletes the Pod, and the kubelet moves a deleted Pod to a terminal
+// phase before removing it. That must not surface as Finished on the Sandbox.
+func TestReconcileSuspendTerminatingPodInTerminalPhaseDoesNotSetFinished(t *testing.T) {
+	sandbox := &sandboxv1beta1.Sandbox{
+		ObjectMeta: metav1.ObjectMeta{Name: "sandbox-name", Namespace: "default", UID: sandboxUID},
+		Spec: sandboxv1beta1.SandboxSpec{SandboxBlueprint: sandboxv1beta1.SandboxBlueprint{
+			PodTemplate: sandboxv1beta1.PodTemplate{
+				Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "test-container"}}},
+			},
+		}},
+	}
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:            sandbox.Name,
+			Namespace:       sandbox.Namespace,
+			OwnerReferences: []metav1.OwnerReference{sandboxControllerRef(sandbox.Name)},
+			// The fake client removes a deleted object at once; the finalizer
+			// keeps it terminating, as a real Pod stays until the kubelet has
+			// reported its terminal phase.
+			Finalizers: []string{"test.agents.x-k8s.io/hold"},
+		},
+		Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "test-container"}}},
+		Status: corev1.PodStatus{
+			Phase:      corev1.PodRunning,
+			PodIPs:     []corev1.PodIP{{IP: "10.244.0.1"}},
+			Conditions: []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}},
+		},
+	}
+	r := &SandboxReconciler{
+		Client: newFakeClient(sandbox, pod),
+		Scheme: Scheme,
+		Tracer: asmetrics.NewNoOp(),
+	}
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: sandbox.Name, Namespace: sandbox.Namespace}}
+
+	_, err := r.Reconcile(t.Context(), req)
+	require.NoError(t, err)
+
+	live := &sandboxv1beta1.Sandbox{}
+	require.NoError(t, r.Get(t.Context(), req.NamespacedName, live))
+	live.Spec.OperatingMode = sandboxv1beta1.SandboxOperatingModeSuspended
+	require.NoError(t, r.Update(t.Context(), live))
+
+	// Deletes the Pod; the finalizer keeps it terminating.
+	_, err = r.Reconcile(t.Context(), req)
+	require.NoError(t, err)
+
+	terminating := &corev1.Pod{}
+	require.NoError(t, r.Get(t.Context(), req.NamespacedName, terminating))
+	require.False(t, terminating.DeletionTimestamp.IsZero())
+	terminating.Status.Phase = corev1.PodFailed
+	require.NoError(t, r.Status().Update(t.Context(), terminating))
+
+	_, err = r.Reconcile(t.Context(), req)
+	require.NoError(t, err)
+
+	require.NoError(t, r.Get(t.Context(), req.NamespacedName, live))
+	require.False(t, meta.IsStatusConditionTrue(live.Status.Conditions, string(sandboxv1beta1.SandboxConditionFinished)))
+	suspended := meta.FindStatusCondition(live.Status.Conditions, string(sandboxv1beta1.SandboxConditionSuspended))
+	require.NotNil(t, suspended)
+	require.Equal(t, sandboxv1beta1.SandboxReasonSuspendedPodTerminating, suspended.Reason)
 }
 
 func TestSetServiceStatusCustomDomain(t *testing.T) {
@@ -3229,20 +6601,18 @@ func TestSandboxReconcile_ConditionsDoNotAccumulate(t *testing.T) {
 			UID:        sandboxUID,
 			Generation: 1,
 		},
-		Spec: sandboxv1beta1.SandboxSpec{
-			OperatingMode: sandboxv1beta1.SandboxOperatingModeRunning,
-			PodTemplate: sandboxv1beta1.PodTemplate{
-				Spec: corev1.PodSpec{
-					Containers: []corev1.Container{{Name: "c", Image: "img"}},
-				},
+		Spec: sandboxv1beta1.SandboxSpec{SandboxBlueprint: sandboxv1beta1.SandboxBlueprint{PodTemplate: sandboxv1beta1.PodTemplate{
+			Spec: corev1.PodSpec{
+				Containers: []corev1.Container{{Name: "c", Image: "img"}},
 			},
+		}}, OperatingMode: sandboxv1beta1.SandboxOperatingModeRunning,
 		},
 	}
 
 	pod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: sbName, Namespace: sbNs,
-			Labels:          map[string]string{sandboxLabel: nameHash},
+			Labels:          map[string]string{sandboxv1beta1.SandboxNameHashLabel: nameHash},
 			OwnerReferences: []metav1.OwnerReference{sandboxControllerRef(sbName)},
 		},
 		Spec: corev1.PodSpec{
@@ -3251,22 +6621,28 @@ func TestSandboxReconcile_ConditionsDoNotAccumulate(t *testing.T) {
 		Status: corev1.PodStatus{
 			Phase:  corev1.PodRunning,
 			PodIPs: []corev1.PodIP{{IP: "10.0.0.1"}},
-			Conditions: []corev1.PodCondition{{
-				Type:   corev1.PodReady,
-				Status: corev1.ConditionTrue,
-			}},
+			Conditions: []corev1.PodCondition{
+				{
+					Type:   corev1.PodScheduled,
+					Status: corev1.ConditionTrue,
+				},
+				{
+					Type:   corev1.PodReady,
+					Status: corev1.ConditionTrue,
+				},
+			},
 		},
 	}
 
 	svc := &corev1.Service{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: sbName, Namespace: sbNs,
-			Labels:          map[string]string{sandboxLabel: nameHash},
+			Labels:          map[string]string{sandboxv1beta1.SandboxNameHashLabel: nameHash},
 			OwnerReferences: []metav1.OwnerReference{sandboxControllerRef(sbName)},
 		},
 		Spec: corev1.ServiceSpec{
 			ClusterIP: "None",
-			Selector:  map[string]string{sandboxLabel: nameHash},
+			Selector:  map[string]string{sandboxv1beta1.SandboxNameHashLabel: nameHash},
 		},
 	}
 
@@ -3288,6 +6664,2190 @@ func TestSandboxReconcile_ConditionsDoNotAccumulate(t *testing.T) {
 
 	var got sandboxv1beta1.Sandbox
 	require.NoError(t, fc.Get(ctx, types.NamespacedName{Name: sbName, Namespace: sbNs}, &got))
-	require.Len(t, got.Status.Conditions, 1,
+	// Steady state for a running, ready sandbox: Suspended, PodScheduled, Ready.
+	require.Len(t, got.Status.Conditions, 3,
 		"conditions slice must not grow across %d reconcile iterations — controller must upsert not append", iters)
+}
+
+func TestRecordSandboxCreationMetrics(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		launchType string
+		template   string
+	}{
+		{name: "direct", launchType: "cold", template: "__unknown__"},
+		{name: "claim", launchType: "cold", template: "test-template"},
+		{name: "warm pool", launchType: "warm", template: "test-template"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			asmetrics.SandboxCreationLatency.Reset()
+			createdAt := metav1.NewTime(time.Now().UTC().Add(-10 * time.Second).Truncate(time.Second))
+			readyAt := metav1.NewTime(createdAt.Add(5 * time.Second))
+			sandbox := &sandboxv1beta1.Sandbox{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "sandbox-metrics", Namespace: "default", UID: "metrics-uid",
+					CreationTimestamp: createdAt,
+					Labels:            map[string]string{sandboxv1beta1.SandboxLaunchTypeLabel: tc.launchType},
+				},
+			}
+			if tc.template != "__unknown__" {
+				sandbox.Annotations = map[string]string{sandboxv1beta1.SandboxTemplateRefAnnotation: tc.template}
+			}
+			r := &SandboxReconciler{Client: newFakeClient(sandbox)}
+			watch := r.sandboxCreationMetricsPredicate()
+			require.True(t, watch.Create(event.CreateEvent{Object: sandbox}))
+			oldStatus := sandbox.Status.DeepCopy()
+			r.recordSandboxCreationMetrics(t.Context(), sandbox, oldStatus)
+			require.Contains(t, r.pendingCreationMetrics, sandbox.UID, "NotReady must retain eligibility")
+			sandbox.Status.Conditions = []metav1.Condition{{
+				Type: string(sandboxv1beta1.SandboxConditionReady), Status: metav1.ConditionTrue,
+				LastTransitionTime: readyAt,
+			}}
+			require.NoError(t, r.updateStatus(t.Context(), oldStatus, sandbox.ResourceVersion, sandbox))
+			require.Empty(t, r.pendingCreationMetrics)
+			require.Empty(t, r.pendingStageMetrics)
+
+			// Both ordinary updates and a later readiness flap leave the UID excluded.
+			notReady := sandbox.DeepCopy()
+			notReady.Status.Conditions[0].Status = metav1.ConditionFalse
+			require.True(t, watch.Update(event.UpdateEvent{ObjectOld: sandbox, ObjectNew: notReady}))
+			r.recordSandboxCreationMetrics(t.Context(), notReady, &sandbox.Status)
+			flappedReady := sandbox.DeepCopy()
+			flappedReady.Status.Conditions[0].LastTransitionTime = metav1.NewTime(readyAt.Add(20 * time.Second))
+			require.True(t, watch.Update(event.UpdateEvent{ObjectOld: notReady, ObjectNew: flappedReady}))
+			r.recordSandboxCreationMetrics(t.Context(), flappedReady, &notReady.Status)
+			require.Empty(t, r.pendingCreationMetrics)
+			require.Empty(t, r.pendingStageMetrics)
+
+			metrics := make(chan prometheus.Metric, 1)
+			asmetrics.SandboxCreationLatency.Collect(metrics)
+			metric := <-metrics
+			collected := &dto.Metric{}
+			require.NoError(t, metric.Write(collected))
+			assert.Equal(t, uint64(1), collected.GetHistogram().GetSampleCount())
+			assert.InDelta(t, float64(5000), collected.GetHistogram().GetSampleSum(), 0.001)
+			labelValues := make(map[string]string)
+			for _, label := range collected.GetLabel() {
+				labelValues[label.GetName()] = label.GetValue()
+			}
+			assert.Equal(t, "default", labelValues["namespace"])
+			assert.Equal(t, tc.launchType, labelValues["launch_type"])
+			assert.Equal(t, tc.template, labelValues["sandbox_template"])
+		})
+	}
+}
+
+func TestSandboxCreationMetricsInitialInventory(t *testing.T) {
+	for _, initialState := range []metav1.ConditionStatus{metav1.ConditionTrue, metav1.ConditionFalse, metav1.ConditionUnknown} {
+		t.Run(string(initialState), func(t *testing.T) {
+			asmetrics.SandboxCreationLatency.Reset()
+			sandbox := &sandboxv1beta1.Sandbox{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "existing", Namespace: "default", UID: "existing-uid",
+					CreationTimestamp: metav1.NewTime(time.Now().Add(-time.Hour)),
+				},
+				Status: sandboxv1beta1.SandboxStatus{Conditions: []metav1.Condition{{
+					Type: string(sandboxv1beta1.SandboxConditionReady), Status: initialState,
+					LastTransitionTime: metav1.NewTime(time.Now().Add(-time.Minute)),
+				}}},
+			}
+			// A fresh reconciler represents a restart or upgrade. The initial
+			// inventory can contain a Ready, still-starting, or suspended Sandbox.
+			r := &SandboxReconciler{}
+			watch := r.sandboxCreationMetricsPredicate()
+			require.True(t, watch.Create(event.CreateEvent{Object: sandbox, IsInInitialList: true}))
+			require.Empty(t, r.pendingCreationMetrics)
+			require.Empty(t, r.pendingStageMetrics)
+			notReady := sandbox.DeepCopy()
+			notReady.Status.Conditions[0].Status = metav1.ConditionFalse
+			notReady.Status.Conditions[0].Reason = sandboxv1beta1.SandboxReasonSuspended
+			require.True(t, watch.Update(event.UpdateEvent{ObjectOld: sandbox, ObjectNew: notReady}))
+			ready := notReady.DeepCopy()
+			ready.Status.Conditions[0].Status = metav1.ConditionTrue
+			ready.Status.Conditions[0].LastTransitionTime = metav1.Now()
+			require.True(t, watch.Update(event.UpdateEvent{ObjectOld: notReady, ObjectNew: ready}))
+			r.recordSandboxCreationMetrics(t.Context(), ready, &notReady.Status)
+			assert.Zero(t, testutil.CollectAndCount(asmetrics.SandboxCreationLatency))
+			assert.Empty(t, r.pendingCreationMetrics)
+		})
+	}
+}
+
+func TestSandboxCreationMetricsWatchLifecycle(t *testing.T) {
+	asmetrics.SandboxCreationLatency.Reset()
+	r := &SandboxReconciler{}
+	watch := r.sandboxCreationMetricsPredicate()
+	original := &sandboxv1beta1.Sandbox{ObjectMeta: metav1.ObjectMeta{Name: "same-name", Namespace: "default", UID: "old-uid"}}
+	require.True(t, watch.Create(event.CreateEvent{Object: original}))
+	require.Contains(t, r.pendingCreationMetrics, original.UID)
+
+	replacement := original.DeepCopy()
+	replacement.UID = "new-uid"
+	require.True(t, watch.Update(event.UpdateEvent{ObjectOld: original, ObjectNew: replacement}))
+	require.NotContains(t, r.pendingCreationMetrics, original.UID)
+	require.NotContains(t, r.pendingStageMetrics, original.UID)
+	require.Contains(t, r.pendingCreationMetrics, replacement.UID)
+	// A late deletion of the old UID cannot drop the replacement's eligibility.
+	require.True(t, watch.Delete(event.DeleteEvent{Object: original, DeleteStateUnknown: true}))
+	require.Contains(t, r.pendingCreationMetrics, replacement.UID)
+	require.True(t, watch.Delete(event.DeleteEvent{Object: replacement}))
+	require.Empty(t, r.pendingCreationMetrics)
+	require.Empty(t, r.pendingStageMetrics)
+
+	// Objects first observed already Ready have no recoverable initial transition.
+	alreadyReady := replacement.DeepCopy()
+	alreadyReady.Status.Conditions = []metav1.Condition{{Type: string(sandboxv1beta1.SandboxConditionReady), Status: metav1.ConditionTrue}}
+	require.True(t, watch.Create(event.CreateEvent{Object: alreadyReady}))
+	require.Empty(t, r.pendingCreationMetrics)
+	require.Empty(t, r.pendingStageMetrics)
+}
+
+func TestSandboxCreationMetricsInvalidTimestamps(t *testing.T) {
+	createdAt := metav1.NewTime(time.Now().Add(-time.Minute).Truncate(time.Second))
+	for _, tc := range []struct {
+		name      string
+		createdAt metav1.Time
+		readyAt   metav1.Time
+	}{
+		{name: "missing creation time", readyAt: metav1.Now()},
+		{name: "missing Ready time", createdAt: createdAt},
+		{name: "negative latency", createdAt: createdAt, readyAt: metav1.NewTime(createdAt.Add(-time.Second))},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			asmetrics.SandboxCreationLatency.Reset()
+			r := &SandboxReconciler{}
+			sandbox := &sandboxv1beta1.Sandbox{ObjectMeta: metav1.ObjectMeta{
+				Name: "invalid", Namespace: "default", UID: "invalid-uid", CreationTimestamp: tc.createdAt,
+			}}
+			require.True(t, r.sandboxCreationMetricsPredicate().Create(event.CreateEvent{Object: sandbox}))
+			oldStatus := sandbox.Status.DeepCopy()
+			sandbox.Status.Conditions = []metav1.Condition{{
+				Type: string(sandboxv1beta1.SandboxConditionReady), Status: metav1.ConditionTrue, LastTransitionTime: tc.readyAt,
+			}}
+			r.recordSandboxCreationMetrics(t.Context(), sandbox, oldStatus)
+			require.Empty(t, r.pendingCreationMetrics)
+			require.Empty(t, r.pendingStageMetrics)
+			// A later valid timestamp cannot turn recovery into a creation sample.
+			sandbox.Status.Conditions[0].LastTransitionTime = metav1.Now()
+			r.recordSandboxCreationMetrics(t.Context(), sandbox, oldStatus)
+			assert.Zero(t, testutil.CollectAndCount(asmetrics.SandboxCreationLatency))
+		})
+	}
+}
+
+func TestSandboxCreationMetricsConcurrentEvents(t *testing.T) {
+	r := &SandboxReconciler{}
+	watch := r.sandboxCreationMetricsPredicate()
+	var workers sync.WaitGroup
+	for i := range 50 {
+		workers.Go(func() {
+			sandbox := &sandboxv1beta1.Sandbox{ObjectMeta: metav1.ObjectMeta{UID: types.UID(fmt.Sprintf("metrics-%d", i))}}
+			watch.Create(event.CreateEvent{Object: sandbox})
+			ready := sandbox.DeepCopy()
+			ready.Status.Conditions = []metav1.Condition{{Type: string(sandboxv1beta1.SandboxConditionReady), Status: metav1.ConditionTrue}}
+			watch.Update(event.UpdateEvent{ObjectOld: sandbox, ObjectNew: ready})
+			r.recordSandboxCreationMetrics(t.Context(), ready, &sandbox.Status)
+			watch.Delete(event.DeleteEvent{Object: ready})
+		})
+	}
+	workers.Wait()
+	require.Empty(t, r.pendingCreationMetrics)
+	require.Empty(t, r.pendingStageMetrics)
+}
+
+func TestSandboxCreationMetricsStatusRetry(t *testing.T) {
+	asmetrics.SandboxCreationLatency.Reset()
+	asmetrics.SandboxStageLatency.Reset()
+	sandbox := &sandboxv1beta1.Sandbox{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "metrics-retry", Namespace: "default", UID: sandboxUID,
+			CreationTimestamp: metav1.NewTime(time.Now().Add(-time.Minute).Truncate(time.Second)),
+		},
+		Spec: sandboxv1beta1.SandboxSpec{SandboxBlueprint: sandboxv1beta1.SandboxBlueprint{
+			PodTemplate: sandboxv1beta1.PodTemplate{Spec: corev1.PodSpec{
+				Containers: []corev1.Container{{Name: "test-container", Image: "test-image"}},
+			}},
+		}},
+	}
+	r := &SandboxReconciler{Client: newFakeClient(sandbox), Scheme: Scheme, Tracer: asmetrics.NewNoOp()}
+	watch := r.sandboxCreationMetricsPredicate()
+	require.True(t, watch.Create(event.CreateEvent{Object: sandbox}))
+	req := ctrl.Request{NamespacedName: client.ObjectKeyFromObject(sandbox)}
+	_, err := r.Reconcile(t.Context(), req)
+	require.NoError(t, err)
+	require.Contains(t, r.pendingCreationMetrics, sandbox.UID)
+
+	pod := &corev1.Pod{}
+	require.NoError(t, r.Get(t.Context(), req.NamespacedName, pod))
+	pod.Status.Phase = corev1.PodRunning
+	pod.Status.PodIPs = []corev1.PodIP{{IP: "10.0.0.8"}}
+	pod.Status.Conditions = []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}}
+	require.NoError(t, r.Status().Update(t.Context(), pod))
+	inner := r.Client.(client.WithWatch)
+	patchErr := errors.New("status unavailable")
+	r.Client = interceptor.NewClient(inner, interceptor.Funcs{
+		SubResourcePatch: func(_ context.Context, _ client.Client, _ string, _ client.Object, _ client.Patch, _ ...client.SubResourcePatchOption) error {
+			return patchErr
+		},
+	})
+	beforeFailedPatch := histogramSampleCount(t, asmetrics.SandboxStageLatency)
+	_, err = r.Reconcile(t.Context(), req)
+	require.ErrorIs(t, err, patchErr)
+	require.Contains(t, r.pendingCreationMetrics, sandbox.UID, "a failed status write must retain eligibility")
+	assert.Zero(t, testutil.CollectAndCount(asmetrics.SandboxCreationLatency))
+
+	stageCount := histogramSampleCount(t, asmetrics.SandboxStageLatency)
+	require.Greater(t, stageCount, beforeFailedPatch, "failed status writes must not lose new child stage samples")
+	r.Client = inner
+	_, err = r.Reconcile(t.Context(), req)
+	require.NoError(t, err)
+	require.Empty(t, r.pendingCreationMetrics)
+	require.Empty(t, r.pendingStageMetrics)
+	assert.Equal(t, 1, testutil.CollectAndCount(asmetrics.SandboxCreationLatency))
+	require.Equal(t, stageCount, histogramSampleCount(t, asmetrics.SandboxStageLatency))
+	// The ordinary steady-state pass must not restore eligibility.
+	_, err = r.Reconcile(t.Context(), req)
+	require.NoError(t, err)
+	require.Empty(t, r.pendingCreationMetrics)
+	require.Empty(t, r.pendingStageMetrics)
+	collected := &dto.Metric{}
+	metric := asmetrics.SandboxCreationLatency.WithLabelValues("default", "cold", "__unknown__").(prometheus.Metric)
+	require.NoError(t, metric.Write(collected))
+	assert.Equal(t, uint64(1), collected.GetHistogram().GetSampleCount())
+
+	t.Run("deleted before Ready status persisted", func(t *testing.T) {
+		asmetrics.SandboxCreationLatency.Reset()
+		r := &SandboxReconciler{
+			Client: interceptor.NewClient(newFakeClient(sandbox, pod), interceptor.Funcs{
+				SubResourcePatch: func(_ context.Context, _ client.Client, _ string, obj client.Object, _ client.Patch, _ ...client.SubResourcePatchOption) error {
+					return k8serrors.NewNotFound(sandboxv1beta1.GroupVersion.WithResource("sandboxes").GroupResource(), obj.GetName())
+				},
+			}),
+			Scheme: Scheme, Tracer: asmetrics.NewNoOp(),
+		}
+		r.sandboxCreationMetricsPredicate().Create(event.CreateEvent{Object: sandbox})
+		_, err := r.Reconcile(t.Context(), req)
+		require.NoError(t, err)
+		require.Empty(t, r.pendingCreationMetrics)
+		require.Empty(t, r.pendingStageMetrics)
+		assert.Zero(t, testutil.CollectAndCount(asmetrics.SandboxCreationLatency))
+	})
+}
+
+type mockTracer struct {
+	asmetrics.Instrumenter
+	capturedAttrs map[string]string
+	events        []mockTracerEvent
+}
+
+type mockTracerEvent struct {
+	name  string
+	attrs map[string]string
+}
+
+func (m *mockTracer) StartSpan(ctx context.Context, _ metav1.Object, _ string, attrs map[string]string) (context.Context, func()) {
+	if len(attrs) > 0 {
+		m.capturedAttrs = attrs
+	}
+	return ctx, func() {}
+}
+
+func (m *mockTracer) GetTraceContext(_ context.Context) string {
+	return ""
+}
+
+func (m *mockTracer) IsRecording(_ context.Context) bool {
+	return true
+}
+
+func (m *mockTracer) AddEvent(_ context.Context, name string, attrs map[string]string) {
+	m.events = append(m.events, mockTracerEvent{name: name, attrs: attrs})
+}
+
+func TestReconcile_TracingNormalization(t *testing.T) {
+	sbName := "tracing-test-sandbox"
+	sbNs := "default"
+	sandbox := &sandboxv1beta1.Sandbox{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      sbName,
+			Namespace: sbNs,
+			UID:       "uid-1",
+			Labels: map[string]string{
+				sandboxv1beta1.CreatedByLabel: "invalid-value",
+			},
+		},
+		Spec: sandboxv1beta1.SandboxSpec{
+			SandboxBlueprint: sandboxv1beta1.SandboxBlueprint{
+				PodTemplate: sandboxv1beta1.PodTemplate{
+					Spec: corev1.PodSpec{
+						Containers: []corev1.Container{{Name: "test-container", Image: "nginx"}},
+					},
+				},
+			},
+		},
+	}
+
+	fc := newFakeClient(sandbox)
+	mt := &mockTracer{}
+	r := &SandboxReconciler{
+		Client:        fc,
+		Scheme:        Scheme,
+		Tracer:        mt,
+		ClusterDomain: "cluster.local",
+	}
+
+	ctx := context.Background()
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: sbName, Namespace: sbNs}}
+
+	var sb sandboxv1beta1.Sandbox
+	require.NoError(t, fc.Get(ctx, req.NamespacedName, &sb))
+
+	_, err := r.Reconcile(ctx, req)
+	require.NoError(t, err)
+
+	require.NotNil(t, mt.capturedAttrs)
+	require.Equal(t, "unknown", mt.capturedAttrs[sandboxv1beta1.CreatedByLabel], "created-by label must be normalized in span attributes")
+}
+
+func TestNameHash_Correctness(t *testing.T) {
+	// Verify the fast hex encoding produces the same output as the
+	// reference implementation (fmt.Sprintf("%08x", ...)).
+	cases := []string{
+		"",
+		"a",
+		"my-sandbox",
+		"test-template-custom",
+		"pool",
+		"sandbox-name-with-a-very-long-label-value",
+	}
+
+	// Supplement with 100 randomized DNS-label-shaped strings so bit
+	// manipulation is exercised across a broader input distribution.
+	// Seeded for reproducibility.
+	rng := rand.New(rand.NewPCG(42, 0))
+	const dnsLabelChars = "abcdefghijklmnopqrstuvwxyz0123456789-"
+	for range 100 {
+		n := rng.IntN(63) + 1 // length in [1, 63]
+		var buf [63]byte
+		for i := range n {
+			buf[i] = dnsLabelChars[rng.IntN(len(dnsLabelChars))]
+		}
+		cases = append(cases, string(buf[:n]))
+	}
+
+	for _, name := range cases {
+		got := NameHash(name)
+		if len(got) != 8 {
+			t.Errorf("NameHash(%q) length = %d, want 8", name, len(got))
+		}
+		// Verify all chars are lowercase hex digits.
+		for i, c := range got {
+			if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+				t.Errorf("NameHash(%q)[%d] = %c, want hex digit", name, i, c)
+			}
+		}
+		// Cross-check against GetNumericHash.
+		want := fmt.Sprintf("%08x", GetNumericHash(name))
+		if got != want {
+			t.Errorf("NameHash(%q) = %q, want %q", name, got, want)
+		}
+	}
+}
+
+func BenchmarkNameHashNew(b *testing.B) {
+	b.ReportAllocs()
+	for range b.N {
+		_ = NameHash("my-sandbox-name")
+	}
+}
+
+func BenchmarkNameHashOld(b *testing.B) {
+	b.ReportAllocs()
+	for range b.N {
+		_ = fmt.Sprintf("%08x", GetNumericHash("my-sandbox-name"))
+	}
+}
+
+// TestReconcileCoalescesNodeNameStatusWrite verifies that a status change
+// consisting only of the scheduled pod's node name is not written in its own
+// API request: the node name rides along with the next status write instead,
+// normally the Ready transition.
+func TestReconcileCoalescesNodeNameStatusWrite(t *testing.T) {
+	sandboxName := "sandbox-name"
+	sandboxNs := "sandbox-ns"
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: sandboxName, Namespace: sandboxNs}}
+
+	sb := &sandboxv1beta1.Sandbox{}
+	sb.Name = sandboxName
+	sb.Namespace = sandboxNs
+	sb.UID = sandboxUID
+	sb.Generation = 1
+	sb.Spec = sandboxv1beta1.SandboxSpec{SandboxBlueprint: sandboxv1beta1.SandboxBlueprint{
+		PodTemplate: sandboxv1beta1.PodTemplate{
+			Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "test-container"}}},
+		},
+	}}
+	r := &SandboxReconciler{
+		Client:        newFakeClient(sb),
+		Scheme:        Scheme,
+		Tracer:        asmetrics.NewNoOp(),
+		ClusterDomain: "cluster.local",
+	}
+
+	// Initial reconcile: creates the pod and writes the initial status.
+	_, err := r.Reconcile(t.Context(), req)
+	require.NoError(t, err)
+	beforeBind := &sandboxv1beta1.Sandbox{}
+	require.NoError(t, r.Get(t.Context(), req.NamespacedName, beforeBind))
+	require.Empty(t, beforeBind.Status.NodeName)
+
+	// The pod reports Pending (its state from creation until it runs) and
+	// the sandbox status reflects that.
+	pod := &corev1.Pod{}
+	require.NoError(t, r.Get(t.Context(), req.NamespacedName, pod))
+	pod.Status.Phase = corev1.PodPending
+	require.NoError(t, r.Status().Update(t.Context(), pod))
+	_, err = r.Reconcile(t.Context(), req)
+	require.NoError(t, err)
+	beforeBind = &sandboxv1beta1.Sandbox{}
+	require.NoError(t, r.Get(t.Context(), req.NamespacedName, beforeBind))
+
+	// Scheduler binds the pod; nothing else about the sandbox changes, so no
+	// status write should happen.
+	require.NoError(t, r.Get(t.Context(), req.NamespacedName, pod))
+	pod.Spec.NodeName = "node-1"
+	require.NoError(t, r.Update(t.Context(), pod))
+
+	_, err = r.Reconcile(t.Context(), req)
+	require.NoError(t, err)
+	live := &sandboxv1beta1.Sandbox{}
+	require.NoError(t, r.Get(t.Context(), req.NamespacedName, live))
+	assert.Empty(t, live.Status.NodeName, "node-name-only change should not be written on its own")
+	assert.Equal(t, beforeBind.ResourceVersion, live.ResourceVersion, "no status write expected for a node-name-only change")
+
+	// Pod becomes Ready: a single status write carries the node name, the
+	// pod IPs and the Ready condition together.
+	require.NoError(t, r.Get(t.Context(), req.NamespacedName, pod))
+	pod.Status.Phase = corev1.PodRunning
+	pod.Status.PodIPs = []corev1.PodIP{{IP: "10.0.0.8"}}
+	pod.Status.Conditions = []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}}
+	require.NoError(t, r.Status().Update(t.Context(), pod))
+
+	_, err = r.Reconcile(t.Context(), req)
+	require.NoError(t, err)
+	require.NoError(t, r.Get(t.Context(), req.NamespacedName, live))
+	assert.Equal(t, "node-1", live.Status.NodeName)
+	assert.Equal(t, []string{"10.0.0.8"}, live.Status.PodIPs)
+	readyCondition := meta.FindStatusCondition(live.Status.Conditions, string(sandboxv1beta1.SandboxConditionReady))
+	require.NotNil(t, readyCondition)
+	assert.Equal(t, metav1.ConditionTrue, readyCondition.Status)
+
+	// Once the sandbox is Ready the deferral no longer applies: a node
+	// change with no condition change (impossible in practice, but cheap to
+	// guard) is written through rather than leaving a Ready sandbox with a
+	// stale node name.
+	require.NoError(t, r.Get(t.Context(), req.NamespacedName, pod))
+	pod.Spec.NodeName = "node-2"
+	require.NoError(t, r.Update(t.Context(), pod))
+
+	_, err = r.Reconcile(t.Context(), req)
+	require.NoError(t, err)
+	require.NoError(t, r.Get(t.Context(), req.NamespacedName, live))
+	assert.Equal(t, "node-2", live.Status.NodeName, "node changes on a Ready sandbox must be written immediately")
+}
+
+func recordedStages(r *SandboxReconciler, sb *sandboxv1beta1.Sandbox) map[string]struct{} {
+	if entry := r.pendingStageMetrics[sb.UID]; entry != nil {
+		return entry.recorded
+	}
+	return nil
+}
+
+func TestRecordStageLatenciesOneShot(t *testing.T) {
+	asmetrics.SandboxStageLatency.Reset()
+
+	observedAt := time.Now().Add(-2 * time.Second).UTC()
+	sandbox := &sandboxv1beta1.Sandbox{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "stage-sb",
+			Namespace: "default",
+			UID:       sandboxUID,
+		},
+		Spec: sandboxv1beta1.SandboxSpec{
+			SandboxBlueprint: sandboxv1beta1.SandboxBlueprint{
+				Service: new(true),
+				PodTemplate: sandboxv1beta1.PodTemplate{
+					Spec: corev1.PodSpec{
+						Containers: []corev1.Container{{Name: "c", Image: "img"}},
+					},
+				},
+			},
+		},
+	}
+
+	ltt := metav1.NewTime(observedAt.Add(500 * time.Millisecond))
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              "stage-sb",
+			Namespace:         "default",
+			UID:               "pod-uid",
+			CreationTimestamp: metav1.NewTime(observedAt.Add(100 * time.Millisecond)),
+			OwnerReferences:   []metav1.OwnerReference{sandboxControllerRef("stage-sb")},
+			Labels:            map[string]string{sandboxv1beta1.SandboxNameHashLabel: NameHash("stage-sb")},
+		},
+		Status: corev1.PodStatus{
+			Phase:  corev1.PodRunning,
+			PodIPs: []corev1.PodIP{{IP: "10.0.0.1"}},
+			Conditions: []corev1.PodCondition{
+				{Type: corev1.PodScheduled, Status: corev1.ConditionTrue, LastTransitionTime: ltt},
+				{Type: corev1.PodReady, Status: corev1.ConditionTrue, LastTransitionTime: ltt},
+			},
+			StartTime: &ltt,
+		},
+	}
+	svc := &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              "stage-sb",
+			Namespace:         "default",
+			UID:               "svc-uid",
+			CreationTimestamp: metav1.NewTime(observedAt.Add(200 * time.Millisecond)),
+			OwnerReferences:   []metav1.OwnerReference{sandboxControllerRef("stage-sb")},
+		},
+	}
+
+	c := newFakeClient(sandbox, pod, svc)
+	r := &SandboxReconciler{Client: c, Scheme: Scheme, Tracer: asmetrics.NewNoOp()}
+	r.trackSandboxCreationMetrics(sandbox)
+	r.pendingStageMetrics[sandbox.UID].observedAt = observedAt
+
+	pending := r.prepareStageLatencies(context.Background(), sandbox, pod, svc)
+	require.Equal(t, uint64(0), histogramSampleCount(t, asmetrics.SandboxStageLatency),
+		"preparation must not emit metrics")
+	emitStageLatencies(context.Background(), sandbox, pending)
+	require.Equal(t, uint64(5), histogramSampleCount(t, asmetrics.SandboxStageLatency),
+		"expected pod_created, pod_scheduled, pod_running, pod_ready, service_ready")
+
+	recorded := recordedStages(r, sandbox)
+	require.Contains(t, recorded, asmetrics.StagePodCreated)
+	require.Contains(t, recorded, asmetrics.StagePodScheduled)
+	require.Contains(t, recorded, asmetrics.StagePodRunning)
+	require.Contains(t, recorded, asmetrics.StagePodReady)
+	require.Contains(t, recorded, asmetrics.StageServiceReady)
+	require.NotContains(t, recorded, asmetrics.StagePVCBound)
+
+	// Second call must not double-count observations (CollectAndCount only checks series).
+	pending = r.prepareStageLatencies(context.Background(), sandbox, pod, svc)
+	emitStageLatencies(context.Background(), sandbox, pending)
+	require.Equal(t, uint64(5), histogramSampleCount(t, asmetrics.SandboxStageLatency))
+}
+
+func TestStageLatenciesSecondGranularity(t *testing.T) {
+	baseline := time.Date(2026, time.October, 29, 12, 0, 0, 750000000, time.UTC)
+	for _, tc := range []struct {
+		name string
+		end  time.Time
+		want time.Duration
+		skip bool
+	}{
+		{name: "earlier second", end: baseline.Truncate(time.Second).Add(-time.Second), skip: true},
+		{name: "same second API timestamp", end: baseline.Truncate(time.Second)},
+		{name: "same second observation", end: baseline.Add(100 * time.Millisecond)},
+		{name: "next second API timestamp", end: baseline.Truncate(time.Second).Add(time.Second), want: time.Second},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			asmetrics.SandboxStageLatency.Reset()
+			sandbox := &sandboxv1beta1.Sandbox{ObjectMeta: metav1.ObjectMeta{UID: sandboxUID}}
+			sandbox.Spec.Service = new(true)
+			r := &SandboxReconciler{}
+			r.trackSandboxCreationMetrics(sandbox)
+			r.pendingStageMetrics[sandbox.UID].observedAt = baseline
+			stamp := metav1.NewTime(tc.end)
+			pod := &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{CreationTimestamp: stamp},
+				Status: corev1.PodStatus{
+					Phase:     corev1.PodRunning,
+					StartTime: &stamp,
+					PodIPs:    []corev1.PodIP{{IP: "10.0.0.1"}},
+					Conditions: []corev1.PodCondition{
+						{Type: corev1.PodScheduled, Status: corev1.ConditionTrue, LastTransitionTime: stamp},
+						{Type: corev1.PodReady, Status: corev1.ConditionTrue, LastTransitionTime: stamp},
+					},
+				},
+			}
+			svc := &corev1.Service{ObjectMeta: metav1.ObjectMeta{CreationTimestamp: stamp}}
+			pending := r.prepareStageLatencies(t.Context(), sandbox, pod, svc)
+			if tc.skip {
+				require.Empty(t, pending)
+			} else {
+				require.Len(t, pending, 5)
+				for _, sample := range pending {
+					require.Equal(t, tc.want, sample.latency, sample.stage)
+				}
+			}
+			emitStageLatencies(t.Context(), sandbox, pending)
+			require.Equal(t, uint64(len(pending)), histogramSampleCount(t, asmetrics.SandboxStageLatency))
+			require.Empty(t, r.prepareStageLatencies(t.Context(), sandbox, pod, svc))
+		})
+	}
+}
+
+func TestRecordStageLatenciesSkipsPreObservationStages(t *testing.T) {
+	asmetrics.SandboxStageLatency.Reset()
+
+	// Warm launch / upgrade: children reached Ready before the controller first observed the Sandbox.
+	observedAt := time.Now().UTC()
+	readyAt := observedAt.Add(-5 * time.Second)
+	sandbox := &sandboxv1beta1.Sandbox{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "warm-sb",
+			Namespace: "default",
+			UID:       sandboxUID,
+		},
+		Spec: sandboxv1beta1.SandboxSpec{
+			SandboxBlueprint: sandboxv1beta1.SandboxBlueprint{
+				Service: new(true),
+				PodTemplate: sandboxv1beta1.PodTemplate{
+					Spec: corev1.PodSpec{
+						Containers: []corev1.Container{{Name: "c", Image: "img"}},
+					},
+				},
+			},
+		},
+	}
+	ltt := metav1.NewTime(readyAt)
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              "warm-sb",
+			Namespace:         "default",
+			UID:               "pod-uid",
+			CreationTimestamp: metav1.NewTime(readyAt.Add(-time.Second)),
+			OwnerReferences:   []metav1.OwnerReference{sandboxControllerRef("warm-sb")},
+			Labels:            map[string]string{sandboxv1beta1.SandboxNameHashLabel: NameHash("warm-sb")},
+		},
+		Status: corev1.PodStatus{
+			Phase:  corev1.PodRunning,
+			PodIPs: []corev1.PodIP{{IP: "10.0.0.1"}},
+			Conditions: []corev1.PodCondition{
+				{Type: corev1.PodScheduled, Status: corev1.ConditionTrue, LastTransitionTime: ltt},
+				{Type: corev1.PodReady, Status: corev1.ConditionTrue, LastTransitionTime: ltt},
+			},
+			StartTime: &ltt,
+		},
+	}
+	svc := &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              "warm-sb",
+			Namespace:         "default",
+			UID:               "svc-uid",
+			CreationTimestamp: metav1.NewTime(readyAt),
+			OwnerReferences:   []metav1.OwnerReference{sandboxControllerRef("warm-sb")},
+		},
+	}
+
+	c := newFakeClient(sandbox, pod, svc)
+	r := &SandboxReconciler{Client: c, Scheme: Scheme, Tracer: asmetrics.NewNoOp()}
+	r.trackSandboxCreationMetrics(sandbox)
+	r.pendingStageMetrics[sandbox.UID].observedAt = observedAt
+
+	pending := r.prepareStageLatencies(context.Background(), sandbox, pod, svc)
+	emitStageLatencies(context.Background(), sandbox, pending)
+	require.Equal(t, 0, testutil.CollectAndCount(asmetrics.SandboxStageLatency),
+		"pre-observation stages must not emit near-zero samples")
+
+	recorded := recordedStages(r, sandbox)
+	require.Contains(t, recorded, asmetrics.StagePodCreated)
+	require.Contains(t, recorded, asmetrics.StagePodReady)
+	require.Contains(t, recorded, asmetrics.StageServiceReady)
+}
+
+func TestRecordStageLatenciesPVCBoundUsesObservationTime(t *testing.T) {
+	asmetrics.SandboxStageLatency.Reset()
+
+	observedAt := time.Now().Add(-10 * time.Second).UTC()
+	sandbox := &sandboxv1beta1.Sandbox{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "pvc-sb",
+			Namespace: "default",
+			UID:       sandboxUID,
+		},
+		Spec: sandboxv1beta1.SandboxSpec{
+			SandboxBlueprint: sandboxv1beta1.SandboxBlueprint{
+				VolumeClaimTemplates: []sandboxv1beta1.PersistentVolumeClaimTemplate{{
+					EmbeddedObjectMetadata: sandboxv1beta1.EmbeddedObjectMetadata{Name: "data"},
+					Spec:                   corev1.PersistentVolumeClaimSpec{},
+				}},
+				PodTemplate: sandboxv1beta1.PodTemplate{
+					Spec: corev1.PodSpec{
+						Containers: []corev1.Container{{Name: "c", Image: "img"}},
+					},
+				},
+			},
+		},
+	}
+	// CreationTimestamp is near t0; if used as bind time, latency would be ~50ms.
+	// PVC phase transitions have no timestamp, so the observation time yields ~10s.
+	pvc := &corev1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              "data-pvc-sb",
+			Namespace:         "default",
+			CreationTimestamp: metav1.NewTime(observedAt.Add(50 * time.Millisecond)),
+			OwnerReferences:   []metav1.OwnerReference{sandboxControllerRef("pvc-sb")},
+		},
+		Status: corev1.PersistentVolumeClaimStatus{Phase: corev1.ClaimBound},
+	}
+
+	c := newFakeClient(sandbox, pvc)
+	r := &SandboxReconciler{Client: c, Scheme: Scheme, Tracer: asmetrics.NewNoOp()}
+	r.trackSandboxCreationMetrics(sandbox)
+	r.pendingStageMetrics[sandbox.UID].observedAt = observedAt
+
+	before := time.Now().Truncate(time.Second)
+	pending := r.prepareStageLatencies(context.Background(), sandbox, nil, nil)
+	after := time.Now().Truncate(time.Second)
+	require.Len(t, pending, 1)
+	require.Zero(t, pending[0].latency%time.Second)
+	require.GreaterOrEqual(t, pending[0].latency, before.Sub(observedAt.Truncate(time.Second)))
+	require.LessOrEqual(t, pending[0].latency, after.Sub(observedAt.Truncate(time.Second)))
+	emitStageLatencies(context.Background(), sandbox, pending)
+
+	require.Equal(t, uint64(1), histogramSampleCount(t, asmetrics.SandboxStageLatency))
+	require.Contains(t, recordedStages(r, sandbox), asmetrics.StagePVCBound)
+
+	// Second call must skip PVC Gets (stage already recorded) and not double-count.
+	pending = r.prepareStageLatencies(context.Background(), sandbox, nil, nil)
+	emitStageLatencies(context.Background(), sandbox, pending)
+	require.Equal(t, uint64(1), histogramSampleCount(t, asmetrics.SandboxStageLatency))
+}
+
+func TestMarkInitiallyBoundPVCStage(t *testing.T) {
+	testCases := []struct {
+		name         string
+		phase        corev1.PersistentVolumeClaimPhase
+		wantRecorded bool
+	}{
+		{name: "bound", phase: corev1.ClaimBound, wantRecorded: true},
+		{name: "pending", phase: corev1.ClaimPending, wantRecorded: false},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			asmetrics.SandboxStageLatency.Reset()
+			sandbox := &sandboxv1beta1.Sandbox{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "pvc-sb",
+					Namespace: "default",
+					UID:       sandboxUID,
+				},
+				Spec: sandboxv1beta1.SandboxSpec{
+					SandboxBlueprint: sandboxv1beta1.SandboxBlueprint{
+						VolumeClaimTemplates: []sandboxv1beta1.PersistentVolumeClaimTemplate{{
+							EmbeddedObjectMetadata: sandboxv1beta1.EmbeddedObjectMetadata{Name: "data"},
+							Spec:                   corev1.PersistentVolumeClaimSpec{},
+						}},
+					},
+				},
+			}
+			pvc := &corev1.PersistentVolumeClaim{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:            "data-pvc-sb",
+					Namespace:       "default",
+					OwnerReferences: []metav1.OwnerReference{sandboxControllerRef("pvc-sb")},
+				},
+				Status: corev1.PersistentVolumeClaimStatus{Phase: tc.phase},
+			}
+
+			c := newFakeClient(sandbox, pvc)
+			r := &SandboxReconciler{Client: c, Scheme: Scheme, Tracer: asmetrics.NewNoOp()}
+			r.trackSandboxCreationMetrics(sandbox)
+			r.startSandboxStageMetrics(t.Context(), sandbox)
+			baseline := r.pendingStageMetrics[sandbox.UID].observedAt
+
+			_, recorded := recordedStages(r, sandbox)[asmetrics.StagePVCBound]
+			require.Equal(t, tc.wantRecorded, recorded)
+			r.startSandboxStageMetrics(t.Context(), sandbox)
+			require.Equal(t, baseline, r.pendingStageMetrics[sandbox.UID].observedAt)
+
+			pending := r.prepareStageLatencies(t.Context(), sandbox, nil, nil)
+			emitStageLatencies(t.Context(), sandbox, pending)
+			require.Equal(t, uint64(0), histogramSampleCount(t, asmetrics.SandboxStageLatency))
+
+			if tc.phase == corev1.ClaimPending {
+				livePVC := &corev1.PersistentVolumeClaim{}
+				require.NoError(t, c.Get(t.Context(), client.ObjectKeyFromObject(pvc), livePVC))
+				livePVC.Status.Phase = corev1.ClaimBound
+				require.NoError(t, c.Status().Update(t.Context(), livePVC))
+
+				pending = r.prepareStageLatencies(t.Context(), sandbox, nil, nil)
+				emitStageLatencies(t.Context(), sandbox, pending)
+				require.Equal(t, uint64(1), histogramSampleCount(t, asmetrics.SandboxStageLatency),
+					"a PVC first observed Pending must emit when it later becomes Bound")
+			}
+		})
+	}
+}
+
+func TestRecordStageLatenciesPVCBoundIgnoresForeignOwner(t *testing.T) {
+	asmetrics.SandboxStageLatency.Reset()
+
+	observedAt := time.Now().Add(-10 * time.Second).UTC()
+	sandbox := &sandboxv1beta1.Sandbox{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "pvc-sb",
+			Namespace: "default",
+			UID:       sandboxUID,
+		},
+		Spec: sandboxv1beta1.SandboxSpec{
+			SandboxBlueprint: sandboxv1beta1.SandboxBlueprint{
+				VolumeClaimTemplates: []sandboxv1beta1.PersistentVolumeClaimTemplate{{
+					EmbeddedObjectMetadata: sandboxv1beta1.EmbeddedObjectMetadata{Name: "data"},
+					Spec:                   corev1.PersistentVolumeClaimSpec{},
+				}},
+				PodTemplate: sandboxv1beta1.PodTemplate{
+					Spec: corev1.PodSpec{
+						Containers: []corev1.Container{{Name: "c", Image: "img"}},
+					},
+				},
+			},
+		},
+	}
+	otherOwner := true
+	pvc := &corev1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "data-pvc-sb",
+			Namespace: "default",
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: "apps/v1",
+				Kind:       "Deployment",
+				Name:       "other",
+				UID:        "other-uid",
+				Controller: &otherOwner,
+			}},
+		},
+		Status: corev1.PersistentVolumeClaimStatus{Phase: corev1.ClaimBound},
+	}
+
+	c := newFakeClient(sandbox, pvc)
+	r := &SandboxReconciler{Client: c, Scheme: Scheme, Tracer: asmetrics.NewNoOp()}
+	r.trackSandboxCreationMetrics(sandbox)
+	r.pendingStageMetrics[sandbox.UID].observedAt = observedAt
+
+	pending := r.prepareStageLatencies(context.Background(), sandbox, nil, nil)
+	emitStageLatencies(context.Background(), sandbox, pending)
+
+	require.NotContains(t, recordedStages(r, sandbox), asmetrics.StagePVCBound)
+	require.Equal(t, uint64(0), histogramSampleCount(t, asmetrics.SandboxStageLatency))
+}
+
+func TestReconcileStartsStageMetricsAndRecordsInitialStages(t *testing.T) {
+	asmetrics.SandboxStageLatency.Reset()
+
+	sandbox := &sandboxv1beta1.Sandbox{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:       "obs-sb",
+			Namespace:  "default",
+			UID:        sandboxUID,
+			Generation: 1,
+		},
+		Spec: sandboxv1beta1.SandboxSpec{
+			SandboxBlueprint: sandboxv1beta1.SandboxBlueprint{
+				VolumeClaimTemplates: []sandboxv1beta1.PersistentVolumeClaimTemplate{{
+					EmbeddedObjectMetadata: sandboxv1beta1.EmbeddedObjectMetadata{Name: "data"},
+					Spec:                   corev1.PersistentVolumeClaimSpec{},
+				}},
+				PodTemplate: sandboxv1beta1.PodTemplate{
+					Spec: corev1.PodSpec{
+						Containers: []corev1.Container{{Name: "c", Image: "img"}},
+					},
+				},
+			},
+		},
+	}
+	pvc := &corev1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:            "data-obs-sb",
+			Namespace:       "default",
+			OwnerReferences: []metav1.OwnerReference{sandboxControllerRef("obs-sb")},
+		},
+		Status: corev1.PersistentVolumeClaimStatus{Phase: corev1.ClaimBound},
+	}
+	c := &createTimestampClient{
+		WithWatch: newFakeClient(sandbox, pvc),
+		now:       time.Now,
+	}
+	r := &SandboxReconciler{Client: c, Scheme: Scheme, Tracer: asmetrics.NewNoOp(), ClusterDomain: "cluster.local"}
+
+	r.trackSandboxCreationMetrics(sandbox)
+	_, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: sandbox.Name, Namespace: sandbox.Namespace}})
+	require.NoError(t, err)
+
+	updated := &sandboxv1beta1.Sandbox{}
+	require.NoError(t, c.Get(context.Background(), client.ObjectKeyFromObject(sandbox), updated))
+	require.False(t, r.pendingStageMetrics[sandbox.UID].observedAt.IsZero())
+	require.Contains(t, recordedStages(r, updated), asmetrics.StagePodCreated)
+	require.Contains(t, recordedStages(r, updated), asmetrics.StagePVCBound)
+	require.Equal(t, uint64(1), histogramSampleCount(t, asmetrics.SandboxStageLatency),
+		"the initially Bound PVC must not emit alongside pod_created")
+}
+
+func TestPrepareStageLatenciesSkipsMissingFirstObservedTime(t *testing.T) {
+	asmetrics.SandboxStageLatency.Reset()
+
+	sandbox := &sandboxv1beta1.Sandbox{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "batch-sb",
+			Namespace: "default",
+			UID:       sandboxUID,
+		},
+		Spec: sandboxv1beta1.SandboxSpec{
+			SandboxBlueprint: sandboxv1beta1.SandboxBlueprint{
+				PodTemplate: sandboxv1beta1.PodTemplate{
+					Spec: corev1.PodSpec{
+						Containers: []corev1.Container{{Name: "c", Image: "img"}},
+					},
+				},
+			},
+		},
+	}
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              "batch-sb",
+			Namespace:         "default",
+			UID:               "pod-uid",
+			CreationTimestamp: metav1.Now(),
+			OwnerReferences:   []metav1.OwnerReference{sandboxControllerRef("batch-sb")},
+			Labels:            map[string]string{sandboxv1beta1.SandboxNameHashLabel: NameHash("batch-sb")},
+		},
+	}
+
+	c := newFakeClient(sandbox, pod)
+	r := &SandboxReconciler{Client: c, Scheme: Scheme, Tracer: asmetrics.NewNoOp()}
+
+	pending := r.prepareStageLatencies(context.Background(), sandbox, pod, nil)
+	emitStageLatencies(context.Background(), sandbox, pending)
+
+	require.Empty(t, recordedStages(r, sandbox))
+	require.Equal(t, uint64(0), histogramSampleCount(t, asmetrics.SandboxStageLatency))
+}
+
+func TestPrepareStageLatenciesReturnsObservations(t *testing.T) {
+	asmetrics.SandboxStageLatency.Reset()
+
+	observedAt := time.Now().Add(-2 * time.Second).UTC()
+	sandbox := &sandboxv1beta1.Sandbox{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "fail-sb",
+			Namespace: "default",
+			UID:       sandboxUID,
+		},
+		Spec: sandboxv1beta1.SandboxSpec{
+			SandboxBlueprint: sandboxv1beta1.SandboxBlueprint{
+				PodTemplate: sandboxv1beta1.PodTemplate{
+					Spec: corev1.PodSpec{
+						Containers: []corev1.Container{{Name: "c", Image: "img"}},
+					},
+				},
+			},
+		},
+	}
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              "fail-sb",
+			Namespace:         "default",
+			UID:               "pod-uid",
+			CreationTimestamp: metav1.NewTime(observedAt.Add(100 * time.Millisecond)),
+			OwnerReferences:   []metav1.OwnerReference{sandboxControllerRef("fail-sb")},
+			Labels:            map[string]string{sandboxv1beta1.SandboxNameHashLabel: NameHash("fail-sb")},
+		},
+	}
+
+	c := newFakeClient(sandbox, pod)
+	r := &SandboxReconciler{Client: c, Scheme: Scheme, Tracer: asmetrics.NewNoOp()}
+	r.trackSandboxCreationMetrics(sandbox)
+	r.pendingStageMetrics[sandbox.UID].observedAt = observedAt
+
+	pending := r.prepareStageLatencies(context.Background(), sandbox, pod, nil)
+	require.NotEmpty(t, pending)
+	require.Equal(t, 0, testutil.CollectAndCount(asmetrics.SandboxStageLatency),
+		"preparation must not emit metrics")
+}
+
+func TestReconcileSuspendedDelaysStageBaseline(t *testing.T) {
+	asmetrics.SandboxStageLatency.Reset()
+
+	sandbox := &sandboxv1beta1.Sandbox{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:       "obs-susp-sb",
+			Namespace:  "default",
+			UID:        sandboxUID,
+			Generation: 1,
+		},
+		Spec: sandboxv1beta1.SandboxSpec{
+			OperatingMode: sandboxv1beta1.SandboxOperatingModeSuspended,
+			SandboxBlueprint: sandboxv1beta1.SandboxBlueprint{
+				PodTemplate: sandboxv1beta1.PodTemplate{
+					Spec: corev1.PodSpec{
+						Containers: []corev1.Container{{Name: "c", Image: "img"}},
+					},
+				},
+			},
+		},
+	}
+	c := newFakeClient(sandbox)
+	r := &SandboxReconciler{Client: c, Scheme: Scheme, Tracer: asmetrics.NewNoOp(), ClusterDomain: "cluster.local"}
+
+	r.trackSandboxCreationMetrics(sandbox)
+	_, err := r.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Name: sandbox.Name, Namespace: sandbox.Namespace},
+	})
+	require.NoError(t, err)
+
+	updated := &sandboxv1beta1.Sandbox{}
+	require.NoError(t, c.Get(context.Background(), client.ObjectKeyFromObject(sandbox), updated))
+	require.True(t, r.pendingStageMetrics[sandbox.UID].observedAt.IsZero())
+	require.Empty(t, recordedStages(r, sandbox))
+	require.Equal(t, 0, testutil.CollectAndCount(asmetrics.SandboxStageLatency))
+
+	updated.Spec.OperatingMode = sandboxv1beta1.SandboxOperatingModeRunning
+	require.NoError(t, c.Update(t.Context(), updated))
+	before := time.Now()
+	_, err = r.Reconcile(t.Context(), ctrl.Request{NamespacedName: client.ObjectKeyFromObject(updated)})
+	require.NoError(t, err)
+	require.False(t, r.pendingStageMetrics[sandbox.UID].observedAt.Before(before))
+}
+
+func TestReconcileChildResourcesStageLatencyDoesNotBlockReady(t *testing.T) {
+	asmetrics.SandboxStageLatency.Reset()
+
+	observedAt := time.Now().Add(-2 * time.Second).UTC()
+	ltt := metav1.NewTime(observedAt.Add(500 * time.Millisecond))
+	sandbox := &sandboxv1beta1.Sandbox{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:       "ready-sb",
+			Namespace:  "default",
+			UID:        sandboxUID,
+			Generation: 1,
+		},
+		Spec: sandboxv1beta1.SandboxSpec{
+			SandboxBlueprint: sandboxv1beta1.SandboxBlueprint{
+				Service: new(true),
+				PodTemplate: sandboxv1beta1.PodTemplate{
+					Spec: corev1.PodSpec{
+						Containers: []corev1.Container{{Name: "c", Image: "img"}},
+					},
+				},
+			},
+		},
+	}
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              "ready-sb",
+			Namespace:         "default",
+			UID:               "pod-uid",
+			CreationTimestamp: metav1.NewTime(observedAt.Add(100 * time.Millisecond)),
+			OwnerReferences:   []metav1.OwnerReference{sandboxControllerRef("ready-sb")},
+			Labels:            map[string]string{sandboxv1beta1.SandboxNameHashLabel: NameHash("ready-sb")},
+		},
+		Status: corev1.PodStatus{
+			Phase:  corev1.PodRunning,
+			PodIPs: []corev1.PodIP{{IP: "10.0.0.1"}},
+			Conditions: []corev1.PodCondition{
+				{Type: corev1.PodScheduled, Status: corev1.ConditionTrue, LastTransitionTime: ltt},
+				{Type: corev1.PodReady, Status: corev1.ConditionTrue, LastTransitionTime: ltt},
+			},
+			StartTime: &ltt,
+		},
+	}
+	svc := &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              "ready-sb",
+			Namespace:         "default",
+			UID:               "svc-uid",
+			CreationTimestamp: metav1.NewTime(observedAt.Add(200 * time.Millisecond)),
+			OwnerReferences:   []metav1.OwnerReference{sandboxControllerRef("ready-sb")},
+			Labels:            map[string]string{sandboxv1beta1.SandboxNameHashLabel: NameHash("ready-sb")},
+		},
+		Spec: corev1.ServiceSpec{ClusterIP: "None"},
+	}
+
+	c := newFakeClient(sandbox, pod, svc)
+	r := &SandboxReconciler{Client: c, Scheme: Scheme, Tracer: asmetrics.NewNoOp(), ClusterDomain: "cluster.local"}
+	r.trackSandboxCreationMetrics(sandbox)
+	r.pendingStageMetrics[sandbox.UID].observedAt = observedAt
+
+	_, _, err := r.reconcileChildResources(context.Background(), sandbox, nil)
+	require.NoError(t, err, "stage-latency bookkeeping must not fail reconcile")
+
+	ready := false
+	for _, cond := range sandbox.Status.Conditions {
+		if cond.Type == string(sandboxv1beta1.SandboxConditionReady) {
+			ready = cond.Status == metav1.ConditionTrue
+			require.NotEqual(t, "ReconcilerError", cond.Reason)
+		}
+	}
+	require.True(t, ready, "healthy sandbox must remain Ready when only telemetry bookkeeping is involved")
+}
+
+func TestRecordChildReconcileErrorOnOwnershipConflict(t *testing.T) {
+	asmetrics.ChildReconcileErrors.Reset()
+
+	sandbox := &sandboxv1beta1.Sandbox{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "own-sb",
+			Namespace: "default",
+			UID:       sandboxUID,
+		},
+		Spec: sandboxv1beta1.SandboxSpec{
+			SandboxBlueprint: sandboxv1beta1.SandboxBlueprint{
+				PodTemplate: sandboxv1beta1.PodTemplate{
+					Spec: corev1.PodSpec{
+						Containers: []corev1.Container{{Name: "c", Image: "img"}},
+					},
+				},
+			},
+		},
+	}
+	otherOwner := true
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "own-sb",
+			Namespace: "default",
+			UID:       "pod-uid",
+			Labels:    map[string]string{sandboxv1beta1.SandboxNameHashLabel: NameHash("own-sb")},
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: "apps/v1",
+				Kind:       "ReplicaSet",
+				Name:       "rs",
+				UID:        "rs-uid",
+				Controller: &otherOwner,
+			}},
+		},
+	}
+	c := newFakeClient(sandbox, pod)
+	r := &SandboxReconciler{Client: c, Scheme: Scheme, Tracer: asmetrics.NewNoOp()}
+
+	_, _, err := r.reconcilePod(context.Background(), sandbox, NameHash(sandbox.Name), nil)
+	require.Error(t, err)
+	require.InDelta(t, 1, testutil.ToFloat64(asmetrics.ChildReconcileErrors.WithLabelValues(
+		"default", asmetrics.ResourcePod, asmetrics.ReasonOwnershipConflict)), 0)
+}
+
+// histogramSampleCount sums observation counts across all series of a histogram
+// collector. testutil.CollectAndCount only counts series, so it cannot detect
+// duplicate observations into an existing series.
+func histogramSampleCount(t *testing.T, c prometheus.Collector) uint64 {
+	t.Helper()
+	reg := prometheus.NewPedanticRegistry()
+	if err := reg.Register(c); err != nil {
+		t.Fatalf("failed to register collector: %v", err)
+	}
+	mfs, err := reg.Gather()
+	if err != nil {
+		t.Fatalf("failed to gather metrics: %v", err)
+	}
+	var total uint64
+	for _, mf := range mfs {
+		for _, m := range mf.GetMetric() {
+			total += m.GetHistogram().GetSampleCount()
+		}
+	}
+	return total
+}
+func TestReconcileNamespaceTerminatingRequeue(t *testing.T) {
+	testCases := []struct {
+		name      string
+		mutate    func(*sandboxv1beta1.Sandbox)
+		setupObjs func(*sandboxv1beta1.Sandbox) []runtime.Object
+		failObj   func(client.Object) bool
+	}{
+		{
+			name: "pod creation in terminating namespace requeues without error",
+			failObj: func(obj client.Object) bool {
+				_, isPod := obj.(*corev1.Pod)
+				return isPod
+			},
+		},
+		{
+			name: "pvc creation in terminating namespace requeues without error",
+			mutate: func(sb *sandboxv1beta1.Sandbox) {
+				sb.Spec.VolumeClaimTemplates = []sandboxv1beta1.PersistentVolumeClaimTemplate{
+					{
+						EmbeddedObjectMetadata: sandboxv1beta1.EmbeddedObjectMetadata{Name: "data"},
+						Spec: corev1.PersistentVolumeClaimSpec{
+							AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
+						},
+					},
+				}
+			},
+			failObj: func(obj client.Object) bool {
+				_, isPVC := obj.(*corev1.PersistentVolumeClaim)
+				return isPVC
+			},
+		},
+		{
+			name: "service creation in terminating namespace requeues without error",
+			mutate: func(sb *sandboxv1beta1.Sandbox) {
+				sb.Spec.Service = new(true)
+			},
+			setupObjs: func(sb *sandboxv1beta1.Sandbox) []runtime.Object {
+				pod := &corev1.Pod{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:            sb.Name,
+						Namespace:       sb.Namespace,
+						OwnerReferences: []metav1.OwnerReference{sandboxControllerRef(sb.Name)},
+						Labels:          map[string]string{sandboxv1beta1.SandboxNameHashLabel: NameHash(sb.Name)},
+					},
+				}
+				return []runtime.Object{pod}
+			},
+			failObj: func(obj client.Object) bool {
+				_, isSvc := obj.(*corev1.Service)
+				return isSvc
+			},
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			sb := &sandboxv1beta1.Sandbox{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:       "ns-term-sb",
+					Namespace:  "terminating-ns",
+					UID:        sandboxUID,
+					Generation: 1,
+				},
+				Spec: sandboxv1beta1.SandboxSpec{
+					SandboxBlueprint: sandboxv1beta1.SandboxBlueprint{
+						PodTemplate: sandboxv1beta1.PodTemplate{
+							Spec: corev1.PodSpec{
+								Containers: []corev1.Container{{Name: "test-container"}},
+							},
+						},
+					},
+				},
+			}
+			if tc.mutate != nil {
+				tc.mutate(sb)
+			}
+
+			var initialObjs []runtime.Object
+			initialObjs = append(initialObjs, sb)
+			if tc.setupObjs != nil {
+				initialObjs = append(initialObjs, tc.setupObjs(sb)...)
+			}
+
+			fc := interceptor.NewClient(newFakeClient(initialObjs...), interceptor.Funcs{
+				Create: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
+					if tc.failObj(obj) {
+						return newNamespaceTerminatingError(obj.GetNamespace())
+					}
+					return c.Create(ctx, obj, opts...)
+				},
+			})
+
+			r := &SandboxReconciler{
+				Client: fc,
+				Scheme: Scheme,
+				Tracer: asmetrics.NewNoOp(),
+			}
+
+			req := ctrl.Request{NamespacedName: types.NamespacedName{Name: sb.Name, Namespace: sb.Namespace}}
+			result, err := r.Reconcile(t.Context(), req)
+			require.NoError(t, err, "reconcile must not return an error when namespace is terminating")
+			assert.Equal(t, ctrl.Result{RequeueAfter: namespaceTerminatingRequeue}, result)
+		})
+	}
+}
+
+func TestReconcileNonTerminatingErrorPropagates(t *testing.T) {
+	sb := &sandboxv1beta1.Sandbox{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:       "err-sb",
+			Namespace:  "default",
+			UID:        sandboxUID,
+			Generation: 1,
+		},
+		Spec: sandboxv1beta1.SandboxSpec{
+			SandboxBlueprint: sandboxv1beta1.SandboxBlueprint{
+				PodTemplate: sandboxv1beta1.PodTemplate{
+					Spec: corev1.PodSpec{
+						Containers: []corev1.Container{{Name: "test-container"}},
+					},
+				},
+			},
+		},
+	}
+	fc := interceptor.NewClient(newFakeClient(sb), interceptor.Funcs{
+		Create: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
+			if _, isPod := obj.(*corev1.Pod); isPod {
+				return k8serrors.NewInternalError(errors.New("internal server error"))
+			}
+			return c.Create(ctx, obj, opts...)
+		},
+	})
+	r := &SandboxReconciler{
+		Client: fc,
+		Scheme: Scheme,
+		Tracer: asmetrics.NewNoOp(),
+	}
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: sb.Name, Namespace: sb.Namespace}}
+	_, err := r.Reconcile(t.Context(), req)
+	require.Error(t, err, "non-terminating error must be returned to trigger retry")
+	assert.False(t, isNamespaceTerminatingError(err))
+}
+
+func drainEvent(t *testing.T, recorder *events.FakeRecorder) string {
+	t.Helper()
+	select {
+	case event := <-recorder.Events:
+		return event
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for event")
+		return ""
+	}
+}
+
+// assertNoEvent fails the test if an event was recorded.
+func assertNoEvent(t *testing.T, recorder *events.FakeRecorder) {
+	t.Helper()
+	select {
+	case event := <-recorder.Events:
+		t.Fatalf("expected no event, got %q", event)
+	default:
+	}
+}
+
+func TestReconcileEvents_PodCreated(t *testing.T) {
+	sandbox := &sandboxv1beta1.Sandbox{
+		ObjectMeta: metav1.ObjectMeta{Name: "sandbox-name", Namespace: "default", UID: sandboxUID},
+		Spec: sandboxv1beta1.SandboxSpec{SandboxBlueprint: sandboxv1beta1.SandboxBlueprint{
+			PodTemplate: sandboxv1beta1.PodTemplate{
+				Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "test-container"}}},
+			},
+		}},
+	}
+	recorder := events.NewFakeRecorder(10)
+	r := &SandboxReconciler{
+		Client:   newFakeClient(sandbox),
+		Scheme:   Scheme,
+		Recorder: recorder,
+		Tracer:   asmetrics.NewNoOp(),
+	}
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: sandbox.Name, Namespace: sandbox.Namespace}}
+
+	_, err := r.Reconcile(t.Context(), req)
+	require.NoError(t, err)
+
+	require.Equal(t, "Normal SandboxPodCreated Created Pod \"sandbox-name\"", drainEvent(t, recorder))
+}
+
+func TestReconcileEvents_PodCreationFailed(t *testing.T) {
+	sandbox := &sandboxv1beta1.Sandbox{
+		ObjectMeta: metav1.ObjectMeta{Name: "sandbox-name", Namespace: "default", UID: sandboxUID},
+		Spec: sandboxv1beta1.SandboxSpec{SandboxBlueprint: sandboxv1beta1.SandboxBlueprint{
+			PodTemplate: sandboxv1beta1.PodTemplate{
+				Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "test-container"}}},
+			},
+		}},
+	}
+	createErr := errors.New("injected create failure")
+	fc := interceptor.NewClient(newFakeClient(sandbox), interceptor.Funcs{
+		Create: func(ctx context.Context, client client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
+			if _, ok := obj.(*corev1.Pod); ok {
+				return createErr
+			}
+			return client.Create(ctx, obj, opts...)
+		},
+	})
+	recorder := events.NewFakeRecorder(10)
+	r := &SandboxReconciler{
+		Client:   fc,
+		Scheme:   Scheme,
+		Recorder: recorder,
+		Tracer:   asmetrics.NewNoOp(),
+	}
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: sandbox.Name, Namespace: sandbox.Namespace}}
+
+	_, err := r.Reconcile(t.Context(), req)
+	require.Error(t, err)
+
+	require.Equal(t, "Warning SandboxPodCreateFailed Failed to create Pod \"sandbox-name\": injected create failure", drainEvent(t, recorder))
+}
+
+// TestReconcileEvents_ReadyTransitions tests every recordReadyTransitionEvent case aside from Suspended: each builds a
+// Sandbox already in the target state, reconciles once to expect the event, then reconciles again to confirm a no-op on no change.
+func TestReconcileEvents_ReadyTransitions(t *testing.T) {
+	podTemplateSpec := sandboxv1beta1.SandboxSpec{SandboxBlueprint: sandboxv1beta1.SandboxBlueprint{
+		PodTemplate: sandboxv1beta1.PodTemplate{
+			Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "test-container"}}},
+		},
+	}}
+	shutdownTime := metav1.NewTime(time.Now().Add(-1 * time.Minute))
+
+	testCases := []struct {
+		name        string
+		sandboxSpec sandboxv1beta1.SandboxSpec
+		pod         *corev1.Pod
+		wantEvent   string
+	}{
+		{
+			name:        "pod ready",
+			sandboxSpec: podTemplateSpec,
+			pod: &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:            "sandbox-name",
+					Namespace:       "default",
+					OwnerReferences: []metav1.OwnerReference{sandboxControllerRef("sandbox-name")},
+				},
+				Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "test-container"}}},
+				Status: corev1.PodStatus{
+					Phase:      corev1.PodRunning,
+					PodIPs:     []corev1.PodIP{{IP: "10.244.0.1"}},
+					Conditions: []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}},
+				},
+			},
+			wantEvent: "Normal SandboxReady Sandbox is ready",
+		},
+		{
+			name:        "pod succeeded",
+			sandboxSpec: podTemplateSpec,
+			pod: &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:            "sandbox-name",
+					Namespace:       "default",
+					OwnerReferences: []metav1.OwnerReference{sandboxControllerRef("sandbox-name")},
+				},
+				Spec:   corev1.PodSpec{Containers: []corev1.Container{{Name: "test-container"}}},
+				Status: corev1.PodStatus{Phase: corev1.PodSucceeded},
+			},
+			wantEvent: "Normal PodSucceeded Pod completed successfully",
+		},
+		{
+			name:        "pod failed",
+			sandboxSpec: podTemplateSpec,
+			pod: &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:            "sandbox-name",
+					Namespace:       "default",
+					OwnerReferences: []metav1.OwnerReference{sandboxControllerRef("sandbox-name")},
+				},
+				Spec:   corev1.PodSpec{Containers: []corev1.Container{{Name: "test-container"}}},
+				Status: corev1.PodStatus{Phase: corev1.PodFailed},
+			},
+			wantEvent: "Warning PodFailed Pod failed",
+		},
+		// The expired cases are treated separately because delete is silent on both reconciles, while retain emits an event
+		// once on the first reconcile and no-ops on the second (due to unchanged state).
+		{
+			name: "expired, retain policy",
+			sandboxSpec: sandboxv1beta1.SandboxSpec{
+				SandboxBlueprint: podTemplateSpec.SandboxBlueprint,
+				Lifecycle: sandboxv1beta1.Lifecycle{
+					ShutdownTime:   &shutdownTime,
+					ShutdownPolicy: ptr.To(sandboxv1beta1.ShutdownPolicyRetain),
+				},
+			},
+			wantEvent: "Normal SandboxExpired Sandbox has expired",
+		},
+		{
+			name: "expired, delete policy",
+			sandboxSpec: sandboxv1beta1.SandboxSpec{
+				SandboxBlueprint: podTemplateSpec.SandboxBlueprint,
+				Lifecycle: sandboxv1beta1.Lifecycle{
+					ShutdownTime:   &shutdownTime,
+					ShutdownPolicy: ptr.To(sandboxv1beta1.ShutdownPolicyDelete),
+				},
+			},
+			wantEvent: "",
+		},
+	}
+
+	for _, tc := range testCases {
+		newReconciler := func() (*SandboxReconciler, ctrl.Request) {
+			sandbox := &sandboxv1beta1.Sandbox{
+				ObjectMeta: metav1.ObjectMeta{Name: "sandbox-name", Namespace: "default", UID: sandboxUID},
+				Spec:       tc.sandboxSpec,
+			}
+			objs := []runtime.Object{sandbox}
+			if tc.pod != nil {
+				objs = append(objs, tc.pod.DeepCopy())
+			}
+			r := &SandboxReconciler{
+				Client: newFakeClient(objs...),
+				Scheme: Scheme,
+				Tracer: asmetrics.NewNoOp(),
+			}
+			return r, ctrl.Request{NamespacedName: types.NamespacedName{Name: sandbox.Name, Namespace: sandbox.Namespace}}
+		}
+
+		t.Run(tc.name, func(t *testing.T) {
+			r, req := newReconciler()
+			recorder := events.NewFakeRecorder(10)
+			r.Recorder = recorder
+
+			_, err := r.Reconcile(t.Context(), req)
+			require.NoError(t, err)
+			if tc.wantEvent == "" {
+				assertNoEvent(t, recorder)
+			} else {
+				require.Equal(t, tc.wantEvent, drainEvent(t, recorder))
+			}
+
+			_, err = r.Reconcile(t.Context(), req)
+			require.NoError(t, err)
+			assertNoEvent(t, recorder)
+		})
+
+		// Verify that --disable-sandbox-events (sets recorder nil) executes all reconcile paths safely without panic
+		t.Run(tc.name+", events disabled", func(t *testing.T) {
+			r, req := newReconciler()
+			require.NotPanics(t, func() {
+				_, err := r.Reconcile(t.Context(), req)
+				require.NoError(t, err)
+			})
+		})
+	}
+}
+
+func TestReconcileEvents_SandboxSuspended(t *testing.T) {
+	sandbox := &sandboxv1beta1.Sandbox{
+		ObjectMeta: metav1.ObjectMeta{Name: "sandbox-name", Namespace: "default", UID: sandboxUID},
+		Spec: sandboxv1beta1.SandboxSpec{SandboxBlueprint: sandboxv1beta1.SandboxBlueprint{
+			PodTemplate: sandboxv1beta1.PodTemplate{
+				Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "test-container"}}},
+			},
+		}},
+	}
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:            sandbox.Name,
+			Namespace:       sandbox.Namespace,
+			OwnerReferences: []metav1.OwnerReference{sandboxControllerRef(sandbox.Name)},
+		},
+		Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "test-container"}}},
+		Status: corev1.PodStatus{
+			Phase:      corev1.PodRunning,
+			PodIPs:     []corev1.PodIP{{IP: "10.244.0.1"}},
+			Conditions: []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}},
+		},
+	}
+	recorder := events.NewFakeRecorder(10)
+	r := &SandboxReconciler{
+		Client:   newFakeClient(sandbox, pod),
+		Scheme:   Scheme,
+		Recorder: recorder,
+		Tracer:   asmetrics.NewNoOp(),
+	}
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: sandbox.Name, Namespace: sandbox.Namespace}}
+
+	_, err := r.Reconcile(t.Context(), req)
+	require.NoError(t, err)
+	require.Equal(t, "Normal SandboxReady Sandbox is ready", drainEvent(t, recorder))
+
+	live := &sandboxv1beta1.Sandbox{}
+	require.NoError(t, r.Get(t.Context(), req.NamespacedName, live))
+	live.Spec.OperatingMode = sandboxv1beta1.SandboxOperatingModeSuspended
+	require.NoError(t, r.Update(t.Context(), live))
+
+	_, err = r.Reconcile(t.Context(), req)
+	require.NoError(t, err)
+	require.Equal(t, "Normal SandboxSuspended Sandbox is suspended", drainEvent(t, recorder))
+
+	require.NoError(t, r.Get(t.Context(), req.NamespacedName, live))
+	live.Spec.OperatingMode = ""
+	require.NoError(t, r.Update(t.Context(), live))
+	// The suspension deleted the Pod so recreate it already Ready so this reconcile emits SandboxReady,
+	// not SandboxPodCreated for a blank new Pod.
+	pod.ResourceVersion = ""
+	require.NoError(t, r.Create(t.Context(), pod))
+
+	_, err = r.Reconcile(t.Context(), req)
+	require.NoError(t, err)
+	require.Equal(t, "Normal SandboxReady Sandbox is ready", drainEvent(t, recorder))
+}
+
+func TestSandboxStageMetricsRestartAndFlaps(t *testing.T) {
+	asmetrics.SandboxStageLatency.Reset()
+	sandbox := &sandboxv1beta1.Sandbox{ObjectMeta: metav1.ObjectMeta{UID: sandboxUID}}
+	pod := &corev1.Pod{}
+	r := &SandboxReconciler{}
+	watch := r.sandboxCreationMetricsPredicate()
+	watch.Create(event.CreateEvent{Object: sandbox})
+	r.startSandboxStageMetrics(t.Context(), sandbox)
+	baseline := r.pendingStageMetrics[sandbox.UID].observedAt
+	// Repeated observations must retain the original baseline and stage set.
+	watch.Update(event.UpdateEvent{ObjectOld: sandbox, ObjectNew: sandbox})
+	r.startSandboxStageMetrics(t.Context(), sandbox)
+	require.Equal(t, baseline, r.pendingStageMetrics[sandbox.UID].observedAt)
+	emitStageLatencies(t.Context(), sandbox, r.prepareStageLatencies(t.Context(), sandbox, pod, nil))
+	require.Equal(t, uint64(1), histogramSampleCount(t, asmetrics.SandboxStageLatency))
+
+	// A fresh controller's initial list cannot admit an in-flight Sandbox,
+	// even after it resumes or receives ordinary watch updates.
+	restarted := &SandboxReconciler{}
+	restarted.sandboxCreationMetricsPredicate().Create(event.CreateEvent{Object: sandbox, IsInInitialList: true})
+	restarted.sandboxCreationMetricsPredicate().Update(event.UpdateEvent{ObjectOld: sandbox, ObjectNew: sandbox})
+	restarted.startSandboxStageMetrics(t.Context(), sandbox)
+	require.Empty(t, restarted.pendingStageMetrics)
+	require.Empty(t, restarted.prepareStageLatencies(t.Context(), sandbox, pod, nil))
+
+	oldStatus := sandbox.Status.DeepCopy()
+	sandbox.Status.Conditions = []metav1.Condition{{Type: string(sandboxv1beta1.SandboxConditionReady), Status: metav1.ConditionTrue}}
+	r.recordSandboxCreationMetrics(t.Context(), sandbox, oldStatus)
+	require.Empty(t, r.pendingStageMetrics)
+	ready := sandbox.DeepCopy()
+	sandbox.Status.Conditions = nil
+	watch.Update(event.UpdateEvent{ObjectOld: ready, ObjectNew: sandbox})
+	r.startSandboxStageMetrics(t.Context(), sandbox)
+	require.Empty(t, r.prepareStageLatencies(t.Context(), sandbox, pod, nil))
+	require.Equal(t, uint64(1), histogramSampleCount(t, asmetrics.SandboxStageLatency))
+}
+
+func TestRecordLifecycleMetrics_SuspendAndResume(t *testing.T) {
+	const name, ns, tmpl = "sb-lifecycle", "sb-ns", "my-tmpl"
+	key := types.NamespacedName{Name: name, Namespace: ns}
+
+	newSandbox := func(mode sandboxv1beta1.SandboxOperatingMode, suspendedStatus metav1.ConditionStatus, suspendedReason string, readyStatus metav1.ConditionStatus, readyReason string) *sandboxv1beta1.Sandbox {
+		s := &sandboxv1beta1.Sandbox{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      name,
+				Namespace: ns,
+				UID:       sandboxUID,
+				Annotations: map[string]string{
+					sandboxv1beta1.SandboxTemplateRefAnnotation: tmpl,
+				},
+				OwnerReferences: []metav1.OwnerReference{{
+					APIVersion: extensionsv1beta1.GroupVersion.String(),
+					Kind:       extensionsv1beta1.SandboxClaimKind,
+					Name:       "test-claim",
+					Controller: new(true),
+				}},
+			},
+			Spec: sandboxv1beta1.SandboxSpec{OperatingMode: mode},
+		}
+		meta.SetStatusCondition(&s.Status.Conditions, metav1.Condition{
+			Type:   string(sandboxv1beta1.SandboxConditionSuspended),
+			Status: suspendedStatus,
+			Reason: suspendedReason,
+		})
+		meta.SetStatusCondition(&s.Status.Conditions, metav1.Condition{
+			Type:   string(sandboxv1beta1.SandboxConditionReady),
+			Status: readyStatus,
+			Reason: readyReason,
+		})
+		return s
+	}
+
+	statusWithConditions := func(conds ...metav1.Condition) *sandboxv1beta1.SandboxStatus {
+		st := &sandboxv1beta1.SandboxStatus{}
+		for _, c := range conds {
+			meta.SetStatusCondition(&st.Conditions, c)
+		}
+		return st
+	}
+
+	condSuspended := func(status metav1.ConditionStatus, reason string) metav1.Condition {
+		return metav1.Condition{
+			Type:   string(sandboxv1beta1.SandboxConditionSuspended),
+			Status: status,
+			Reason: reason,
+		}
+	}
+
+	condReady := func(status metav1.ConditionStatus, reason string) metav1.Condition {
+		return metav1.Condition{
+			Type:   string(sandboxv1beta1.SandboxConditionReady),
+			Status: status,
+			Reason: reason,
+		}
+	}
+
+	tests := []struct {
+		name                  string
+		seedSuspend           *lifecycleTimeEntry
+		seedResume            *lifecycleTimeEntry
+		sandbox               *sandboxv1beta1.Sandbox
+		oldStatus             *sandboxv1beta1.SandboxStatus
+		wantSuspendRequested  float64
+		wantSuspendTerminated float64
+		wantSuspendError      float64
+		wantSuspendLatencyObs int
+		wantSuspendEntryUID   types.UID
+		wantResumeRequested   float64
+		wantResumeReady       float64
+		wantResumeError       float64
+		wantResumeLatencyObs  int
+		wantResumeEntryUID    types.UID
+	}{
+		{
+			name:                 "suspend requested anchors timer and increments requested counter",
+			sandbox:              newSandbox(sandboxv1beta1.SandboxOperatingModeSuspended, metav1.ConditionFalse, sandboxv1beta1.SandboxReasonSuspendedPodTerminating, metav1.ConditionFalse, sandboxv1beta1.SandboxReasonSuspended),
+			oldStatus:            statusWithConditions(condSuspended(metav1.ConditionFalse, sandboxv1beta1.SandboxReasonNotSuspended), condReady(metav1.ConditionTrue, sandboxv1beta1.SandboxReasonDependenciesReady)),
+			wantSuspendRequested: 1,
+			wantSuspendEntryUID:  sandboxUID,
+		},
+		{
+			name:                  "suspend completion records pod_terminated and suspend latency after anchor",
+			seedSuspend:           &lifecycleTimeEntry{timestamp: time.Now().Add(-500 * time.Millisecond), uid: sandboxUID},
+			sandbox:               newSandbox(sandboxv1beta1.SandboxOperatingModeSuspended, metav1.ConditionTrue, sandboxv1beta1.SandboxReasonSuspendedPodTerminated, metav1.ConditionFalse, sandboxv1beta1.SandboxReasonSuspended),
+			oldStatus:             statusWithConditions(condSuspended(metav1.ConditionFalse, sandboxv1beta1.SandboxReasonSuspendedPodTerminating), condReady(metav1.ConditionFalse, sandboxv1beta1.SandboxReasonSuspended)),
+			wantSuspendTerminated: 1,
+			wantSuspendLatencyObs: 1,
+		},
+		{
+			name:                  "same-reconcile suspend request and pod_terminated skips ~0ms latency sample and clears timer",
+			sandbox:               newSandbox(sandboxv1beta1.SandboxOperatingModeSuspended, metav1.ConditionTrue, sandboxv1beta1.SandboxReasonSuspendedPodTerminated, metav1.ConditionFalse, sandboxv1beta1.SandboxReasonSuspended),
+			oldStatus:             statusWithConditions(condSuspended(metav1.ConditionFalse, sandboxv1beta1.SandboxReasonNotSuspended)),
+			wantSuspendRequested:  1,
+			wantSuspendTerminated: 1,
+		},
+		{
+			name:      "does not record suspend on fresh create with operatingMode=Suspended",
+			sandbox:   newSandbox(sandboxv1beta1.SandboxOperatingModeSuspended, metav1.ConditionTrue, sandboxv1beta1.SandboxReasonSuspendedPodTerminated, metav1.ConditionFalse, sandboxv1beta1.SandboxReasonSuspended),
+			oldStatus: statusWithConditions(),
+		},
+		{
+			name:                 "suspend error increments error counter",
+			sandbox:              newSandbox(sandboxv1beta1.SandboxOperatingModeSuspended, metav1.ConditionFalse, sandboxv1beta1.SandboxReasonSuspendedPodNotOwned, metav1.ConditionFalse, sandboxv1beta1.SandboxReasonSuspended),
+			oldStatus:            statusWithConditions(condSuspended(metav1.ConditionFalse, sandboxv1beta1.SandboxReasonNotSuspended)),
+			wantSuspendRequested: 1,
+			wantSuspendError:     1,
+			wantSuspendEntryUID:  sandboxUID,
+		},
+		{
+			name:                "counts suspend error at most once per anchored suspend across error reasons",
+			seedSuspend:         &lifecycleTimeEntry{timestamp: time.Now().Add(-time.Second), uid: sandboxUID, errorRecorded: true},
+			sandbox:             newSandbox(sandboxv1beta1.SandboxOperatingModeSuspended, metav1.ConditionUnknown, sandboxv1beta1.SandboxReasonSuspendedPodStateUnknown, metav1.ConditionFalse, sandboxv1beta1.SandboxReasonSuspended),
+			oldStatus:           statusWithConditions(condSuspended(metav1.ConditionFalse, sandboxv1beta1.SandboxReasonSuspendedPodNotOwned)),
+			wantSuspendEntryUID: sandboxUID,
+		},
+		{
+			name:                "anchors resume start when leaving Suspended=True, not yet Ready",
+			sandbox:             newSandbox(sandboxv1beta1.SandboxOperatingModeRunning, metav1.ConditionFalse, sandboxv1beta1.SandboxReasonNotSuspended, metav1.ConditionFalse, sandboxv1beta1.SandboxReasonDependenciesNotReady),
+			oldStatus:           statusWithConditions(condSuspended(metav1.ConditionTrue, sandboxv1beta1.SandboxReasonSuspendedPodTerminated)),
+			wantResumeRequested: 1,
+			wantResumeEntryUID:  sandboxUID,
+		},
+		{
+			name:                 "records resume ready and latency once Ready after an anchor",
+			seedResume:           &lifecycleTimeEntry{timestamp: time.Now().Add(-2 * time.Second), uid: sandboxUID},
+			sandbox:              newSandbox(sandboxv1beta1.SandboxOperatingModeRunning, metav1.ConditionFalse, sandboxv1beta1.SandboxReasonNotSuspended, metav1.ConditionTrue, sandboxv1beta1.SandboxReasonDependenciesReady),
+			oldStatus:            statusWithConditions(condSuspended(metav1.ConditionFalse, sandboxv1beta1.SandboxReasonNotSuspended), condReady(metav1.ConditionFalse, sandboxv1beta1.SandboxReasonDependenciesNotReady)),
+			wantResumeReady:      1,
+			wantResumeLatencyObs: 1,
+		},
+		{
+			name:                "same-reconcile resume request and Ready=True skips ~0ms latency sample and clears timer",
+			sandbox:             newSandbox(sandboxv1beta1.SandboxOperatingModeRunning, metav1.ConditionFalse, sandboxv1beta1.SandboxReasonNotSuspended, metav1.ConditionTrue, sandboxv1beta1.SandboxReasonDependenciesReady),
+			oldStatus:           statusWithConditions(condSuspended(metav1.ConditionTrue, sandboxv1beta1.SandboxReasonSuspendedPodTerminated)),
+			wantResumeRequested: 1,
+			wantResumeReady:     1,
+		},
+		{
+			name:      "does not anchor if prior Suspended condition was False (canceled suspend)",
+			sandbox:   newSandbox(sandboxv1beta1.SandboxOperatingModeRunning, metav1.ConditionFalse, sandboxv1beta1.SandboxReasonNotSuspended, metav1.ConditionFalse, sandboxv1beta1.SandboxReasonDependenciesNotReady),
+			oldStatus: statusWithConditions(condSuspended(metav1.ConditionFalse, sandboxv1beta1.SandboxReasonSuspendedPodTerminating)),
+		},
+		{
+			name:       "suspend clears an in-flight resume timer",
+			seedResume: &lifecycleTimeEntry{timestamp: time.Now(), uid: sandboxUID},
+			sandbox:    newSandbox(sandboxv1beta1.SandboxOperatingModeSuspended, metav1.ConditionFalse, sandboxv1beta1.SandboxReasonSuspendedPodTerminating, metav1.ConditionFalse, sandboxv1beta1.SandboxReasonSuspended),
+			oldStatus:  statusWithConditions(condSuspended(metav1.ConditionFalse, sandboxv1beta1.SandboxReasonSuspendedPodTerminating)),
+		},
+		{
+			name:               "does not consume or delete a resume entry belonging to a different UID",
+			seedResume:         &lifecycleTimeEntry{timestamp: time.Now().Add(-2 * time.Second), uid: types.UID("other-uid")},
+			sandbox:            newSandbox(sandboxv1beta1.SandboxOperatingModeRunning, metav1.ConditionFalse, sandboxv1beta1.SandboxReasonNotSuspended, metav1.ConditionTrue, sandboxv1beta1.SandboxReasonDependenciesReady),
+			oldStatus:          statusWithConditions(),
+			wantResumeEntryUID: types.UID("other-uid"),
+		},
+		{
+			name:               "records resume error when an in-flight resume hits ReconcilerError",
+			seedResume:         &lifecycleTimeEntry{timestamp: time.Now().Add(-time.Second), uid: sandboxUID},
+			sandbox:            newSandbox(sandboxv1beta1.SandboxOperatingModeRunning, metav1.ConditionFalse, sandboxv1beta1.SandboxReasonNotSuspended, metav1.ConditionFalse, sandboxv1beta1.SandboxReasonReconcilerError),
+			oldStatus:          statusWithConditions(condSuspended(metav1.ConditionFalse, sandboxv1beta1.SandboxReasonNotSuspended), condReady(metav1.ConditionFalse, sandboxv1beta1.SandboxReasonDependenciesNotReady)),
+			wantResumeError:    1,
+			wantResumeEntryUID: sandboxUID,
+		},
+		{
+			name:               "counts resume error at most once per anchored resume across error flaps",
+			seedResume:         &lifecycleTimeEntry{timestamp: time.Now().Add(-time.Second), uid: sandboxUID, errorRecorded: true},
+			sandbox:            newSandbox(sandboxv1beta1.SandboxOperatingModeRunning, metav1.ConditionFalse, sandboxv1beta1.SandboxReasonNotSuspended, metav1.ConditionFalse, sandboxv1beta1.SandboxReasonReconcilerError),
+			oldStatus:          statusWithConditions(condSuspended(metav1.ConditionFalse, sandboxv1beta1.SandboxReasonNotSuspended), condReady(metav1.ConditionFalse, sandboxv1beta1.SandboxReasonDependenciesNotReady)),
+			wantResumeEntryUID: sandboxUID,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			asmetrics.SandboxSuspendTotal.Reset()
+			asmetrics.SandboxSuspendLatency.Reset()
+			asmetrics.SandboxResumeTotal.Reset()
+			asmetrics.SandboxResumeLatency.Reset()
+
+			r := &SandboxReconciler{}
+			if tc.seedSuspend != nil {
+				r.suspendStartTimes.Store(key, *tc.seedSuspend)
+			}
+			if tc.seedResume != nil {
+				r.resumeStartTimes.Store(key, *tc.seedResume)
+			}
+
+			r.recordLifecycleMetrics(context.Background(), tc.oldStatus, tc.sandbox)
+
+			assert.InDelta(t, tc.wantSuspendRequested, testutil.ToFloat64(asmetrics.SandboxSuspendTotal.WithLabelValues(ns, tmpl, "SandboxClaim", "requested")), 0.001)
+			assert.InDelta(t, tc.wantSuspendTerminated, testutil.ToFloat64(asmetrics.SandboxSuspendTotal.WithLabelValues(ns, tmpl, "SandboxClaim", "pod_terminated")), 0.001)
+			assert.InDelta(t, tc.wantSuspendError, testutil.ToFloat64(asmetrics.SandboxSuspendTotal.WithLabelValues(ns, tmpl, "SandboxClaim", "error")), 0.001)
+			assert.Equal(t, tc.wantSuspendLatencyObs, testutil.CollectAndCount(asmetrics.SandboxSuspendLatency))
+
+			suspendEntry, _ := r.suspendStartTimes.Load(key)
+			assert.Equal(t, tc.wantSuspendEntryUID, suspendEntry.uid)
+
+			assert.InDelta(t, tc.wantResumeRequested, testutil.ToFloat64(asmetrics.SandboxResumeTotal.WithLabelValues(ns, tmpl, "SandboxClaim", "requested")), 0.001)
+			assert.InDelta(t, tc.wantResumeReady, testutil.ToFloat64(asmetrics.SandboxResumeTotal.WithLabelValues(ns, tmpl, "SandboxClaim", "ready")), 0.001)
+			assert.InDelta(t, tc.wantResumeError, testutil.ToFloat64(asmetrics.SandboxResumeTotal.WithLabelValues(ns, tmpl, "SandboxClaim", "error")), 0.001)
+			assert.Equal(t, tc.wantResumeLatencyObs, testutil.CollectAndCount(asmetrics.SandboxResumeLatency))
+
+			resumeEntry, _ := r.resumeStartTimes.Load(key)
+			assert.Equal(t, tc.wantResumeEntryUID, resumeEntry.uid)
+		})
+	}
+}
+
+func TestRecordLifecycleMetrics_FinishedAndExpired(t *testing.T) {
+	const name, ns, tmpl = "sb-terminal", "sb-ns", "my-tmpl"
+	key := types.NamespacedName{Name: name, Namespace: ns}
+
+	claimOwnerRef := []metav1.OwnerReference{{
+		APIVersion: extensionsv1beta1.GroupVersion.String(),
+		Kind:       extensionsv1beta1.SandboxClaimKind,
+		Name:       "test-claim",
+		Controller: new(true),
+	}}
+
+	t.Run("Finished transitions", func(t *testing.T) {
+		asmetrics.SandboxFinishedTotal.Reset()
+		r := &SandboxReconciler{}
+
+		sb := &sandboxv1beta1.Sandbox{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      name,
+				Namespace: ns,
+				UID:       sandboxUID,
+				Annotations: map[string]string{
+					sandboxv1beta1.SandboxTemplateRefAnnotation: tmpl,
+				},
+				OwnerReferences: claimOwnerRef,
+			},
+		}
+		meta.SetStatusCondition(&sb.Status.Conditions, metav1.Condition{
+			Type:   string(sandboxv1beta1.SandboxConditionFinished),
+			Status: metav1.ConditionTrue,
+			Reason: sandboxv1beta1.SandboxReasonPodSucceeded,
+		})
+
+		oldStatus := &sandboxv1beta1.SandboxStatus{}
+		r.recordLifecycleMetrics(context.Background(), oldStatus, sb)
+		require.InDelta(t, 1.0, testutil.ToFloat64(asmetrics.SandboxFinishedTotal.WithLabelValues(ns, tmpl, "SandboxClaim", "PodSucceeded")), 0.001)
+
+		// Repeating with identical Finished status must not double-count.
+		r.recordLifecycleMetrics(context.Background(), sb.Status.DeepCopy(), sb)
+		require.InDelta(t, 1.0, testutil.ToFloat64(asmetrics.SandboxFinishedTotal.WithLabelValues(ns, tmpl, "SandboxClaim", "PodSucceeded")), 0.001)
+
+		// Direct Sandbox (owned_by=None) ignores user-supplied template annotation.
+		directSB := sb.DeepCopy()
+		directSB.OwnerReferences = nil
+		r.recordLifecycleMetrics(context.Background(), oldStatus, directSB)
+		require.InDelta(t, 1.0, testutil.ToFloat64(asmetrics.SandboxFinishedTotal.WithLabelValues(ns, "unknown", "None", "PodSucceeded")), 0.001)
+	})
+
+	t.Run("Expired transitions clear timers and record policy", func(t *testing.T) {
+		asmetrics.SandboxExpiredTotal.Reset()
+		r := &SandboxReconciler{}
+		r.suspendStartTimes.Store(key, lifecycleTimeEntry{timestamp: time.Now(), uid: sandboxUID})
+		r.resumeStartTimes.Store(key, lifecycleTimeEntry{timestamp: time.Now(), uid: sandboxUID})
+
+		delPolicy := sandboxv1beta1.ShutdownPolicyDelete
+		sb := &sandboxv1beta1.Sandbox{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      name,
+				Namespace: ns,
+				UID:       sandboxUID,
+				Annotations: map[string]string{
+					sandboxv1beta1.SandboxTemplateRefAnnotation: tmpl,
+				},
+				OwnerReferences: claimOwnerRef,
+			},
+			Spec: sandboxv1beta1.SandboxSpec{
+				Lifecycle: sandboxv1beta1.Lifecycle{
+					ShutdownPolicy: &delPolicy,
+				},
+			},
+		}
+		meta.SetStatusCondition(&sb.Status.Conditions, metav1.Condition{
+			Type:   string(sandboxv1beta1.SandboxConditionReady),
+			Status: metav1.ConditionFalse,
+			Reason: sandboxv1beta1.SandboxReasonExpired,
+		})
+
+		oldStatus := &sandboxv1beta1.SandboxStatus{}
+		r.recordLifecycleMetrics(context.Background(), oldStatus, sb)
+		require.InDelta(t, 1.0, testutil.ToFloat64(asmetrics.SandboxExpiredTotal.WithLabelValues(ns, tmpl, "SandboxClaim", "Delete")), 0.001)
+
+		_, hasSuspend := r.suspendStartTimes.Load(key)
+		_, hasResume := r.resumeStartTimes.Load(key)
+		assert.False(t, hasSuspend)
+		assert.False(t, hasResume)
+
+		// Repeating with Reason=SandboxExpired already in oldStatus must not double-count.
+		r.recordLifecycleMetrics(context.Background(), sb.Status.DeepCopy(), sb)
+		require.InDelta(t, 1.0, testutil.ToFloat64(asmetrics.SandboxExpiredTotal.WithLabelValues(ns, tmpl, "SandboxClaim", "Delete")), 0.001)
+	})
+}
+
+func TestReconcile_CleanUpLifecycleTimersOnNotFoundAndDeletion(t *testing.T) {
+	key := types.NamespacedName{Name: "stale-sb", Namespace: "default"}
+
+	t.Run("NotFound", func(t *testing.T) {
+		fc := fake.NewClientBuilder().WithScheme(Scheme).Build()
+		r := &SandboxReconciler{
+			Client: fc,
+			Scheme: Scheme,
+			Tracer: asmetrics.NewNoOp(),
+		}
+		r.suspendStartTimes.Store(key, lifecycleTimeEntry{timestamp: time.Now(), uid: "stale-uid"})
+		r.resumeStartTimes.Store(key, lifecycleTimeEntry{timestamp: time.Now(), uid: "stale-uid"})
+
+		_, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: key})
+		require.NoError(t, err)
+
+		_, hasSuspend := r.suspendStartTimes.Load(key)
+		_, hasResume := r.resumeStartTimes.Load(key)
+		assert.False(t, hasSuspend, "expected suspendStartTimes entry to be deleted on NotFound")
+		assert.False(t, hasResume, "expected resumeStartTimes entry to be deleted on NotFound")
+	})
+
+	t.Run("DeletionTimestamp", func(t *testing.T) {
+		now := metav1.Now()
+		sb := &sandboxv1beta1.Sandbox{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:              key.Name,
+				Namespace:         key.Namespace,
+				UID:               "deleting-uid",
+				DeletionTimestamp: &now,
+				Finalizers:        []string{"test.agents.x-k8s.io/keep"},
+			},
+		}
+		fc := fake.NewClientBuilder().WithScheme(Scheme).WithObjects(sb).Build()
+		r := &SandboxReconciler{
+			Client: fc,
+			Scheme: Scheme,
+			Tracer: asmetrics.NewNoOp(),
+		}
+		r.suspendStartTimes.Store(key, lifecycleTimeEntry{timestamp: time.Now(), uid: sb.UID})
+		r.resumeStartTimes.Store(key, lifecycleTimeEntry{timestamp: time.Now(), uid: sb.UID})
+
+		_, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: key})
+		require.NoError(t, err)
+
+		_, hasSuspend := r.suspendStartTimes.Load(key)
+		_, hasResume := r.resumeStartTimes.Load(key)
+		assert.False(t, hasSuspend, "expected suspendStartTimes entry to be deleted on DeletionTimestamp")
+		assert.False(t, hasResume, "expected resumeStartTimes entry to be deleted on DeletionTimestamp")
+	})
+}
+
+func TestReconcile_LifecycleMetricsEndToEnd(t *testing.T) {
+	asmetrics.SandboxSuspendTotal.Reset()
+	asmetrics.SandboxSuspendLatency.Reset()
+	asmetrics.SandboxResumeTotal.Reset()
+	asmetrics.SandboxResumeLatency.Reset()
+	asmetrics.SandboxExpiredTotal.Reset()
+
+	const ns, tmpl = "default", "e2e-tmpl"
+	sandbox := &sandboxv1beta1.Sandbox{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "sandbox-e2e-metrics",
+			Namespace: ns,
+			UID:       sandboxUID,
+			Annotations: map[string]string{
+				sandboxv1beta1.SandboxTemplateRefAnnotation: tmpl,
+			},
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: extensionsv1beta1.GroupVersion.String(),
+				Kind:       extensionsv1beta1.SandboxClaimKind,
+				Name:       "e2e-claim",
+				Controller: new(true),
+			}},
+		},
+		Spec: sandboxv1beta1.SandboxSpec{
+			SandboxBlueprint: sandboxv1beta1.SandboxBlueprint{
+				PodTemplate: sandboxv1beta1.PodTemplate{
+					Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "test-container"}}},
+				},
+			},
+		},
+	}
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:            sandbox.Name,
+			Namespace:       sandbox.Namespace,
+			OwnerReferences: []metav1.OwnerReference{sandboxControllerRef(sandbox.Name)},
+		},
+		Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "test-container"}}},
+		Status: corev1.PodStatus{
+			Phase:      corev1.PodRunning,
+			PodIPs:     []corev1.PodIP{{IP: "10.244.0.1"}},
+			Conditions: []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}},
+		},
+	}
+
+	r := &SandboxReconciler{
+		Client: newFakeClient(sandbox, pod),
+		Scheme: Scheme,
+		Tracer: asmetrics.NewNoOp(),
+	}
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: sandbox.Name, Namespace: sandbox.Namespace}}
+
+	// 1. Initial Ready reconcile (cold create): no suspend/resume/expired metrics.
+	_, err := r.Reconcile(t.Context(), req)
+	require.NoError(t, err)
+	require.Equal(t, 0, testutil.CollectAndCount(asmetrics.SandboxResumeLatency))
+
+	// 2. Suspend requested: pass 1 deletes Pod and marks PodTerminating; pass 2 observes Pod gone -> PodTerminated.
+	live := &sandboxv1beta1.Sandbox{}
+	require.NoError(t, r.Get(t.Context(), req.NamespacedName, live))
+	live.Spec.OperatingMode = sandboxv1beta1.SandboxOperatingModeSuspended
+	require.NoError(t, r.Update(t.Context(), live))
+
+	_, err = r.Reconcile(t.Context(), req)
+	require.NoError(t, err)
+	require.InDelta(t, 1.0, testutil.ToFloat64(asmetrics.SandboxSuspendTotal.WithLabelValues(ns, tmpl, "SandboxClaim", "requested")), 0.001)
+	require.Equal(t, 0, testutil.CollectAndCount(asmetrics.SandboxSuspendLatency))
+
+	_, err = r.Reconcile(t.Context(), req)
+	require.NoError(t, err)
+	require.InDelta(t, 1.0, testutil.ToFloat64(asmetrics.SandboxSuspendTotal.WithLabelValues(ns, tmpl, "SandboxClaim", "pod_terminated")), 0.001)
+	require.Equal(t, 1, testutil.CollectAndCount(asmetrics.SandboxSuspendLatency))
+
+	// 3. Resume requested: pass 1 creates Pod (not Ready yet); pass 2 sees Pod Ready.
+	require.NoError(t, r.Get(t.Context(), req.NamespacedName, live))
+	live.Spec.OperatingMode = sandboxv1beta1.SandboxOperatingModeRunning
+	require.NoError(t, r.Update(t.Context(), live))
+
+	_, err = r.Reconcile(t.Context(), req)
+	require.NoError(t, err)
+	require.InDelta(t, 1.0, testutil.ToFloat64(asmetrics.SandboxResumeTotal.WithLabelValues(ns, tmpl, "SandboxClaim", "requested")), 0.001)
+	require.Equal(t, 0, testutil.CollectAndCount(asmetrics.SandboxResumeLatency))
+
+	createdPod := &corev1.Pod{}
+	require.NoError(t, r.Get(t.Context(), req.NamespacedName, createdPod))
+	createdPod.Status = corev1.PodStatus{
+		Phase:      corev1.PodRunning,
+		PodIPs:     []corev1.PodIP{{IP: "10.244.0.2"}},
+		Conditions: []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}},
+	}
+	require.NoError(t, r.Status().Update(t.Context(), createdPod))
+
+	_, err = r.Reconcile(t.Context(), req)
+	require.NoError(t, err)
+	require.InDelta(t, 1.0, testutil.ToFloat64(asmetrics.SandboxResumeTotal.WithLabelValues(ns, tmpl, "SandboxClaim", "ready")), 0.001)
+	require.Equal(t, 1, testutil.CollectAndCount(asmetrics.SandboxResumeLatency))
+
+	// 4. Sandbox expires -> SandboxExpired.
+	require.NoError(t, r.Get(t.Context(), req.NamespacedName, live))
+	past := metav1.NewTime(time.Now().Add(-time.Minute))
+	live.Spec.ShutdownTime = &past
+	require.NoError(t, r.Update(t.Context(), live))
+
+	_, err = r.Reconcile(t.Context(), req)
+	require.NoError(t, err)
+	require.InDelta(t, 1.0, testutil.ToFloat64(asmetrics.SandboxExpiredTotal.WithLabelValues(ns, tmpl, "SandboxClaim", "Retain")), 0.001)
+}
+
+func TestSandboxStaleStatusPatchConflictDroppedWithoutMetrics(t *testing.T) {
+	asmetrics.SandboxSuspendTotal.Reset()
+
+	sandbox := &sandboxv1beta1.Sandbox{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "sb-stale-status",
+			Namespace: "default",
+			UID:       sandboxUID,
+			Annotations: map[string]string{
+				sandboxv1beta1.SandboxPodNameAnnotation: "missing-legacy-pod",
+			},
+		},
+		Spec: sandboxv1beta1.SandboxSpec{
+			OperatingMode: sandboxv1beta1.SandboxOperatingModeSuspended,
+		},
+		Status: sandboxv1beta1.SandboxStatus{
+			Conditions: []metav1.Condition{{
+				Type:   string(sandboxv1beta1.SandboxConditionSuspended),
+				Status: metav1.ConditionFalse,
+				Reason: sandboxv1beta1.SandboxReasonNotSuspended,
+			}},
+		},
+	}
+
+	staleView := false
+	var staleSandbox *sandboxv1beta1.Sandbox
+	statusPatchAttempts := 0
+
+	fc := fake.NewClientBuilder().
+		WithScheme(Scheme).
+		WithRuntimeObjects(sandbox).
+		WithStatusSubresource(&sandboxv1beta1.Sandbox{}).
+		WithIndex(&corev1.Pod{}, podSandboxNameHashIndex, podSandboxNameHashIndexer).
+		WithInterceptorFuncs(interceptor.Funcs{
+			Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+				if sb, ok := obj.(*sandboxv1beta1.Sandbox); ok && key.Name == sandbox.Name && staleView {
+					staleSandbox.DeepCopyInto(sb)
+					return nil
+				}
+				return c.Get(ctx, key, obj, opts...)
+			},
+			SubResourcePatch: func(ctx context.Context, c client.Client, subResourceName string, obj client.Object, patch client.Patch, opts ...client.SubResourcePatchOption) error {
+				if _, ok := obj.(*sandboxv1beta1.Sandbox); ok && subResourceName == "status" {
+					statusPatchAttempts++
+				}
+				return c.SubResource(subResourceName).Patch(ctx, obj, patch, opts...)
+			},
+		}).
+		Build()
+
+	r := &SandboxReconciler{
+		Client: fc,
+		Scheme: Scheme,
+		Tracer: asmetrics.NewNoOp(),
+	}
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: sandbox.Name, Namespace: sandbox.Namespace}}
+
+	// Freeze the initial stale cache view (with SandboxPodNameAnnotation and old RV)
+	// before any reconcile writes land.
+	staleSandbox = &sandboxv1beta1.Sandbox{}
+	require.NoError(t, fc.Get(t.Context(), req.NamespacedName, staleSandbox))
+
+	// Pass 1 clears SandboxPodNameAnnotation (bumping RV), so its own status patch
+	// conflicts against the metadata write and is dropped without recording metrics.
+	_, err := r.Reconcile(t.Context(), req)
+	require.NoError(t, err)
+	require.Equal(t, 1, statusPatchAttempts)
+	require.InDelta(t, 0.0, testutil.ToFloat64(asmetrics.SandboxSuspendTotal.WithLabelValues("default", "unknown", "None", "requested")), 0.001)
+
+	// Pass 2 runs on the converged view (annotation cleared) and commits Suspended=True once.
+	_, err = r.Reconcile(t.Context(), req)
+	require.NoError(t, err)
+	require.Equal(t, 2, statusPatchAttempts)
+	require.InDelta(t, 1.0, testutil.ToFloat64(asmetrics.SandboxSuspendTotal.WithLabelValues("default", "unknown", "None", "requested")), 0.001)
+	require.InDelta(t, 1.0, testutil.ToFloat64(asmetrics.SandboxSuspendTotal.WithLabelValues("default", "unknown", "None", "pod_terminated")), 0.001)
+
+	// Pass 3 reads the frozen stale view (still carrying SandboxPodNameAnnotation).
+	// clearPodNameAnnotation patches metadata and refreshes sandbox.ResourceVersion
+	// mid-pass, but updateStatus pins its optimistic lock to oldResourceVersion, so
+	// the fake client rejects the status patch (409) without double-counting.
+	staleView = true
+	_, err = r.Reconcile(t.Context(), req)
+	require.NoError(t, err)
+	require.Equal(t, 3, statusPatchAttempts)
+	require.InDelta(t, 1.0, testutil.ToFloat64(asmetrics.SandboxSuspendTotal.WithLabelValues("default", "unknown", "None", "requested")), 0.001)
+	require.InDelta(t, 1.0, testutil.ToFloat64(asmetrics.SandboxSuspendTotal.WithLabelValues("default", "unknown", "None", "pod_terminated")), 0.001)
 }

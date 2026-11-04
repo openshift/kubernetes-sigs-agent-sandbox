@@ -1,0 +1,7 @@
+resources:
+- deployment.yaml
+- networkpolicy.yaml
+- pdb.yaml
+- rbac.yaml
+- service.yaml
+- serviceaccount.yaml

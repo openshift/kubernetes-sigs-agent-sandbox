@@ -1,0 +1,10 @@
+# ConfigMap for OpenShift service-ca CA bundle injection.
+# The service CA operator populates the service-ca.crt key automatically.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: agent-sandbox-serving-ca
+  namespace: agent-sandbox-system
+  annotations:
+    service.beta.openshift.io/inject-cabundle: "true"
+data: {}

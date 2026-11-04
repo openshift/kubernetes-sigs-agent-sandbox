@@ -10,20 +10,20 @@ It supports three connectivity modes: **Gateway** (Kubernetes Gateway API), **Po
 
 ## Architecture
 
-The client operates in three modes:
+The client operates in three connectivity modes:
 
-1. **Production (Gateway Mode):** Traffic flows from the Client -> Cloud Load Balancer (Gateway)
+1. **Gateway Mode:** Traffic flows from the Client -> Cloud Load Balancer (Gateway)
    -> Router Service -> Sandbox Pod. The client watches the Gateway resource for an external IP.
-2. **Development (Port-Forward Mode):** Traffic flows from the Client -> SPDY tunnel -> Router
-   Service -> Sandbox Pod. Uses `client-go/tools/portforward` natively, no `kubectl` required.
-3. **Advanced / Internal Mode:** The client connects directly to a provided `APIURL`, bypassing
+2. **Port-Forward Mode:** Traffic flows from the Client -> SPDY tunnel -> Router
+   Service -> Sandbox Pod. Uses `client-go/tools/portforward` natively, no `kubectl` required (ideal for local development and CI).
+3. **Direct URL Mode:** The client connects directly to a provided `APIURL`, bypassing
    discovery. Useful for in-cluster agents or custom domains.
 
 ## Prerequisites
 
 - A running Kubernetes cluster with a valid kubeconfig (or in-cluster config). This is required even in Direct URL mode because the client creates Kubernetes clientsets for SandboxClaim lifecycle management.
 - The [**Agent Sandbox Controller**](https://github.com/kubernetes-sigs/agent-sandbox?tab=readme-ov-file#installation) installed.
-- The **Sandbox Router** deployed in the target namespace (`sandbox-router-svc`).
+- The **Sandbox Router** deployed in the target namespace, or in another namespace named by `RouterNamespace` (see [sandbox-router](https://github.com/kubernetes-sigs/agent-sandbox/tree/main/sandbox-router/README.md) and its [deployment manifests](https://github.com/kubernetes-sigs/agent-sandbox/tree/main/sandbox-router/deploy)). *(Note: If you are using a specific tagged release, replace `main` in these URLs with your version tag.)*
 - A `SandboxWarmPool` created in the target namespace.
 - Go 1.26+.
 
@@ -33,9 +33,24 @@ The client operates in three modes:
 go get sigs.k8s.io/agent-sandbox/clients/go/sandbox
 ```
 
+## Versioning and Releases
+
+The Go SDK is currently published from the repository's root Go module.
+That means repository tags such as `v0.1.0` are also the SDK versions for:
+
+```bash
+go get sigs.k8s.io/agent-sandbox/clients/go/sandbox@v0.1.0
+```
+
+To follow the most recent repository release, use:
+
+```bash
+go get sigs.k8s.io/agent-sandbox/clients/go/sandbox@latest
+```
+
 ## Usage Examples
 
-### 1. Production Mode (Gateway)
+### 1. Gateway Mode
 
 Use this when running against a cluster with a public Gateway IP. The client automatically
 discovers the Gateway address.
@@ -56,7 +71,7 @@ if err != nil { log.Fatal(err) }
 fmt.Println(result.Stdout)
 ```
 
-### 2. Developer Mode (Port-Forward)
+### 2. Port-Forward Mode
 
 Use this for local development or CI. If you omit `GatewayName` and `APIURL`, the client
 automatically establishes an SPDY port-forward tunnel to the Router Service.
@@ -74,7 +89,7 @@ if err != nil { log.Fatal(err) }
 fmt.Println(result.Stdout)
 ```
 
-### 3. Advanced / Internal Mode
+### 3. Direct URL Mode
 
 Use `APIURL` to bypass discovery entirely. Useful for:
 
@@ -113,14 +128,145 @@ client, err := sandbox.NewClient(ctx, sandbox.Options{
 // Paths like "dir/script.py" are rejected with an error.
 err := sb.Write(ctx, "script.py", []byte("print('hello')"))
 
+// Stream a large file without buffering it in memory. Streaming uploads use
+// one request attempt because an io.Reader cannot generally be replayed.
+// Legacy runtime uploads use HTTP chunked transfer encoding, so the runtime
+// and any proxy in front of it must accept requests without Content-Length.
+// (The example requires imports for os and log.)
+file, err := os.Open("model.bin")
+if err != nil { log.Fatal(err) }
+defer file.Close()
+if err := sb.WriteReader(ctx, "model.bin", file); err != nil {
+    log.Fatal(err)
+}
+
 // Read a file
 data, err := sb.Read(ctx, "script.py")
 
+// Stream a large download into a caller-owned destination. ReadTo never closes
+// the destination and writes at most MaxDownloadSize bytes.
+download, err := os.Create("model-copy.bin")
+if err != nil { log.Fatal(err) }
+defer download.Close()
+written, err := sb.ReadTo(ctx, "model.bin", download)
+if err != nil { log.Fatal(err) }
+fmt.Printf("downloaded %d bytes\n", written)
+
 // Check existence
 exists, err := sb.Exists(ctx, "script.py")
+
+// Create a directory, rename a file, and copy it (sandboxd runtime only)
+err = sb.Mkdir(ctx, "out/logs", true) // parents
+if err != nil { log.Fatal(err) }
+err = sb.Move(ctx, "script.py", "out/script.py", false) // overwrite
+if err != nil { log.Fatal(err) }
+err = sb.Copy(ctx, "out/script.py", "backup.py", false)
+if err != nil { log.Fatal(err) }
 ```
 
-`Run()` responses are capped at 16 MB; `List()`/`Exists()` at 8 MB.
+`Move()` and `Copy()` do not retry unless you pass `WithMaxAttempts`, because a
+repeat after a lost response fails.
+
+`Read()` and `ReadTo()` responses are capped by `MaxDownloadSize` (256 MB by
+default). `Run()` responses are capped at 16 MB; `List()`/`Exists()` at 8 MB.
+
+### Runtime Health and Metadata
+
+With `RuntimeSandboxd`, query the in-sandbox daemon. The legacy runtime returns
+`ErrUnsupportedByRuntime`. Neither call retries unless you pass
+`WithMaxAttempts`.
+
+```go
+health, err := sb.Health(ctx)   // health.Status, health.UptimeSeconds
+meta, err := sb.Metadata(ctx)   // meta.Env (non-sensitive, SANDBOX_-prefixed by default)
+```
+
+### Streaming Commands (sandboxd)
+
+`sb.Commands().Start` runs a command with the same shell-string semantics as
+`Run` (`/bin/sh -c`), but lets you read output before the command exits. It needs
+`RuntimeSandboxd` and a gRPC connection established through pod port-forward,
+`ConnectivityRouterPortForward`, or in-cluster connectivity. The legacy runtime
+and a REST-only `APIURL` return `ErrUnsupportedByRuntime`. This does not add a
+Gateway+sandboxd connection mode.
+
+The example assumes `sb` is already open with `RuntimeSandboxd`. Import
+`context`, `io`, `os`, `time`, and the `sandbox` SDK package:
+
+```go
+func streamCommand(ctx context.Context, sb *sandbox.Sandbox) (int, error) {
+    handle, err := sb.Commands().Start(ctx,
+        "echo starting; sleep 1; echo done",
+        sandbox.WithTimeout(10*time.Minute))
+    if err != nil { return 0, err }
+    defer handle.Close()
+
+    exitCode := 0
+    for {
+        event, err := handle.Recv()
+        if err == io.EOF { return exitCode, nil }
+        if err != nil { return 0, err }
+        switch event.Type {
+        case sandbox.ProcessEventStdout:
+            if _, err := os.Stdout.Write(event.Data); err != nil { return 0, err }
+        case sandbox.ProcessEventStderr:
+            if _, err := os.Stderr.Write(event.Data); err != nil { return 0, err }
+        case sandbox.ProcessEventExit:
+            exitCode = event.ExitCode
+        }
+    }
+}
+```
+
+`Start` waits for the daemon's initial process ID, not the first output. A short
+command may already have exited by then. `ProcessID()` is a daemon-local virtual
+ID, not an OS PID or a durable identity across daemon restarts.
+
+Output events contain raw byte chunks, not necessarily complete lines or valid
+UTF-8. stdout and stderr remain separate and have no guaranteed global ordering;
+the SDK does not accumulate output. A nonzero exit code is a command result,
+not an SDK error. Continue reading **after the exit event to `io.EOF`** to check
+the final RPC status. Missing required events are protocol errors, and wrapped
+gRPC errors retain their status code.
+
+The caller context and a positive `WithTimeout` bound the **whole stream**,
+including startup. `Start` does not apply the default `RequestTimeout` and does
+not have a separate startup-only timeout. Close the handle or cancel its context
+when you stop reading; `Close` is idempotent and cancels only this session, not
+the shared connection or SandboxClaim. A nil Close error is local cleanup, not
+confirmation that the remote process has already been killed. This is not detach.
+
+To request graceful shutdown from another goroutine, keep the Start context
+alive and give the signal RPC its own bounded context:
+
+```go
+signalCtx, cancelSignal := context.WithTimeout(ctx, 5*time.Second)
+defer cancelSignal()
+err := handle.SendSignal(signalCtx, sandbox.SignalSIGTERM)
+```
+
+Only `SignalSIGINT`, `SignalSIGTERM`, and `SignalSIGKILL` are supported.
+Signal success is not an exit acknowledgement; continue the original receive
+loop through Exit + EOF. Signal failures, or cancelling only `signalCtx`, do not
+cancel that loop. SIGINT/SIGTERM may be trapped or ignored: the original process
+deadline or `Close` provides a final cancellation boundary. Do not cancel Start
+before trying to send a graceful-stop signal. The handle uses its original
+connection and process identity even if the Sandbox later reconnects.
+
+Each handle permits one active `Recv`; a concurrent second call returns
+`ErrConcurrentRecv` without ending the session. Signals and Close may run
+concurrently with the receive loop. Explicit cancellation, timeout, handle Close,
+and the parent Sandbox's Close/Disconnect release session resources even if
+nobody calls Recv again. Parent Close still deletes the claim; Disconnect does
+not. The SDK does not read, drain or discard output in the background, so a
+caller that stops consuming without cancelling can retain resources and block
+the process through backpressure. Unconsumed ordinary EOF or transport faults
+are not guaranteed to be discovered automatically.
+
+`Start` never retries non-idempotent process creation and rejects
+`WithMaxAttempts(n)` when `n > 1`. Transport attempts before a request reaches
+the service are not a guarantee of repeated command execution. stdin, PTY,
+reattachment, and automatic process recreation are not provided by this API.
 
 ### 5. Custom TLS / Transport
 
@@ -153,6 +299,23 @@ for _, key := range client.ListActiveSandboxes() {
 
 // Re-attach to existing sandbox by claim name
 sb, _ := client.GetSandbox(ctx, sb1.ClaimName(), "default")
+
+// Label the claims a client creates (Options.Labels), then list by label
+labeled, err := sandbox.NewClient(ctx, sandbox.Options{Labels: map[string]string{"app": "agent"}})
+if err != nil { log.Fatal(err) }
+defer labeled.DeleteAll(ctx)
+
+sb3, err := labeled.CreateSandbox(ctx, "python-pool", "default")
+if err != nil { log.Fatal(err) }
+
+names, err := labeled.ListAllSandboxes(ctx, "default", sandbox.WithLabelSelector("app=agent"))
+if err != nil { log.Fatal(err) }
+fmt.Println(names) // includes sb3.ClaimName()
+
+// Expire claims on their own (Options.ShutdownAfter)
+ttl, err := sandbox.NewClient(ctx, sandbox.Options{ShutdownAfter: time.Hour})
+if err != nil { log.Fatal(err) }
+defer ttl.DeleteAll(ctx)
 ```
 
 ## Configuration
@@ -161,25 +324,68 @@ All options are documented on the `Options` struct in
 [options.go](sandbox/options.go). Key fields:
 
 - `WarmPoolName`: passed per-sandbox to `CreateSandbox`.
+- `Env`: environment variables to inject into the `SandboxClaim`. Setting this
+  forces a cold start from the warm pool template instead of adopting a
+  pre-warmed pod, which may increase startup latency.
+- `Labels`: labels added to every `SandboxClaim` the client creates.
+- `ShutdownAfter`: expire every claim this client creates after this long, so a
+  crashed client does not leak sandboxes. Unset by default (no expiry).
+- `Connectivity`: `port-forward` (default), `router-port-forward`,
+  `in-cluster-service`, or `in-cluster-pod-ip`. `router-port-forward`
+  port-forwards the sandbox-router, which proxies sandboxd's REST and gRPC
+  APIs. gRPC (`Run`, `Start`, and watchers) needs sandbox-router v1.0.9 or
+  later. It cannot reach sandboxd when authentication is enabled because the
+  router strips `Authorization` (see #2102), and the router's `ProxyTimeout`
+  caps each REST request. Set `DisablePodIPRouting: true` to route by cache or
+  DNS instead of a stored pod IP when the router has `--cache-enabled` or the
+  Sandbox has a headless Service.
+- `RouterNamespace`: namespace of `sandbox-router-svc` for the port-forward
+  modes that go through the router. Defaults to the claim namespace. Set it to
+  `agent-sandbox-system` when using the shipped router manifests, which deploy
+  the router there.
 - `GatewayName`: set to enable Gateway mode.
 - `APIURL`: set for Direct URL mode (takes precedence over `GatewayName`).
 - `TracerProvider`: OpenTelemetry integration.
 
-Any operation accepts `WithTimeout` to override the default request timeout,
-or `WithMaxAttempts` to control retry behavior:
+Operations accept `WithTimeout` for a total operation timeout. HTTP operations
+override their default request timeout; sandboxd gRPC commands use the caller
+context unless an explicit timeout is supplied. Retry options depend on the
+operation: in particular, streaming `Start` rejects attempts greater than one.
 
 ```go
 result, err := client.Run(ctx, "make build", sandbox.WithTimeout(10*time.Minute))
+```
+
+`Run` and `Commands.Start` also take `WithEnv` and `WithWorkingDir`
+(RuntimeSandboxd only; the legacy runtime returns `ErrUnsupportedByRuntime`).
+`WithEnv` is merged over the sandbox's environment, and the directory is relative
+to the sandbox root:
+
+```go
+result, err := client.Run(ctx, "make build",
+    sandbox.WithEnv(map[string]string{"CI": "1"}),
+    sandbox.WithWorkingDir("project"))
 ```
 
 ## Retry Behavior
 
 File operations (`Read`, `Write`, `List`, `Exists`) are automatically retried (up to
 6 attempts) on 500/502/503/504 responses and connection errors with exponential backoff.
+`WriteReader` streams from an `io.Reader` with a single request attempt because a
+reader cannot generally be replayed safely after a partial upload. Passing
+`WithMaxAttempts(n)` with `n > 1` returns an error rather than silently reducing
+the operation to a single attempt.
+
+`ReadTo` can retry before a successful response begins. Once response bytes have
+been written to the destination, a body-read or destination-write failure is
+returned without retrying because the destination cannot generally be rewound.
+The caller owns the destination and should decide whether to keep or remove any
+partially written data.
 
 **Important:** `Run()` defaults to a single attempt (no retries) because command
-execution is not idempotent. Use `WithMaxAttempts` to opt in to retries for
-idempotent commands:
+execution is not idempotent. On the legacy runtime, use `WithMaxAttempts` to opt
+in to retries for idempotent commands; sandboxd `Run` always sends one Execute
+RPC. Streaming `Commands.Start` rejects attempts greater than one:
 
 ```go
 result, err := client.Run(ctx, "cat /etc/hostname", sandbox.WithMaxAttempts(6))
@@ -222,8 +428,8 @@ if err := client.Open(ctx); err != nil { ... }
 | `CleanupTimeout` | 30 s | Claim deletion during rollback / Close |
 | `RequestTimeout` | 180 s | Total timeout per SDK method call (Run, Read, …) |
 | `PerAttemptTimeout` | 60 s | Time to receive response headers per attempt |
-| `MaxUploadSize` | 256 MB | Maximum content size for `Write()` |
-| `MaxDownloadSize` | 256 MB | Maximum response body size for `Read()` |
+| `MaxUploadSize` | 256 MB | Maximum content size for `Write()` and `WriteReader()` |
+| `MaxDownloadSize` | 256 MB | Maximum response body size for `Read()` and `ReadTo()` |
 
 ## Port-Forward Recovery
 
@@ -267,11 +473,18 @@ Calling `Open()` on a client with an orphaned claim returns `ErrOrphanedClaim`.
 | `ErrAlreadyOpen` | `Open()` called on an already-open client. Call `Close()` first. |
 | `ErrOrphanedClaim` | A previous claim could not be cleaned up (failed `Close()`, failed `Open()` rollback, or sandbox disappeared during reconnect); call `Close()` to retry deletion. |
 | `ErrTimeout` | Sandbox or Gateway did not become ready within the configured timeout. |
-| `ErrClaimFailed` | SandboxClaim creation was rejected by the API server. |
+| `ErrClaimFailed` | SandboxClaim creation was rejected by the API server, or the claim reported a failure the controller does not retry (for example `InvalidMetadata` or `ClaimExpired`). |
+| `ErrWarmPoolNotFound` | The claim's SandboxWarmPool does not exist. |
+| `ErrTemplateNotFound` | The SandboxTemplate behind the warm pool does not exist. |
 | `ErrPortForwardDied` | The SPDY tunnel dropped. Call `Open()` to reconnect. |
 | `ErrRetriesExhausted` | All HTTP retry attempts failed. |
 | `ErrSandboxDeleted` | The Sandbox was deleted before becoming ready. |
 | `ErrGatewayDeleted` | The Gateway was deleted during address discovery. |
+| `ErrProcessProtocol` | A streaming command returned invalid events or ended without the required Init/Exit. Missing-event EOF also matches `io.ErrUnexpectedEOF`. |
+| `ErrConcurrentRecv` | Another receive call is active on this process handle; the session remains open. |
+
+Streaming RPC and signal failures preserve their gRPC status code through
+wrapping; inspect them with `status.Code(err)` from `google.golang.org/grpc/status`.
 
 Non-OK HTTP responses are wrapped in `*HTTPError`, which can be extracted
 with `errors.As` to inspect the status code:

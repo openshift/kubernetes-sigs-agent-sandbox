@@ -12,8 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import io
 import os
-from test.e2e.clients.python.framework.context import TestContext
+import tempfile
 
 import pytest
 import yaml
@@ -23,136 +24,12 @@ from k8s_agent_sandbox.models import (
     SandboxLocalTunnelConnectionConfig,
 )
 
-TEST_MANIFESTS_DIR = "test/e2e/clients/python/test_manifests"
-TEMPLATE_YAML_PATH = os.path.join(TEST_MANIFESTS_DIR, "sandbox_template.yaml")
-WARMPOOL_YAML_PATH = os.path.join(TEST_MANIFESTS_DIR, "sandbox_warmpool.yaml")
-
-ROUTER_YAML_PATH = (
-    "clients/python/agentic-sandbox-client/sandbox-router/sandbox_router.yaml"
+from test.e2e.clients.python.framework.context import TestContext
+from test.e2e.clients.python.framework.sdk_helpers import (
+    GATEWAY_NAME,
+    run_sdk_tests,
+    wait_until_sandbox_routable,
 )
-GATEWAY_YAML_PATH = (
-    "clients/python/agentic-sandbox-client/gateway-kind/gateway-kind.yaml"
-)
-GATEWAY_NAME = "kind-gateway"
-
-
-@pytest.fixture(scope="module")
-def tc():
-    """Provides the required kubernetes api for E2E tests"""
-    context = TestContext()
-    yield context
-
-
-@pytest.fixture(scope="function")
-def temp_namespace(tc):
-    """Creates and yields a temporary namespace for testing"""
-    namespace = tc.create_temp_namespace(prefix="py-sdk-e2e-")
-    yield namespace
-    tc.delete_namespace(namespace)
-
-
-def get_image_tag(env_var="IMAGE_TAG", default="latest"):
-    """Retrieves the image tag from environment variable or returns default"""
-    return os.environ.get(env_var, default)
-
-
-def get_image_prefix(env_var="IMAGE_PREFIX", default="kind.local/"):
-    """Retrieves the image prefix from environment variable or returns default"""
-    return os.environ.get(env_var, default)
-
-
-@pytest.fixture(scope="function")
-def deploy_router(tc, temp_namespace):
-    """Deploys the sandbox router into the test namespace"""
-    image_tag = get_image_tag()
-    image_prefix = get_image_prefix()
-    router_image = "{}sandbox-router:{}".format(image_prefix, image_tag)
-    print(f"Using router image: {router_image}")
-
-    with open(ROUTER_YAML_PATH, "r") as f:
-        manifest = f.read().replace("${ROUTER_IMAGE}", router_image)
-        # Enable unauthenticated mode for local E2E test execution
-        manifest = manifest.replace('value: "false"', 'value: "true"')
-
-    print(f"Applying router manifest to namespace: {temp_namespace}")
-    tc.apply_manifest_text(manifest, namespace=temp_namespace)
-
-    print("Waiting for router deployment to be ready...")
-    tc.wait_for_deployment_ready("sandbox-router-deployment", namespace=temp_namespace)
-
-
-@pytest.fixture(scope="function")
-def deploy_gateway(tc, temp_namespace):
-    """Deploys the sandbox gateway into the test namespace"""
-    with open(GATEWAY_YAML_PATH, "r") as f:
-        manifest = f.read()
-
-    print(f"Applying gateway manifest to namespace: {temp_namespace}")
-    tc.apply_manifest_text(manifest, namespace=temp_namespace)
-    print("Waiting for gateway to get an address...")
-    tc.wait_for_gateway_address(GATEWAY_NAME, namespace=temp_namespace)
-
-
-@pytest.fixture(scope="function")
-def sandbox_template(tc, temp_namespace):
-    """Deploys the sandbox template into the test namespace"""
-    image_tag = get_image_tag()
-    image_prefix = get_image_prefix()
-    with open(TEMPLATE_YAML_PATH, "r") as f:
-        manifest = f.read().format(image_prefix=image_prefix, image_tag=image_tag)
-    tc.apply_manifest_text(manifest, namespace=temp_namespace)
-    return "python-sdk-test-template"
-
-
-@pytest.fixture(scope="function")
-def sandbox_warmpool(tc, temp_namespace, sandbox_template):
-    """Deploys the sandbox warmpool into the test namespace"""
-    with open(WARMPOOL_YAML_PATH, "r") as f:
-        manifest = f.read()
-    tc.apply_manifest_text(manifest, namespace=temp_namespace)
-    print("Warmpool manifest applied.")
-
-    tc.wait_for_warmpool_ready("python-sdk-warmpool", namespace=temp_namespace)
-    print("Warmpool is ready.")
-    return "python-sdk-warmpool"
-
-
-@pytest.fixture(scope="function")
-def sandbox_coldpool(tc, temp_namespace, sandbox_template):
-    """Deploys a zero-replica sandbox warmpool for cold start tests"""
-    manifest = f"""apiVersion: extensions.agents.x-k8s.io/v1beta1
-kind: SandboxWarmPool
-metadata:
-  name: python-sdk-coldpool
-spec:
-  replicas: 0
-  sandboxTemplateRef:
-    name: {sandbox_template}
-"""
-    tc.apply_manifest_text(manifest, namespace=temp_namespace)
-    print("Coldpool manifest applied.")
-    return "python-sdk-coldpool"
-
-
-def run_sdk_tests(sandbox):
-    """Runs basic SDK operations to validate functionality"""
-    # Test execution
-    result = sandbox.commands.run("echo 'Hello from SDK'")
-    print(f"Run result: {result}")
-    assert result.stdout == "Hello from SDK\n", f"Unexpected stdout: {result.stdout}"
-    assert result.stderr == "", f"Unexpected stderr: {result.stderr}"
-    assert result.exit_code == 0, f"Unexpected exit code: {result.exit_code}"
-
-    # Test File Write / Read
-    file_content = "This is a test file."
-    file_path = "test.txt"  # Relative path inside the sandbox
-    print(f"Writing content to '{file_path}'...")
-    sandbox.files.write(file_path, file_content)
-
-    print(f"Reading content from '{file_path}'...")
-    read_content = sandbox.files.read(file_path).decode("utf-8")
-    print(f"Read content: '{read_content}'")
-    assert read_content == file_content, f"File content mismatch: {read_content}"
 
 
 def test_python_sdk_router_mode(tc, temp_namespace, sandbox_template, deploy_router, sandbox_coldpool):
@@ -170,6 +47,54 @@ def test_python_sdk_router_mode(tc, temp_namespace, sandbox_template, deploy_rou
 
     except Exception as e:
         pytest.fail(f"SDK test without warmpool failed: {e}")
+    finally:
+        client.delete_all()
+
+
+def test_python_sdk_annotation(tc, temp_namespace, sandbox_coldpool):
+    """Tests that the Python SDK creates SandboxClaim with correct annotation."""
+    from datetime import datetime
+    from k8s_agent_sandbox.constants import (
+        CLIENT_REQUEST_TIME_ANNOTATION,
+        CLAIM_API_GROUP,
+        CLAIM_API_VERSION,
+        CLAIM_PLURAL_NAME,
+    )
+
+    client = SandboxClient()
+    try:
+        sandbox = client.create_sandbox(
+            warmpool=sandbox_coldpool,
+            namespace=temp_namespace,
+        )
+
+        custom_objects_api = tc.get_custom_objects_api()
+        claim = custom_objects_api.get_namespaced_custom_object(
+            group=CLAIM_API_GROUP,
+            version=CLAIM_API_VERSION,
+            namespace=temp_namespace,
+            plural=CLAIM_PLURAL_NAME,
+            name=sandbox.claim_name,
+        )
+
+        annotations = claim.get("metadata", {}).get("annotations", {})
+        print(f"Annotations: {annotations}")
+
+        assert CLIENT_REQUEST_TIME_ANNOTATION in annotations, (
+            f"Expected annotation '{CLIENT_REQUEST_TIME_ANNOTATION}' missing"
+        )
+
+        timestamp_str = annotations[CLIENT_REQUEST_TIME_ANNOTATION]
+        print(f"Timestamp: {timestamp_str}")
+
+        try:
+            dt = datetime.fromisoformat(timestamp_str)
+            assert dt.tzname() == "UTC", "Timestamp should be in UTC"
+        except ValueError as e:
+            pytest.fail(f"Failed to parse timestamp '{timestamp_str}': {e}")
+
+        print("--- SandboxClaim Annotation Test Passed! ---")
+
     finally:
         client.delete_all()
 
@@ -196,9 +121,14 @@ def test_python_sdk_router_mode_warmpool(
 
 
 def test_python_sdk_gateway_mode(
-    tc, temp_namespace, sandbox_template, deploy_router, deploy_gateway, sandbox_coldpool
+    tc,
+    temp_namespace,
+    sandbox_template,
+    deploy_router,
+    deploy_gateway,
+    sandbox_coldpool,
 ):
-    """Tests the Python SDK in Production mode (with Gateway and Router) without warmpool."""
+    """Tests the Python SDK in Gateway mode (with Gateway and Router) without warmpool."""
     config = SandboxGatewayConnectionConfig(
         gateway_name=GATEWAY_NAME,
         gateway_namespace=temp_namespace,
@@ -227,7 +157,7 @@ def test_python_sdk_gateway_mode_warmpool(
     sandbox_warmpool,
     deploy_gateway,
 ):
-    """Tests the Python SDK in Production mode (with gateway and router) with warmpool."""
+    """Tests the Python SDK in Gateway mode (with gateway and router) with warmpool."""
     config = SandboxGatewayConnectionConfig(
         gateway_name=GATEWAY_NAME,
         gateway_namespace=temp_namespace,
@@ -244,5 +174,108 @@ def test_python_sdk_gateway_mode_warmpool(
 
     except Exception as e:
         pytest.fail(f"SDK test with warmpool failed: {e}")
+    finally:
+        client.delete_all()
+
+
+def test_python_sdk_volume_claim_templates(
+    tc, temp_namespace, sandbox_template, deploy_router, sandbox_warmpool
+):
+    """Tests volume claim template propagation and operation in the Python SDK."""
+    storage_class = os.getenv("SANDBOX_TEST_STORAGE_CLASS")
+    custom_vcts = [
+        {
+            "metadata": {"name": "custom-workspace"},
+            "spec": {
+                "accessModes": ["ReadWriteOnce"],
+                "resources": {"requests": {"storage": "1Gi"}},
+            },
+        }
+    ]
+    if storage_class:
+        custom_vcts[0]["spec"]["storageClassName"] = storage_class
+
+    config = SandboxLocalTunnelConnectionConfig(router_namespace=temp_namespace)
+    client = SandboxClient(connection_config=config)
+    try:
+        sandbox = client.create_sandbox(
+            warmpool=sandbox_warmpool,
+            namespace=temp_namespace,
+            volume_claim_templates=custom_vcts,
+        )
+
+        # Verify that volumeClaimTemplates was propagated to the SandboxClaim spec
+        print("Verifying SandboxClaim spec.volumeClaimTemplates...")
+        claim_res = client.k8s_helper.get_sandbox_claim(
+            sandbox.claim_name, temp_namespace
+        )
+        assert claim_res is not None, f"SandboxClaim {sandbox.claim_name} should exist"
+        claim_spec = claim_res.get("spec", {})
+        claim_vcts = claim_spec.get("volumeClaimTemplates", [])
+        assert len(claim_vcts) == 1, (
+            f"Expected 1 volumeClaimTemplate on SandboxClaim, got {len(claim_vcts)}"
+        )
+        assert claim_vcts[0].get("metadata", {}).get("name") == "custom-workspace", (
+            "Volume claim template name mismatch in SandboxClaim"
+        )
+
+        # Verify that volumeClaimTemplates was propagated to the Sandbox spec
+        print("Verifying Sandbox spec.volumeClaimTemplates...")
+        sandbox_res = client.k8s_helper.get_sandbox(sandbox.sandbox_id, temp_namespace)
+        assert sandbox_res is not None, f"Sandbox {sandbox.sandbox_id} should exist"
+        sandbox_spec = sandbox_res.get("spec", {})
+        sandbox_vcts = sandbox_spec.get("volumeClaimTemplates", [])
+
+        # Verify that our custom volume claim template exists in Sandbox spec.volumeClaimTemplates
+        custom_vct = next(
+            (
+                v
+                for v in sandbox_vcts
+                if v.get("metadata", {}).get("name") == "custom-workspace"
+            ),
+            None,
+        )
+        assert custom_vct is not None, (
+            "Custom volume claim template 'custom-workspace' not found in Sandbox spec"
+        )
+        assert custom_vct.get("spec", {}).get("accessModes") == ["ReadWriteOnce"], (
+            "Volume claim template accessModes mismatch in Sandbox"
+        )
+        if storage_class:
+            assert (
+                custom_vct.get("spec", {}).get("storageClassName") == storage_class
+            ), "Volume claim template storageClassName mismatch in Sandbox"
+        assert (
+            custom_vct.get("spec", {})
+            .get("resources", {})
+            .get("requests", {})
+            .get("storage")
+            == "1Gi"
+        ), "Volume claim template storage request mismatch in Sandbox"
+
+        # Verify that the PersistentVolumeClaim resource was created with the expected properties
+        print("Verifying PVC creation in cluster...")
+        pvc_name = f"custom-workspace-{sandbox.sandbox_id}"
+        pvc_res = client.k8s_helper.core_v1_api.read_namespaced_persistent_volume_claim(
+            pvc_name, temp_namespace
+        )
+        assert pvc_res is not None, f"PVC {pvc_name} should exist"
+        assert pvc_res.spec.resources.requests is not None
+        assert pvc_res.spec.resources.requests.get("storage") == "1Gi", (
+            "PVC storage request mismatch in cluster"
+        )
+        if storage_class:
+            assert pvc_res.spec.storage_class_name == storage_class, (
+                "PVC storageClassName mismatch in cluster"
+            )
+
+        print("Running command to verify sandbox is operational...")
+        wait_until_sandbox_routable(sandbox)
+        res = sandbox.commands.run("df -h")
+        print(f"Disk space output:\n{res.stdout}")
+        assert res.exit_code == 0, (
+            f"Command df -h failed with exit code {res.exit_code}: {res.stderr}"
+        )
+
     finally:
         client.delete_all()

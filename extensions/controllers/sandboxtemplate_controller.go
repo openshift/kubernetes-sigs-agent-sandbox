@@ -58,6 +58,7 @@ func (r *SandboxTemplateReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		if k8errors.IsNotFound(err) {
 			return ctrl.Result{}, nil
 		}
+		asmetrics.RecordTemplateReconcileError(req.Namespace, asmetrics.ClassifyReconcileError(err, asmetrics.ReasonOther))
 		return ctrl.Result{}, fmt.Errorf("failed to get sandbox template %q: %w", req.NamespacedName, err)
 	}
 
@@ -65,6 +66,7 @@ func (r *SandboxTemplateReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 	defer end()
 
 	if err := r.ensureTemplateRefHashLabel(ctx, template); err != nil {
+		asmetrics.RecordTemplateReconcileError(template.Namespace, asmetrics.ClassifyReconcileError(err, asmetrics.ReasonOther))
 		return ctrl.Result{}, err
 	}
 
@@ -83,14 +85,22 @@ func (r *SandboxTemplateReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 
 	// 3. Handle "Unmanaged" Opt-Out
 	if management == extensionsv1beta1.NetworkPolicyManagementUnmanaged {
-		existingNP := &networkingv1.NetworkPolicy{
-			ObjectMeta: metav1.ObjectMeta{Name: npName, Namespace: npNamespace},
-		}
-		if err := r.Delete(ctx, existingNP); err != nil && !k8errors.IsNotFound(err) {
-			logger.Error(err, "Failed to clean up unmanaged NetworkPolicy")
-			return ctrl.Result{}, err
-		} else if err == nil {
+		existingNP := &networkingv1.NetworkPolicy{}
+		err := r.Get(ctx, types.NamespacedName{Name: npName, Namespace: npNamespace}, existingNP)
+		if err == nil {
+			if !metav1.IsControlledBy(existingNP, template) {
+				logger.Info("Skipping deletion of NetworkPolicy not owned by template", "name", npName)
+				return ctrl.Result{}, nil
+			}
+			if err := r.Delete(ctx, existingNP); err != nil {
+				logger.Error(err, "Failed to clean up unmanaged NetworkPolicy")
+				asmetrics.RecordTemplateReconcileError(template.Namespace, asmetrics.ClassifyReconcileError(err, asmetrics.ReasonDeleteFailed))
+				return ctrl.Result{}, err
+			}
 			logger.Info("Deleted unmanaged NetworkPolicy", "name", existingNP.Name)
+		} else if !k8errors.IsNotFound(err) {
+			asmetrics.RecordTemplateReconcileError(template.Namespace, asmetrics.ClassifyReconcileError(err, asmetrics.ReasonOther))
+			return ctrl.Result{}, fmt.Errorf("failed to get NetworkPolicy: %w", err)
 		}
 		return ctrl.Result{}, nil
 	}
@@ -120,6 +130,11 @@ func (r *SandboxTemplateReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 	err := r.Get(ctx, types.NamespacedName{Name: npName, Namespace: npNamespace}, existingNP)
 
 	if err == nil {
+		if !metav1.IsControlledBy(existingNP, template) {
+			err := fmt.Errorf("refusing to update NetworkPolicy %q as it is not controlled by SandboxTemplate %q", npName, template.Name)
+			asmetrics.RecordTemplateReconcileError(template.Namespace, asmetrics.ClassifyReconcileError(err, asmetrics.ReasonOwnershipConflict))
+			return ctrl.Result{}, err
+		}
 		// Policy exists: Semantic DeepEqual check for drift
 		if equality.Semantic.DeepEqual(existingNP.Spec, desiredSpec) {
 			return ctrl.Result{}, nil // Perfect match, O(1) efficiency.
@@ -128,6 +143,7 @@ func (r *SandboxTemplateReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		existingNP.Spec = desiredSpec
 		if err := r.Update(ctx, existingNP); err != nil {
 			logger.Error(err, "Failed to update NetworkPolicy", "name", npName)
+			asmetrics.RecordTemplateReconcileError(template.Namespace, asmetrics.ClassifyReconcileError(err, asmetrics.ReasonOther))
 			return ctrl.Result{}, err
 		}
 		logger.Info("Successfully updated shared NetworkPolicy", "name", npName)
@@ -135,6 +151,7 @@ func (r *SandboxTemplateReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 	}
 
 	if !k8errors.IsNotFound(err) {
+		asmetrics.RecordTemplateReconcileError(template.Namespace, asmetrics.ClassifyReconcileError(err, asmetrics.ReasonOther))
 		return ctrl.Result{}, fmt.Errorf("failed to get NetworkPolicy: %w", err)
 	}
 
@@ -145,11 +162,13 @@ func (r *SandboxTemplateReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 	}
 
 	if err := controllerutil.SetControllerReference(template, np, r.Scheme); err != nil {
+		asmetrics.RecordTemplateReconcileError(template.Namespace, asmetrics.ClassifyReconcileError(err, asmetrics.ReasonOther))
 		return ctrl.Result{}, err
 	}
 
 	if err := r.Create(ctx, np); err != nil {
 		logger.Error(err, "Failed to create NetworkPolicy", "name", npName)
+		asmetrics.RecordTemplateReconcileError(template.Namespace, asmetrics.ClassifyReconcileError(err, asmetrics.ReasonCreateFailed))
 		return ctrl.Result{}, err
 	}
 

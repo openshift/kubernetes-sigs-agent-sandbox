@@ -17,6 +17,7 @@ package e2e
 import (
 	"fmt"
 	"hash/fnv"
+	"strings"
 	"testing"
 	"time"
 
@@ -37,7 +38,17 @@ func NameHash(objectName string) string {
 
 	// Convert the uint32 to a hexadecimal string.
 	// This results in an 8-character string (e.g., "a5b3c2d1").
-	return fmt.Sprintf("%08x", hashValue)
+	const hex = "0123456789abcdef"
+	var buf [8]byte
+	buf[0] = hex[(hashValue>>28)&0xf]
+	buf[1] = hex[(hashValue>>24)&0xf]
+	buf[2] = hex[(hashValue>>20)&0xf]
+	buf[3] = hex[(hashValue>>16)&0xf]
+	buf[4] = hex[(hashValue>>12)&0xf]
+	buf[5] = hex[(hashValue>>8)&0xf]
+	buf[6] = hex[(hashValue>>4)&0xf]
+	buf[7] = hex[hashValue&0xf]
+	return string(buf[:])
 }
 
 func simpleSandbox(ns string) *sandboxv1beta1.Sandbox {
@@ -79,8 +90,21 @@ func TestSimpleSandbox(t *testing.T) {
 		predicates.SandboxHasStatus(sandboxv1beta1.SandboxStatus{
 			Service:       "my-sandbox",
 			ServiceFQDN:   fmt.Sprintf("my-sandbox.%s.svc.cluster.local", ns.Name),
-			LabelSelector: "agents.x-k8s.io/sandbox-name-hash=" + nameHash,
+			LabelSelector: sandboxv1beta1.SandboxNameHashLabel + "=" + nameHash,
 			Conditions: []metav1.Condition{
+				{
+					Type:               string(sandboxv1beta1.SandboxConditionSuspended),
+					Status:             metav1.ConditionFalse,
+					ObservedGeneration: 1,
+					Reason:             sandboxv1beta1.SandboxReasonNotSuspended,
+					Message:            "Sandbox is not suspended",
+				},
+				{
+					Type:               string(sandboxv1beta1.SandboxConditionPodScheduled),
+					Status:             metav1.ConditionTrue,
+					ObservedGeneration: 1,
+					Reason:             sandboxv1beta1.SandboxReasonPodScheduled,
+				},
 				{
 					Type:               "Ready",
 					Status:             metav1.ConditionTrue,
@@ -128,4 +152,47 @@ func TestSimpleSandbox(t *testing.T) {
 	service.Name = "my-sandbox"
 	service.Namespace = ns.Name
 	tc.MustMatchPredicates(service, p...)
+}
+
+func TestSandboxServiceNameValidation(t *testing.T) {
+	tc := framework.NewTestContext(t)
+	ns := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: fmt.Sprintf("sandbox-name-validation-%d", time.Now().UnixNano())}}
+	require.NoError(t, tc.CreateWithCleanup(t.Context(), ns))
+
+	newSandbox := func(name string, service *bool) *sandboxv1beta1.Sandbox {
+		return &sandboxv1beta1.Sandbox{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns.Name},
+			Spec: sandboxv1beta1.SandboxSpec{SandboxBlueprint: sandboxv1beta1.SandboxBlueprint{
+				Service: service,
+				PodTemplate: sandboxv1beta1.PodTemplate{Spec: corev1.PodSpec{Containers: []corev1.Container{{
+					Name:  "pause",
+					Image: "registry.k8s.io/pause:3.10",
+				}}}},
+			}},
+		}
+	}
+
+	t.Run("63 characters with service succeeds", func(t *testing.T) {
+		err := tc.CreateWithCleanup(t.Context(), newSandbox(strings.Repeat("a", 63), new(true)))
+		require.NoError(t, err)
+	})
+
+	t.Run("64 characters with service is rejected", func(t *testing.T) {
+		err := tc.CreateWithCleanup(t.Context(), newSandbox(strings.Repeat("b", 64), new(true)))
+		require.ErrorContains(t, err, "metadata.name must not exceed 63 characters when spec.service is true")
+	})
+
+	t.Run("64 characters without service succeeds but enabling service is rejected", func(t *testing.T) {
+		sandbox := newSandbox(strings.Repeat("c", 64), new(false))
+		require.NoError(t, tc.CreateWithCleanup(t.Context(), sandbox))
+
+		sandbox.Spec.Service = new(true)
+		err := tc.Update(t.Context(), sandbox)
+		require.ErrorContains(t, err, "metadata.name must not exceed 63 characters when spec.service is true")
+	})
+
+	t.Run("64 characters with service unset succeeds", func(t *testing.T) {
+		err := tc.CreateWithCleanup(t.Context(), newSandbox(strings.Repeat("d", 64), nil))
+		require.NoError(t, err)
+	})
 }

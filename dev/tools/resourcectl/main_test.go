@@ -24,6 +24,7 @@ import (
 	"os"
 	"os/exec"
 	"runtime"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -33,8 +34,10 @@ func TestHelperProcess(t *testing.T) {
 	if os.Getenv("GO_WANT_HELPER_PROCESS") != "1" {
 		return
 	}
-	// Just sleep forever (or until killed)
-	select {}
+	// Sleep until the parent kills us. We use a long sleep rather than an empty
+	// `select{}` because the latter trips Go's deadlock detector (exit code 2),
+	// which races the kill and makes the kill-signal assertion flaky.
+	time.Sleep(time.Hour)
 }
 
 func TestIsHeartbeatProcess(t *testing.T) {
@@ -79,6 +82,67 @@ func TestIsHeartbeatProcess(t *testing.T) {
 	}
 }
 
+func TestConcurrentStateUpdates(t *testing.T) {
+	// Create a temporary home directory to sandbox the state file.
+	tmpHome, err := os.MkdirTemp("", "resourcectl-test-home-*")
+	if err != nil {
+		t.Fatalf("failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpHome)
+
+	t.Setenv("HOME", tmpHome)
+
+	// Concurrently append a distinct resource from many goroutines. Without the
+	// state file lock these read-modify-write cycles would race and lose
+	// entries; with it, every entry must survive.
+	const n = 20
+	var wg sync.WaitGroup
+	errCh := make(chan error, n)
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			errCh <- updateState(func(state *State) error {
+				// Widen the read-modify-write window so a missing lock would
+				// reliably drop entries.
+				time.Sleep(time.Millisecond)
+				state.BoskosResources = append(state.BoskosResources, BoskosResource{
+					Name: fmt.Sprintf("resource-%d", i),
+				})
+				return nil
+			})
+		}(i)
+	}
+	wg.Wait()
+	close(errCh)
+
+	for err := range errCh {
+		if err != nil {
+			t.Fatalf("updateState failed: %v", err)
+		}
+	}
+
+	state, err := readState()
+	if err != nil {
+		t.Fatalf("failed to read state file: %v", err)
+	}
+	if len(state.BoskosResources) != n {
+		t.Errorf("expected %d resources after concurrent updates, but got %d", n, len(state.BoskosResources))
+	}
+
+	seen := make(map[string]int, len(state.BoskosResources))
+	for _, resource := range state.BoskosResources {
+		seen[resource.Name]++
+	}
+
+	for i := 0; i < n; i++ {
+		name := fmt.Sprintf("resource-%d", i)
+		if seen[name] != 1 {
+			t.Fatalf("expected exactly one %q entry, got %d", name, seen[name])
+		}
+	}
+}
+
 func TestRunCleanup(t *testing.T) {
 	// Create temporary home directory to sandbox state file
 	tmpHome, err := os.MkdirTemp("", "resourcectl-test-home-*")
@@ -88,9 +152,7 @@ func TestRunCleanup(t *testing.T) {
 	defer os.RemoveAll(tmpHome)
 
 	// Override HOME
-	origHome := os.Getenv("HOME")
-	os.Setenv("HOME", tmpHome)
-	defer os.Setenv("HOME", origHome)
+	t.Setenv("HOME", tmpHome)
 
 	// Start a mock Boskos server
 	mockBoskos := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -223,5 +285,57 @@ func TestRunCleanup(t *testing.T) {
 
 	if len(state.BoskosResources) != 0 {
 		t.Errorf("expected 0 resources left in state.json, but got %d: %+v", len(state.BoskosResources), state.BoskosResources)
+	}
+}
+
+// TestRunHeartbeatRefreshesLeasePeriodically pins the one job the heartbeat
+// exists for: repeated /update calls that keep the Boskos lease ahead of the
+// reaper, surviving transient failures. The kOps lanes lost their projects
+// to the Janitor 30 minutes after acquire because nothing asserted this.
+func TestRunHeartbeatRefreshesLeasePeriodically(t *testing.T) {
+	origInterval := heartbeatInterval
+	heartbeatInterval = 20 * time.Millisecond
+	defer func() { heartbeatInterval = origInterval }()
+
+	var mu sync.Mutex
+	var updates int
+	var badRequests []string
+	mockBoskos := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+		q := r.URL.Query()
+		if r.Method != http.MethodPost || r.URL.Path != "/update" ||
+			q.Get("name") != "test-resource" || q.Get("owner") != "test-owner" || q.Get("state") != "busy" {
+			badRequests = append(badRequests, r.Method+" "+r.URL.String())
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		updates++
+		// Fail the second refresh to prove one rejected update does not end the loop.
+		if updates == 2 {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer mockBoskos.Close()
+	t.Setenv("BOSKOS_HOST", mockBoskos.URL)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel()
+	err := runHeartbeat(ctx, "test-resource", "test-owner")
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("runHeartbeat returned %v, want it to run until the context expires", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(badRequests) > 0 {
+		t.Errorf("unexpected Boskos requests: %v", badRequests)
+	}
+	// Initial heartbeat plus roughly 25 ticks; only a lower bound is meaningful
+	// on a loaded CI machine.
+	if updates < 5 {
+		t.Errorf("got %d /update calls in 500ms at a 20ms interval, want at least 5", updates)
 	}
 }

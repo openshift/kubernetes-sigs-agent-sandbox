@@ -13,26 +13,236 @@
 # limitations under the License.
 
 import re
-from typing import Literal, Union
-from pydantic import BaseModel, field_validator
+import warnings
+from datetime import datetime, timezone
+from typing import Annotated, Any, Literal, Optional, Union
+from pydantic import AfterValidator, BaseModel, ConfigDict, Field, ModelWrapValidatorHandler, SecretStr, ValidationError, field_validator, model_validator
+from pydantic_core import InitErrorDetails
+
+_ENV_VAR_NAME_RE = re.compile(r"^[-._a-zA-Z][-._a-zA-Z0-9]*$")
+_RESERVED_HEADER_PREFIX = "x-sandbox-"
+_DEPRECATED_IN_CLUSTER_MODES = {
+    "service-dns": "in-cluster-service",
+    "pod-ip": "in-cluster-pod-ip",
+}
+
+
+def _validate_sandboxd_auth_token(token: SecretStr) -> SecretStr:
+    if not re.fullmatch(r"[\x21-\x7e]+", token.get_secret_value()):
+        raise ValueError("auth_token must be non-empty printable ASCII with no spaces")
+    return token
+
+
+_SandboxdAuthToken = Annotated[
+    SecretStr, Field(strict=True), AfterValidator(_validate_sandboxd_auth_token)
+]
+
+
+def _redact_sandboxd_validation_errors(
+    cls: type[BaseModel], value: Any, handler: ModelWrapValidatorHandler[Any]
+) -> Any:
+    try:
+        return handler(value)
+    except ValidationError as error:
+        # hide_input_in_errors only affects text; structured errors also retain
+        # raw input, including whole configs when a model validator fails.
+        details = [
+            InitErrorDetails(type=item["type"], loc=item["loc"], input=None, ctx=item.get("ctx", {}))
+            for item in error.errors(include_input=False, include_url=False)
+        ]
+        raise ValidationError.from_exception_data(cls.__name__, details, hide_input=True) from None
+
 
 class ExecutionResult(BaseModel):
     """A structured object for holding the result of a command execution."""
     stdout: str = ""  # Standard output from the command.
     stderr: str = ""  # Standard error from the command.
     exit_code: int = -1  # Exit code of the command.
+    timed_out: bool = False  # True if the runtime killed the command for exceeding its time limit.
+
+class LegacyExecuteRequest(BaseModel):
+    """Request body for the legacy python-runtime /execute endpoint."""
+    command: str  # Shell command to run.
+    timeout_seconds: Optional[float] = None  # Limit on how long the command may run; omitted when unset.
+
+class ProcessOutputEvent(BaseModel):
+    """A chunk of stdout or stderr from a process started with commands.start().
+
+    ``data`` is raw bytes, not text: a multi-byte character can be split
+    across two chunks, so callers decode the stream rather than each chunk.
+    A PTY process never produces ``stderr`` events, because the terminal
+    merges stderr into stdout.
+    """
+    type: Literal["stdout", "stderr"]
+    data: bytes
+
+class ProcessExitEvent(BaseModel):
+    """Terminal event of a process started with commands.start().
+
+    ``exit_code`` is -1 when the process was killed by a signal: sandboxd
+    reports Go's ExitCode(), not the shell's 128+N convention.
+    """
+    type: Literal["exit"] = "exit"
+    exit_code: int
+
+# Discriminated union of events ProcessHandle.events() yields. The init event
+# sandboxd sends first is consumed by commands.start() to populate the
+# handle's process_id, so it is not part of the public event stream. This
+# mirrors the Go SDK's ProcessEvent and the TypeScript SDK's ProcessEvent.
+ProcessEvent = Union[ProcessOutputEvent, ProcessExitEvent]
+
+class PtySize(BaseModel):
+    """Pseudo-terminal geometry for commands.start().
+
+    Mirrors the TypeScript SDK's ``PtySize``.
+    """
+    cols: int = 80
+    rows: int = 24
+
+    @field_validator("cols", "rows")
+    @classmethod
+    def _validate_positive(cls, v: int) -> int:
+        if v < 1 or v > 65535:
+            raise ValueError("cols/rows must be between 1 and 65535")
+        return v
 
 class FileEntry(BaseModel):
-    """Represents a file or directory entry in the sandbox."""
-    name: str # Name of the file.
+    """Represents a file or directory entry in the sandbox.
+
+    Runtime-neutral: the SDK decodes both the legacy python-runtime wire
+    format (``mod_time`` as a float POSIX timestamp) and the sandboxd wire
+    format (``modified_at`` as an RFC 3339 string, plus ``mode``) into this
+    one shape. ``modified`` is always a timezone-aware datetime.
+    """
+    name: str  # Name of the file.
     size: int  # Size of the file in bytes.
     type: Literal["file", "directory"]  # Type of the entry (file or directory).
-    mod_time: float # Last modification time of the file. (POSIX timestamp)
+    modified: datetime  # Last modification time (timezone-aware).
+    mode: Optional[str] = None  # Octal permission bits (sandboxd only), e.g. "0644".
+
+    @classmethod
+    def from_legacy(cls, entry: dict[str, Any]) -> "FileEntry":
+        """Build from the legacy python-runtime listing entry."""
+        return cls(
+            name=entry["name"],
+            size=entry["size"],
+            type=entry["type"],
+            modified=datetime.fromtimestamp(entry.get("mod_time", 0), tz=timezone.utc),
+        )
+
+    @classmethod
+    def from_sandboxd(cls, entry: dict[str, Any]) -> "FileEntry":
+        """Build from a sandboxd DirectoryListing entry."""
+        return cls(
+            name=entry["name"],
+            size=entry["size"],
+            type=entry["type"],
+            modified=datetime.fromisoformat(entry["modified_at"].replace("Z", "+00:00")),
+            mode=entry.get("mode"),
+        )
+
+
+class FileEvent(BaseModel):
+    """A filesystem change observed by :meth:`FileWatcher.watch`.
+
+    Mirrors the ``watcher.v1.FileEvent`` protobuf message with SDK-idiomatic
+    field names. ``type`` is a string matching the proto names (``create``,
+    ``write``, ``remove``, ``rename``, ``chmod``, ``error``); future proto
+    versions may introduce additional values, so consumers should tolerate
+    unknown types rather than treating the set as closed.
+
+    For ``rename`` events, ``path`` carries the OLD (source) path; when the
+    new name lands inside the watched tree it arrives as a separate
+    ``create`` event. Pair the two to reconstruct renames.
+    """
+
+    type: str  # Kind of change observed (e.g. "create", "write", "rename").
+    path: str = ""  # Sandbox-relative path; for ``rename`` events the OLD path.
+    error: str = ""  # For ``error`` events, a human-readable message; empty otherwise.
+
+class SandboxHealth(BaseModel):
+    """Sandbox liveness/readiness reported by sandboxd's /v1/health endpoint.
+
+    Mirrors the Go SDK's ``sandbox.Health`` and the TypeScript SDK's
+    ``SandboxHealth``.
+    """
+    status: Literal["ok"]  # HealthResponse.status enum in the sandboxd spec.
+    # Required rather than optional because sandboxd always serves it
+    # (HealthResponse.UptimeSeconds is a plain int64), so a body without it is
+    # malformed rather than a sandbox of unknown uptime.
+    uptime_seconds: int = Field(ge=0)  # Seconds sandboxd has been running.
+
+    @classmethod
+    def from_sandboxd(cls, payload: dict[str, Any]) -> "SandboxHealth":
+        """Build from a sandboxd /v1/health response body."""
+        # model_validate so a malformed body surfaces as one pydantic
+        # ValidationError naming every bad field, not a bare KeyError.
+        return cls.model_validate(payload)
+
+class SandboxMetadata(BaseModel):
+    """Runtime environment metadata reported by sandboxd's /v1/metadata endpoint.
+
+    Only non-sensitive orchestrator-injected configuration is exposed here;
+    the sandboxd spec forbids serving credentials from /v1/metadata. Mirrors
+    the Go SDK's ``sandbox.Metadata`` and the TypeScript SDK's
+    ``SandboxMetadata``.
+    """
+    env: dict[str, str] = Field(default_factory=dict)  # Orchestrator-injected environment variables; empty when none apply.
+
+    @classmethod
+    def from_sandboxd(cls, payload: dict[str, Any]) -> "SandboxMetadata":
+        """Build from a sandboxd /v1/metadata response body."""
+        return cls(env=payload.get("env") or {})
+
+class SandboxClaimEnvVar(BaseModel):
+    """Represents an environment variable entry in a SandboxClaim spec."""
+    name: str  # Name of the environment variable.
+    value: str  # Value of the environment variable.
+    container_name: str | None = Field(default=None, serialization_alias="containerName")
+
+    @field_validator("name")
+    @classmethod
+    def validate_name(cls, v: str) -> str:
+        if not _ENV_VAR_NAME_RE.match(v):
+            raise ValueError(
+                "Invalid environment variable name: must consist of alphabetic "
+                "characters, digits, '_', '-', or '.', and must not start with a digit"
+            )
+        if v == "." or v == ".." or v.startswith(".."):
+            raise ValueError(
+                "Invalid environment variable name: must not be '.', '..', or start with '..'"
+            )
+        return v
 
 class SandboxDirectConnectionConfig(BaseModel):
-    """Configuration for connecting directly to a Sandbox URL."""
+    """Configuration for connecting directly to a Sandbox URL.
+
+    ``extra_headers`` and ``client_cert``/``ca_cert`` (mTLS) support a router
+    behind an authenticating gateway.
+    """
     api_url: str  # Direct URL to the router.
     server_port: int = 8888  # Port the sandbox container listens on.
+    # Hidden from repr to keep credentials out of logs.
+    extra_headers: dict[str, str] = Field(default_factory=dict, repr=False)  # Sent on every request.
+    client_cert: Optional[tuple[str, str]] = None  # (certificate path, private key path) for mTLS.
+    ca_cert: Optional[str] = None  # CA bundle path used to verify the router; default trust store if unset.
+
+    @field_validator("extra_headers")
+    @classmethod
+    def validate_extra_headers(cls, v: dict[str, str]) -> dict[str, str]:
+        for name in v:
+            if name.lower().startswith(_RESERVED_HEADER_PREFIX):
+                raise ValueError(
+                    f"header {name!r} is reserved: the SDK sets {_RESERVED_HEADER_PREFIX}* headers itself"
+                )
+        return v
+
+    @model_validator(mode="after")
+    def validate_tls_requires_https(self) -> "SandboxDirectConnectionConfig":
+        # TLS options are ignored on http://, so fail loudly instead.
+        if (self.client_cert or self.ca_cert) and not self.api_url.lower().startswith("https://"):
+            raise ValueError("client_cert and ca_cert require an https:// api_url")
+        return self
 
 class SandboxGatewayConnectionConfig(BaseModel):
     """Configuration for connecting via Kubernetes Gateway API."""
@@ -54,27 +264,112 @@ class SandboxLocalTunnelConnectionConfig(BaseModel):
             raise ValueError("Invalid Kubernetes namespace name format")
         return v
 
+class SandboxdPodTunnelConnectionConfig(BaseModel):
+    """Configuration for the sandboxd runtime via a direct pod port-forward.
+
+    sandboxd (KEP-539.2) exposes two listeners: the Filesystem & Runtime REST
+    API and the gRPC ProcessService. This config port-forwards directly to the
+    sandbox pod, reaching both.
+
+    Doesn't work on Kata or gVisor; use SandboxdInClusterConnectionConfig for those.
+    """
+    model_config = ConfigDict(hide_input_in_errors=True)
+
+    auth_token: _SandboxdAuthToken | None = Field(default=None, repr=False)  # Optional bearer token for sandboxd REST and gRPC.
+    rest_port: int = 8080  # sandboxd REST filesystem port on the pod.
+    grpc_port: int = 9090  # sandboxd gRPC ProcessService port on the pod.
+    port_forward_ready_timeout: int = 30  # Seconds to wait for port-forward readiness.
+
+    @field_validator("rest_port", "grpc_port")
+    @classmethod
+    def validate_port(cls, v: int) -> int:
+        if v < 1 or v > 65535:
+            raise ValueError("port must be between 1 and 65535")
+        return v
+
+    _redact_errors = model_validator(mode="wrap")(_redact_sandboxd_validation_errors)
+
+class SandboxdInClusterConnectionConfig(BaseModel):
+    """Connect to sandboxd directly over the selected in-cluster address.
+
+    ``in-cluster-service`` requires ``Sandbox.status.serviceFQDN`` and a Service
+    enabled on the Sandbox template. ``in-cluster-pod-ip`` uses
+    ``Sandbox.status.podIPs``. Neither mode falls back to the other. sandboxd's
+    REST filesystem listener defaults to port 8080 and its gRPC ProcessService
+    listener to port 9090.
+    """
+    model_config = ConfigDict(hide_input_in_errors=True)
+
+    auth_token: _SandboxdAuthToken | None = Field(default=None, repr=False)  # Optional bearer token for sandboxd REST and gRPC.
+    mode: Literal["in-cluster-service", "in-cluster-pod-ip"]
+    rest_port: int = 8080
+    grpc_port: int = 9090
+
+    @field_validator("mode", mode="before")
+    @classmethod
+    def map_deprecated_mode(cls, v: object) -> object:
+        if isinstance(v, str) and v in _DEPRECATED_IN_CLUSTER_MODES:
+            new = _DEPRECATED_IN_CLUSTER_MODES[v]
+            warnings.warn(
+                f"SandboxdInClusterConnectionConfig mode {v!r} is deprecated; use {new!r}",
+                DeprecationWarning,
+                stacklevel=3,
+            )
+            return new
+        return v
+
+    @field_validator("rest_port", "grpc_port")
+    @classmethod
+    def validate_port(cls, v: int) -> int:
+        if v < 1 or v > 65535:
+            raise ValueError("port must be between 1 and 65535")
+        return v
+
+    @model_validator(mode="after")
+    def validate_distinct_ports(self) -> "SandboxdInClusterConnectionConfig":
+        if self.rest_port == self.grpc_port:
+            raise ValueError("REST and gRPC ports must be different")
+        return self
+
+    _redact_errors = model_validator(mode="wrap")(_redact_sandboxd_validation_errors)
+
 class SandboxInClusterConnectionConfig(BaseModel):
     """Configuration for direct in-cluster connection to the sandbox pod, bypassing the router.
 
-    By default, connects via stable K8s DNS:
+    The client first uses the pod IP reported in the Sandbox status. If the pod IP
+    is unavailable, it falls back to the stable Kubernetes DNS endpoint:
         http://{sandbox_id}.{namespace}.svc.cluster.local:{server_port}
-
-    When use_pod_ip=True, connects directly to the pod IP from the Sandbox status,
-    avoiding DNS resolution at the cost of needing a K8s API call to retrieve the IP.
     """
     server_port: int = 8888  # Port the sandbox container listens on.
-    use_pod_ip: bool = False  # If True, connect via pod IP instead of cluster DNS.
 
 SandboxConnectionConfig = Union[
     SandboxDirectConnectionConfig,
     SandboxGatewayConnectionConfig,
     SandboxLocalTunnelConnectionConfig,
     SandboxInClusterConnectionConfig,
+    SandboxdPodTunnelConnectionConfig,
+    SandboxdInClusterConnectionConfig,
 ]
+
+class AdditionalPodMetadata(BaseModel):
+    """Wire-format for SandboxClaim ``spec.additionalPodMetadata``.
+
+    Labels and annotations stamped onto the running Sandbox Pod (not the
+    SandboxClaim object). Omit empty sections so the manifest never carries
+    an empty ``additionalPodMetadata``.
+    """
+    labels: dict[str, str] | None = None
+    annotations: dict[str, str] | None = None
+
+class SandboxFileConfig(BaseModel):
+    """Client-side file download limits, shared by read() and read_to()."""
+
+    model_config = ConfigDict(validate_assignment=True)
+
+    max_download_size: int | None = Field(default=None, strict=True, gt=0)  # Maximum file bytes downloaded; None preserves unlimited reads.
+
 
 class SandboxTracerConfig(BaseModel):
     """Configuration for tracer level information"""
     enable_tracing: bool = False  # Whether to enable OpenTelemetry tracing.
     trace_service_name: str = "sandbox-client"  # Service name used for traces.
-    

@@ -1,0 +1,40 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "k8s-agent-sandbox-mcp-server"
+version = "0.0.1"
+description = "MCP server for the Kubernetes Agent Sandbox."
+readme = "README.md"
+requires-python = ">=3.11"
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: OS Independent",
+]
+dependencies = [
+  "k8s-agent-sandbox[async,grpc]>=1.0.6,<2.0",
+  "pydantic-settings~=2.14.2",
+  "fastapi~=0.139.0",
+  "fastmcp[apps]~=3.4.4",
+  "uvicorn~=0.51.0",
+]
+
+[tool.setuptools.packages.find]
+include = ["k8s_agent_sandbox_mcp_server*"]
+exclude = [
+    "tests*",
+]
+
+[project.optional-dependencies]
+test = [
+    "pytest",
+    "pytest-xdist",
+    "anyio",
+    # Used by the probe tests to drive the ASGI app. It is currently pulled in
+    # transitively by fastmcp, but declare it so the suite does not silently
+    # depend on another package's dependency tree.
+    "httpx",
+]
+

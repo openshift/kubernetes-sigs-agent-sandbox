@@ -1,0 +1,70 @@
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  labels:
+    app.kubernetes.io/component: sandbox-router
+    app.kubernetes.io/name: sandbox-router
+  name: sandbox-router
+spec:
+  egress:
+  - ports:
+    - port: 53
+      protocol: UDP
+    - port: 53
+      protocol: TCP
+    - port: 5353
+      protocol: UDP
+    - port: 5353
+      protocol: TCP
+    to:
+    - namespaceSelector:
+        matchExpressions:
+        - key: kubernetes.io/metadata.name
+          operator: In
+          values:
+          - kube-system
+          - openshift-dns
+  - ports:
+    - protocol: TCP
+    to:
+    - namespaceSelector: {}
+      podSelector:
+        matchExpressions:
+        - key: agents.x-k8s.io/sandbox-name-hash
+          operator: Exists
+  - ports:
+    - port: 4317
+      protocol: TCP
+    to:
+    - namespaceSelector: {}
+  - ports:
+    - port: 443
+      protocol: TCP
+    - port: 6443
+      protocol: TCP
+  ingress:
+  - from:
+    - namespaceSelector: {}
+    ports:
+    - port: 8443
+      protocol: TCP
+  - from:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: monitoring
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: openshift-monitoring
+    ports:
+    - port: 9090
+      protocol: TCP
+  - ports:
+    - port: 8081
+      protocol: TCP
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/component: sandbox-router
+      app.kubernetes.io/name: sandbox-router
+  policyTypes:
+  - Ingress
+  - Egress

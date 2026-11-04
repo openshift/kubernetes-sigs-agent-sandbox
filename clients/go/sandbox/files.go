@@ -18,19 +18,25 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"math"
 	"mime/multipart"
 	"net/http"
+	"net/url"
 	pathpkg "path"
+	"reflect"
+	"slices"
 	"strings"
+	"time"
 
 	"github.com/go-logr/logr"
 	"go.opentelemetry.io/otel/trace"
 )
 
 const maxErrorBodySize = 512            // limits untrusted server content in error chains
-const maxMetadataResponseSize = 8 << 20 // 8 MB; bounds List/Exists JSON decode
+const maxMetadataResponseSize = 8 << 20 // 8 MB; bounds small JSON decodes (List, Exists, Health, Metadata)
 
 const upperHex = "0123456789ABCDEF"
 
@@ -40,7 +46,7 @@ const upperHex = "0123456789ABCDEF"
 func percentEncode(s string) string {
 	var b strings.Builder
 	b.Grow(len(s))
-	for i := 0; i < len(s); i++ {
+	for i := range len(s) {
 		c := s[i]
 		if c >= 'A' && c <= 'Z' || c >= 'a' && c <= 'z' ||
 			c >= '0' && c <= '9' || c == '-' || c == '_' || c == '.' || c == '~' {
@@ -54,13 +60,31 @@ func percentEncode(s string) string {
 	return b.String()
 }
 
-// applyCallOpts applies per-call options, returning a context with any
-// WithTimeout deadline and the configured max retry count (0 = default).
-func applyCallOpts(ctx context.Context, opts []CallOption) (context.Context, context.CancelFunc, int) {
+func encodeFilePath(path string) string {
+	encoded := percentEncode(path)
+	switch encoded {
+	case ".":
+		return "%2E"
+	case "..":
+		return "%2E%2E"
+	default:
+		return encoded
+	}
+}
+
+// resolveCallOpts folds opts into one callOptions value.
+func resolveCallOpts(opts []CallOption) callOptions {
 	var co callOptions
 	for _, o := range opts {
 		o(&co)
 	}
+	return co
+}
+
+// applyCallOpts applies per-call options, returning a context with any
+// WithTimeout deadline and the configured max retry count (0 = default).
+func applyCallOpts(ctx context.Context, opts []CallOption) (context.Context, context.CancelFunc, int) {
+	co := resolveCallOpts(opts)
 	if co.timeout > 0 {
 		ctx, cancel := context.WithTimeout(ctx, co.timeout)
 		return ctx, cancel, co.maxAttempts
@@ -68,9 +92,20 @@ func applyCallOpts(ctx context.Context, opts []CallOption) (context.Context, con
 	return ctx, func() {}, co.maxAttempts
 }
 
+// applyCallOptsNoRetry is applyCallOpts for operations that do not retry
+// unless the caller opts in with WithMaxAttempts.
+func applyCallOptsNoRetry(ctx context.Context, opts []CallOption) (context.Context, context.CancelFunc, int) {
+	ctx, cancel, maxAttempts := applyCallOpts(ctx, opts)
+	if maxAttempts == 0 {
+		maxAttempts = 1
+	}
+	return ctx, cancel, maxAttempts
+}
+
 // Files provides file operations on a sandbox.
 type Files struct {
 	connector    *connector
+	runtime      Runtime
 	tracer       trace.Tracer
 	svcName      string
 	log          logr.Logger
@@ -81,12 +116,41 @@ type Files struct {
 	lifecycleCtx func() context.Context
 }
 
-// Write uploads content to the sandbox. The path must be a plain filename
-// without directory separators (e.g., "script.py", not "dir/script.py").
+// filesEndpoint returns the sandboxd REST path for a file path.
+func filesEndpoint(path string) string {
+	return "v1/files/" + encodeFilePath(path)
+}
+
+// httpErrorFromResponse builds an HTTPError from a non-2xx response. For the
+// sandboxd runtime the body is an APIError JSON document; its message is
+// surfaced directly when it decodes cleanly.
+func (f *Files) httpErrorFromResponse(resp *http.Response, op string) *HTTPError {
+	return newHTTPError(resp, op, f.runtime)
+}
+
+// newHTTPError builds an HTTPError from a non-2xx response. It is shared by
+// every call that talks to sandboxd's REST API.
+func newHTTPError(resp *http.Response, op string, runtime Runtime) *HTTPError {
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, maxErrorBodySize))
+	if runtime == RuntimeSandboxd {
+		var apiErr sandboxdAPIError
+		if err := json.Unmarshal(body, &apiErr); err == nil && apiErr.Code != "" {
+			return &HTTPError{StatusCode: resp.StatusCode, Body: apiErr.Code + ": " + apiErr.Message, Operation: op}
+		}
+	}
+	return &HTTPError{StatusCode: resp.StatusCode, Body: string(body), Operation: op}
+}
+
+// Write uploads content to the sandbox.
 //
-// The entire content is buffered in memory as a multipart form body to
-// support retries on transient failures. Content exceeding MaxUploadSize
-// (default 256 MB) is rejected before any network I/O.
+// With the legacy runtime the path must be a plain filename without
+// directory separators (e.g., "script.py", not "dir/script.py"). The
+// sandboxd runtime supports relative paths and creates parent directories
+// automatically.
+//
+// The entire content is buffered in memory to support retries on transient
+// failures. Content exceeding MaxUploadSize (default 256 MB) is rejected
+// before any network I/O.
 func (f *Files) Write(ctx context.Context, path string, content []byte, opts ...CallOption) error {
 	defer f.trackOp()()
 	ctx, callCancel, maxAttempts := applyCallOpts(ctx, opts)
@@ -100,49 +164,236 @@ func (f *Files) Write(ctx context.Context, path string, content []byte, opts ...
 		return err
 	}
 
-	base := pathpkg.Base(path)
-	if base == "." || base == ".." || base == "/" || base != path {
-		err := fmt.Errorf("%s: write: %q is not a plain filename (resolved to %q); pass only the filename, not a path with directories", f.errPrefix(), path, base)
+	var method, endpoint, contentType string
+	var body *bytes.Reader
+	var err error
+	if f.runtime == RuntimeSandboxd {
+		method, endpoint, contentType, body, err = f.sandboxdWriteReq(path, content)
+	} else {
+		method, endpoint, contentType, body, err = f.legacyWriteReq(path, content)
+	}
+	if err != nil {
 		recordError(span, err)
 		return err
 	}
-	var buf bytes.Buffer
-	buf.Grow(len(content) + 512)
-	writer := multipart.NewWriter(&buf)
-	part, err := writer.CreateFormFile("file", base)
-	if err != nil {
-		recordError(span, err)
-		return fmt.Errorf("%s: failed to create form file: %w", f.errPrefix(), err)
+
+	if err := f.sendWriteRequest(ctx, path, method, endpoint, body, contentType, maxAttempts, span); err != nil {
+		return err
 	}
-	if _, err := part.Write(content); err != nil {
+	f.log.V(1).Info("write completed", "path", path, "size", len(content))
+	return nil
+}
+
+// WriteReader uploads content read from content without buffering the entire
+// payload in memory. Streaming uploads use a single request attempt because a
+// generic io.Reader cannot be replayed safely after a partial request. Passing
+// WithMaxAttempts with a value greater than 1 returns an error; it is not
+// silently reduced to a single attempt.
+//
+// With the legacy runtime, path must be a plain filename. The sandboxd runtime
+// accepts relative paths and creates parent directories automatically. For an
+// unknown-length reader, MaxUploadSize is enforced while the request is being
+// streamed; the server may therefore receive a prefix before an oversized
+// upload is rejected. Legacy streaming uploads use HTTP chunked transfer
+// encoding, so compatible runtimes and proxies must accept streaming request
+// bodies without a Content-Length header.
+func (f *Files) WriteReader(ctx context.Context, path string, content io.Reader, opts ...CallOption) error {
+	defer f.trackOp()()
+	ctx, callCancel, maxAttempts := applyCallOpts(ctx, opts)
+	defer callCancel()
+	ctx, span := startSpan(withLifecycleSpan(ctx, f.lifecycleCtx()), f.tracer, f.svcName, "write", AttrFilePath.String(path))
+	defer span.End()
+
+	if content == nil {
+		err := fmt.Errorf("%s: write(%q): content reader must not be nil", f.errPrefix(), path)
 		recordError(span, err)
-		return fmt.Errorf("%s: failed to write content: %w", f.errPrefix(), err)
+		return err
 	}
-	if err := writer.Close(); err != nil {
+	if maxAttempts > 1 {
+		err := fmt.Errorf("%s: write(%q): streaming uploads do not support retries", f.errPrefix(), path)
 		recordError(span, err)
-		return fmt.Errorf("%s: failed to close multipart writer: %w", f.errPrefix(), err)
+		return err
+	}
+	// A zero value means "use the operation default" to the connector. A
+	// generic reader cannot be replayed safely, so streaming uploads always
+	// normalize the default to one attempt.
+	if maxAttempts == 0 {
+		maxAttempts = 1
 	}
 
-	resp, err := f.connector.SendRequest(ctx, http.MethodPost, "upload", bytes.NewReader(buf.Bytes()), writer.FormDataContentType(), maxAttempts)
+	var method, endpoint, contentType string
+	var body io.Reader
+	var err error
+	if f.runtime == RuntimeSandboxd {
+		if err := f.validateSandboxdWritePath(path); err != nil {
+			recordError(span, err)
+			return err
+		}
+		method, endpoint, contentType = http.MethodPut, filesEndpoint(path), "application/octet-stream"
+		body = &uploadLimitReader{reader: content, remaining: f.maxUpload, maxUpload: f.maxUpload}
+	} else {
+		if err := f.validateLegacyWritePath(path); err != nil {
+			recordError(span, err)
+			return err
+		}
+		method, endpoint = http.MethodPost, "upload"
+		body, contentType, err = f.legacyStreamingWriteReq(path, content)
+		if err != nil {
+			recordError(span, err)
+			return err
+		}
+	}
+
+	if err := f.sendWriteRequest(ctx, path, method, endpoint, body, contentType, maxAttempts, span); err != nil {
+		return err
+	}
+	f.log.V(1).Info("streaming write completed", "path", path)
+	return nil
+}
+
+func (f *Files) sendWriteRequest(
+	ctx context.Context,
+	path, method, endpoint string,
+	body io.Reader,
+	contentType string,
+	maxAttempts int,
+	span trace.Span,
+) error {
+	resp, err := f.connector.SendRequest(ctx, method, endpoint, body, contentType, maxAttempts)
 	if err != nil {
 		recordError(span, err)
 		return fmt.Errorf("%s: write(%q) failed: %w", f.errPrefix(), path, err)
 	}
 	defer resp.Body.Close()
-
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, maxErrorBodySize))
-		retErr := fmt.Errorf("%s: write(%q): %w", f.errPrefix(), path, &HTTPError{StatusCode: resp.StatusCode, Body: string(body), Operation: "write"})
+		retErr := fmt.Errorf("%s: write(%q): %w", f.errPrefix(), path, f.httpErrorFromResponse(resp, "write"))
 		recordError(span, retErr)
 		return retErr
 	}
 	defer func() { _, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, maxDrainBytes)) }()
-	f.log.V(1).Info("write completed", "path", path, "size", len(content))
 	return nil
 }
 
-// Read downloads a file from the sandbox.
+type uploadLimitReader struct {
+	reader    io.Reader
+	remaining int64
+	maxUpload int64
+}
+
+func (r *uploadLimitReader) Read(p []byte) (int, error) {
+	if len(p) == 0 {
+		return 0, nil
+	}
+	if r.remaining > 0 {
+		if int64(len(p)) > r.remaining {
+			p = p[:r.remaining]
+		}
+		n, err := r.reader.Read(p)
+		r.remaining -= int64(n)
+		return n, err
+	}
+
+	var extra [1]byte
+	n, err := r.reader.Read(extra[:])
+	if n > 0 {
+		return 0, fmt.Errorf("content size exceeds MaxUploadSize %d", r.maxUpload)
+	}
+	return 0, err
+}
+
+// sandboxdWriteReq builds the sandboxd PUT request: an idempotent write of the
+// raw bytes to /v1/files/{path}. Parent directories are created server-side.
+// Relative paths are allowed, but ".." components that escape the sandbox root
+// are rejected client-side as defense in depth (sandboxd also enforces this
+// server-side via SanitizePath).
+func (f *Files) sandboxdWriteReq(path string, content []byte) (method, endpoint, contentType string, body *bytes.Reader, err error) {
+	if err := f.validateSandboxdWritePath(path); err != nil {
+		return "", "", "", nil, err
+	}
+	return http.MethodPut, filesEndpoint(path), "application/octet-stream", bytes.NewReader(content), nil
+}
+
+func (f *Files) validateSandboxdWritePath(path string) error {
+	if path == "" || path == "." || path == ".." || strings.HasSuffix(path, "/") {
+		return fmt.Errorf("%s: write: %q is not a valid file path", f.errPrefix(), path)
+	}
+	if slices.Contains(strings.Split(path, "/"), "..") {
+		return fmt.Errorf("%s: write: %q must not contain %q path segments (escapes the sandbox root)", f.errPrefix(), path, "..")
+	}
+	return nil
+}
+
+// legacyWriteReq builds the python-runtime multipart upload request. The path
+// must be a plain filename (no directory separators); the whole body is
+// buffered so the request can be retried.
+func (f *Files) legacyWriteReq(path string, content []byte) (method, endpoint, contentType string, body *bytes.Reader, err error) {
+	if err := f.validateLegacyWritePath(path); err != nil {
+		return "", "", "", nil, err
+	}
+	base := pathpkg.Base(path)
+	var buf bytes.Buffer
+	buf.Grow(len(content) + 512)
+	writer := multipart.NewWriter(&buf)
+	part, err := writer.CreateFormFile("file", base)
+	if err != nil {
+		return "", "", "", nil, fmt.Errorf("%s: failed to create form file: %w", f.errPrefix(), err)
+	}
+	if _, err := part.Write(content); err != nil {
+		return "", "", "", nil, fmt.Errorf("%s: failed to write content: %w", f.errPrefix(), err)
+	}
+	if err := writer.Close(); err != nil {
+		return "", "", "", nil, fmt.Errorf("%s: failed to close multipart writer: %w", f.errPrefix(), err)
+	}
+	return http.MethodPost, "upload", writer.FormDataContentType(), bytes.NewReader(buf.Bytes()), nil
+}
+
+func (f *Files) legacyStreamingWriteReq(path string, content io.Reader) (body io.Reader, contentType string, err error) {
+	var framing bytes.Buffer
+	writer := multipart.NewWriter(&framing)
+	if _, err := writer.CreateFormFile("file", path); err != nil {
+		return nil, "", fmt.Errorf("%s: failed to create form file: %w", f.errPrefix(), err)
+	}
+	prefix := bytes.Clone(framing.Bytes())
+	framing.Reset()
+	if err := writer.Close(); err != nil {
+		return nil, "", fmt.Errorf("%s: failed to close multipart writer: %w", f.errPrefix(), err)
+	}
+	suffix := bytes.Clone(framing.Bytes())
+	limited := &uploadLimitReader{reader: content, remaining: f.maxUpload, maxUpload: f.maxUpload}
+	return io.MultiReader(bytes.NewReader(prefix), limited, bytes.NewReader(suffix)), writer.FormDataContentType(), nil
+}
+
+func (f *Files) validateLegacyWritePath(path string) error {
+	base := pathpkg.Base(path)
+	if base == "." || base == ".." || base == "/" || base != path {
+		return fmt.Errorf("%s: write: %q is not a plain filename (resolved to %q); pass only the filename, not a path with directories", f.errPrefix(), path, base)
+	}
+	return nil
+}
+
+// Read downloads a file from the sandbox and returns its complete contents.
 func (f *Files) Read(ctx context.Context, path string, opts ...CallOption) ([]byte, error) {
+	var destination bytes.Buffer
+	if _, err := f.readTo(ctx, path, &destination, opts...); err != nil {
+		return nil, err
+	}
+	if destination.Len() == 0 {
+		// Preserve io.ReadAll's existing non-nil result for an empty response.
+		return []byte{}, nil
+	}
+	return destination.Bytes(), nil
+}
+
+// ReadTo downloads a file into a caller-owned destination without buffering
+// the complete response. It returns the number of bytes written. The destination
+// is never closed. If the response exceeds MaxDownloadSize, ReadTo writes at most
+// MaxDownloadSize bytes and returns an error. Data written before an error or
+// context cancellation remains in the destination.
+func (f *Files) ReadTo(ctx context.Context, path string, destination io.Writer, opts ...CallOption) (int64, error) {
+	return f.readTo(ctx, path, destination, opts...)
+}
+
+func (f *Files) readTo(ctx context.Context, path string, destination io.Writer, opts ...CallOption) (int64, error) {
 	defer f.trackOp()()
 	ctx, callCancel, maxAttempts := applyCallOpts(ctx, opts)
 	defer callCancel()
@@ -152,37 +403,69 @@ func (f *Files) Read(ctx context.Context, path string, opts ...CallOption) ([]by
 	if path == "" {
 		err := fmt.Errorf("%s: read: path must not be empty", f.errPrefix())
 		recordError(span, err)
-		return nil, err
+		return 0, err
+	}
+	if isNilWriter(destination) {
+		err := fmt.Errorf("%s: read(%q): destination writer must not be nil", f.errPrefix(), path)
+		recordError(span, err)
+		return 0, err
 	}
 
-	encoded := percentEncode(path)
-	resp, err := f.connector.SendRequest(ctx, http.MethodGet, "download/"+encoded, nil, "", maxAttempts)
+	endpoint := "download/" + encodeFilePath(path)
+	if f.runtime == RuntimeSandboxd {
+		endpoint = filesEndpoint(path)
+	}
+	resp, err := f.connector.SendRequest(ctx, http.MethodGet, endpoint, nil, "", maxAttempts)
 	if err != nil {
 		recordError(span, err)
-		return nil, fmt.Errorf("%s: read(%q) failed: %w", f.errPrefix(), path, err)
+		return 0, fmt.Errorf("%s: read(%q) failed: %w", f.errPrefix(), path, err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, maxErrorBodySize))
-		retErr := fmt.Errorf("%s: read(%q): %w", f.errPrefix(), path, &HTTPError{StatusCode: resp.StatusCode, Body: string(body), Operation: "read"})
+		retErr := fmt.Errorf("%s: read(%q): %w", f.errPrefix(), path, f.httpErrorFromResponse(resp, "read"))
 		recordError(span, retErr)
-		return nil, retErr
+		return 0, retErr
 	}
-	defer func() { _, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, maxDrainBytes)) }()
-	data, err := io.ReadAll(io.LimitReader(resp.Body, f.maxDownload+1))
-	if err != nil {
-		recordError(span, err)
-		return nil, fmt.Errorf("%s: failed to read file content: %w", f.errPrefix(), err)
-	}
-	if int64(len(data)) > f.maxDownload {
+	if resp.ContentLength > f.maxDownload {
 		err := fmt.Errorf("%s: file size exceeds limit of %d bytes", f.errPrefix(), f.maxDownload)
 		recordError(span, err)
-		return nil, err
+		return 0, err
 	}
-	span.SetAttributes(AttrFileSize.Int(len(data)))
-	f.log.V(1).Info("read completed", "path", path, "size", len(data))
-	return data, nil
+
+	written, err := io.Copy(destination, io.LimitReader(resp.Body, f.maxDownload))
+	if err != nil {
+		recordError(span, err)
+		return written, fmt.Errorf("%s: failed to read file content: %w", f.errPrefix(), err)
+	}
+	var extra [1]byte
+	extraBytes, extraErr := io.ReadFull(resp.Body, extra[:])
+	if extraBytes > 0 {
+		err := fmt.Errorf("%s: file size exceeds limit of %d bytes", f.errPrefix(), f.maxDownload)
+		recordError(span, err)
+		return written, err
+	}
+	if extraErr != nil && !errors.Is(extraErr, io.EOF) {
+		recordError(span, extraErr)
+		return written, fmt.Errorf("%s: failed to read file content: %w", f.errPrefix(), extraErr)
+	}
+	span.SetAttributes(AttrFileSize.Int64(written))
+	f.log.V(1).Info("read completed", "path", path, "size", written)
+	return written, nil
+}
+
+func isNilWriter(writer io.Writer) bool {
+	if writer == nil {
+		return true
+	}
+
+	value := reflect.ValueOf(writer)
+	switch value.Kind() {
+	case reflect.Chan, reflect.Func, reflect.Map, reflect.Pointer, reflect.Slice:
+		return value.IsNil()
+	default:
+		return false
+	}
 }
 
 // List returns the contents of a directory in the sandbox.
@@ -199,8 +482,11 @@ func (f *Files) List(ctx context.Context, path string, opts ...CallOption) ([]Fi
 		return nil, err
 	}
 
-	encoded := percentEncode(path)
-	resp, err := f.connector.SendRequest(ctx, http.MethodGet, "list/"+encoded, nil, "", maxAttempts)
+	endpoint := "list/" + encodeFilePath(path)
+	if f.runtime == RuntimeSandboxd {
+		endpoint = filesEndpoint(path)
+	}
+	resp, err := f.connector.SendRequest(ctx, http.MethodGet, endpoint, nil, "", maxAttempts)
 	if err != nil {
 		recordError(span, err)
 		return nil, fmt.Errorf("%s: list(%q) failed: %w", f.errPrefix(), path, err)
@@ -208,27 +494,50 @@ func (f *Files) List(ctx context.Context, path string, opts ...CallOption) ([]Fi
 	defer resp.Body.Close()
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, maxErrorBodySize))
-		retErr := fmt.Errorf("%s: list(%q): %w", f.errPrefix(), path, &HTTPError{StatusCode: resp.StatusCode, Body: string(body), Operation: "list"})
+		retErr := fmt.Errorf("%s: list(%q): %w", f.errPrefix(), path, f.httpErrorFromResponse(resp, "list"))
 		recordError(span, retErr)
 		return nil, retErr
 	}
 	defer func() { _, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, maxDrainBytes)) }()
 
 	var entries []FileEntry
-	if err := json.NewDecoder(io.LimitReader(resp.Body, maxMetadataResponseSize)).Decode(&entries); err != nil {
-		recordError(span, err)
-		return nil, fmt.Errorf("%s: failed to decode file listing: %w", f.errPrefix(), err)
-	}
-	filtered := make([]FileEntry, 0, len(entries))
-	for i := range entries {
-		if entries[i].Type == FileTypeFile || entries[i].Type == FileTypeDirectory {
-			filtered = append(filtered, entries[i])
-		} else {
-			f.log.V(1).Info("skipping entry with unsupported file type", "path", path, "entry", entries[i].Name, "type", entries[i].Type)
+	limited := io.LimitReader(resp.Body, maxMetadataResponseSize)
+	if f.runtime == RuntimeSandboxd {
+		var listing sandboxdDirectoryListing
+		if err := json.NewDecoder(limited).Decode(&listing); err != nil {
+			recordError(span, err)
+			return nil, fmt.Errorf("%s: failed to decode file listing: %w", f.errPrefix(), err)
+		}
+		entries = make([]FileEntry, 0, len(listing.Entries))
+		for _, e := range listing.Entries {
+			if e.Type != FileTypeFile && e.Type != FileTypeDirectory {
+				f.log.V(1).Info("skipping entry with unsupported file type", "path", path, "entry", e.Name, "type", e.Type)
+				continue
+			}
+			// RFC3339Nano so fractional-second timestamps are preserved
+			// (it also parses whole-second RFC3339 values).
+			modTime, parseErr := time.Parse(time.RFC3339Nano, e.ModifiedAt)
+			if parseErr != nil {
+				f.log.V(1).Info("entry has unparseable modified_at; using zero time", "path", path, "entry", e.Name, "modified_at", e.ModifiedAt)
+			}
+			entries = append(entries, FileEntry{Name: e.Name, Size: e.Size, Type: e.Type, ModTime: modTime, Mode: e.Mode})
+		}
+	} else {
+		var legacy []legacyFileEntry
+		if err := json.NewDecoder(limited).Decode(&legacy); err != nil {
+			recordError(span, err)
+			return nil, fmt.Errorf("%s: failed to decode file listing: %w", f.errPrefix(), err)
+		}
+		entries = make([]FileEntry, 0, len(legacy))
+		for _, e := range legacy {
+			if e.Type != FileTypeFile && e.Type != FileTypeDirectory {
+				f.log.V(1).Info("skipping entry with unsupported file type", "path", path, "entry", e.Name, "type", e.Type)
+				continue
+			}
+			sec, frac := math.Modf(e.ModTime)
+			entries = append(entries, FileEntry{Name: e.Name, Size: e.Size, Type: e.Type, ModTime: time.Unix(int64(sec), int64(frac*1e9)).UTC()})
 		}
 	}
-	entries = filtered
 	span.SetAttributes(AttrFileCount.Int(len(entries)))
 	f.log.V(1).Info("list completed", "path", path, "entries", len(entries))
 	return entries, nil
@@ -248,7 +557,34 @@ func (f *Files) Exists(ctx context.Context, path string, opts ...CallOption) (bo
 		return false, err
 	}
 
-	encoded := percentEncode(path)
+	if f.runtime == RuntimeSandboxd {
+		// sandboxd has no dedicated exists endpoint: HEAD on the file path
+		// answers existence without transferring the body (200 vs 404).
+		resp, err := f.connector.SendRequest(ctx, http.MethodHead, filesEndpoint(path), nil, "", maxAttempts)
+		if err != nil {
+			recordError(span, err)
+			return false, fmt.Errorf("%s: exists(%q) failed: %w", f.errPrefix(), path, err)
+		}
+		defer resp.Body.Close()
+		defer func() { _, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, maxDrainBytes)) }()
+
+		switch {
+		case resp.StatusCode >= 200 && resp.StatusCode < 300:
+			span.SetAttributes(AttrFileExists.Bool(true))
+			f.log.V(1).Info("exists completed", "path", path, "exists", true)
+			return true, nil
+		case resp.StatusCode == http.StatusNotFound:
+			span.SetAttributes(AttrFileExists.Bool(false))
+			f.log.V(1).Info("exists completed", "path", path, "exists", false)
+			return false, nil
+		default:
+			retErr := fmt.Errorf("%s: exists(%q): %w", f.errPrefix(), path, f.httpErrorFromResponse(resp, "exists"))
+			recordError(span, retErr)
+			return false, retErr
+		}
+	}
+
+	encoded := encodeFilePath(path)
 	resp, err := f.connector.SendRequest(ctx, http.MethodGet, "exists/"+encoded, nil, "", maxAttempts)
 	if err != nil {
 		recordError(span, err)
@@ -274,4 +610,108 @@ func (f *Files) Exists(ctx context.Context, path string, opts ...CallOption) (bo
 	span.SetAttributes(AttrFileExists.Bool(result.Exists))
 	f.log.V(1).Info("exists completed", "path", path, "exists", result.Exists)
 	return result.Exists, nil
+}
+
+// Delete removes a file or directory in the sandbox. When recursive is
+// true, directories are removed with their contents (rm -rf semantics);
+// otherwise deleting a non-empty directory fails with a 409 HTTPError.
+//
+// Only supported by the sandboxd runtime: the legacy python-runtime has no
+// delete endpoint, and calls return ErrUnsupportedByRuntime.
+func (f *Files) Delete(ctx context.Context, path string, recursive bool, opts ...CallOption) error {
+	query := url.Values{}
+	if recursive {
+		query.Set("recursive", "true")
+	}
+	return f.sandboxdFileOp(ctx, "delete", http.MethodDelete, path, "", query, true, opts)
+}
+
+// Mkdir creates a directory in the sandbox. It succeeds when the directory
+// already exists, so it retries like Delete. When parents is false, a missing
+// parent directory fails with a 404 HTTPError.
+//
+// Only supported by the sandboxd runtime.
+func (f *Files) Mkdir(ctx context.Context, path string, parents bool, opts ...CallOption) error {
+	query := url.Values{"type": {"directory"}}
+	if parents {
+		query.Set("parents", "true")
+	}
+	return f.sandboxdFileOp(ctx, "mkdir", http.MethodPut, path, "", query, true, opts)
+}
+
+// Move renames the file or directory at source to destination, creating
+// missing parent directories of destination. An existing destination fails
+// with a 409 HTTPError unless overwrite is true, which replaces a file but
+// never a directory.
+//
+// Move does not retry unless WithMaxAttempts is set, because a repeat after a
+// lost response fails with 404. Only supported by the sandboxd runtime.
+func (f *Files) Move(ctx context.Context, source, destination string, overwrite bool, opts ...CallOption) error {
+	return f.transfer(ctx, "move", source, destination, overwrite, opts)
+}
+
+// Copy copies the file or directory at source to destination, with the same
+// destination rules, retry behavior, and runtime support as Move.
+func (f *Files) Copy(ctx context.Context, source, destination string, overwrite bool, opts ...CallOption) error {
+	return f.transfer(ctx, "copy", source, destination, overwrite, opts)
+}
+
+func (f *Files) transfer(ctx context.Context, action, source, destination string, overwrite bool, opts []CallOption) error {
+	if destination == "" {
+		return fmt.Errorf("%s: %s: destination must not be empty", f.errPrefix(), action)
+	}
+	query := url.Values{"destination": {destination}}
+	if overwrite {
+		query.Set("overwrite", "true")
+	}
+	// The encoded path never contains a literal colon, so sandboxd can split
+	// the action off at the last one.
+	return f.sandboxdFileOp(ctx, action, http.MethodPost, source, ":"+action, query, false, opts)
+}
+
+// sandboxdFileOp sends a request that sandboxd answers with an empty 2xx body.
+// It appends actionSuffix to the path's endpoint and fails with
+// ErrUnsupportedByRuntime on the legacy python-runtime. Unless retry is true,
+// it sends the request once unless the caller sets WithMaxAttempts.
+func (f *Files) sandboxdFileOp(ctx context.Context, op, method, path, actionSuffix string, query url.Values, retry bool, opts []CallOption) error {
+	defer f.trackOp()()
+	apply := applyCallOptsNoRetry
+	if retry {
+		apply = applyCallOpts
+	}
+	ctx, callCancel, maxAttempts := apply(ctx, opts)
+	defer callCancel()
+	ctx, span := startSpan(withLifecycleSpan(ctx, f.lifecycleCtx()), f.tracer, f.svcName, op, AttrFilePath.String(path))
+	defer span.End()
+
+	if f.runtime != RuntimeSandboxd {
+		err := fmt.Errorf("%s: %s(%q): %w: the legacy python-runtime has no %s endpoint", f.errPrefix(), op, path, ErrUnsupportedByRuntime, op)
+		recordError(span, err)
+		return err
+	}
+	if path == "" {
+		err := fmt.Errorf("%s: %s: path must not be empty", f.errPrefix(), op)
+		recordError(span, err)
+		return err
+	}
+
+	endpoint := filesEndpoint(path) + actionSuffix
+	if len(query) > 0 {
+		endpoint += "?" + query.Encode()
+	}
+	resp, err := f.connector.SendRequest(ctx, method, endpoint, nil, "", maxAttempts)
+	if err != nil {
+		recordError(span, err)
+		return fmt.Errorf("%s: %s(%q) failed: %w", f.errPrefix(), op, path, err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		retErr := fmt.Errorf("%s: %s(%q): %w", f.errPrefix(), op, path, f.httpErrorFromResponse(resp, op))
+		recordError(span, retErr)
+		return retErr
+	}
+	defer func() { _, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, maxDrainBytes)) }()
+	f.log.V(1).Info(op+" completed", "path", path)
+	return nil
 }

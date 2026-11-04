@@ -188,22 +188,30 @@ If you are using gVisor or Kata Containers, direct pod port-forwarding isn't com
 
 1.  **Deploy the Router (Required for All Modes):**
     ```bash
-    # Deploys the Deployment and Service
-    kubectl apply -f ../../clients/python/agentic-sandbox-client/sandbox_router/sandbox_router.yaml
+    # Deploys the Deployment, Service, ServiceAccount, and RBAC
+    kubectl apply -f ../../sandbox-router/deploy/serviceaccount.yaml \
+      -f ../../sandbox-router/deploy/rbac.yaml \
+      -f ../../sandbox-router/deploy/deployment.yaml \
+      -f ../../sandbox-router/deploy/service.yaml
     ```
 
 2.  **Deploy the Gateway (Production Only):**
-    If you need external access via a Public IP (GKE), apply the Gateway configuration.
+    If you need external access via a public IP, apply the Gateway configuration.
+    This requires the Gateway API CRDs and a Gateway API controller
+    (e.g. Istio, GKE built-in, Envoy Gateway) — see the
+    [sandbox-router README](../../clients/python/agentic-sandbox-client/sandbox-router/README.md) for prerequisites.
+    Edit `spec.gatewayClassName` in the YAML to match your environment — see the
+    comments in `gateway.yaml` for options.
     ```bash
-    # Deploys Gateway, HTTPRoute, and HealthCheckPolicy
-    kubectl apply -f ../../clients/python/agentic-sandbox-client/sandbox_router/gateway.yaml
+    # (GKE-only) Deploys Gateway, HTTPRoute, and HealthCheckPolicy
+    kubectl apply -f ../../sandbox-router/deploy/examples/gateway-gke.yaml
     ```
 
-**For Production (via Gateway)**
+**Via Gateway**
 
 1. Get the Gateway IP:
 ```bash
-export GATEWAY_IP=$(kubectl get gateway external-http-gateway -n default -o jsonpath='{.status.addresses[0].value}')
+export GATEWAY_IP=$(kubectl get gateway external-http-gateway -n agent-sandbox-system -o jsonpath='{.status.addresses[0].value}')
 echo "Gateway IP: $GATEWAY_IP"
 ```
 
@@ -217,22 +225,23 @@ curl -v -H "X-Sandbox-ID: sandbox-example" \
 3.  **Access via Browser (UI):**
     To load the VSCode interface, your browser must send the routing headers.
     
-    1.  Install a header-modifying extension (e.g., **ModHeader** for Chrome/Edge/Firefox).
-    2.  Configure the extension to send:
+    1.  Install a browser extension that can set request headers on HTTP and
+        WebSocket upgrade requests. It sees your traffic, so pick one you trust.
+    2.  Configure the extension to send, only to the Gateway IP:
         * `X-Sandbox-ID`: `sandbox-example`
         * `X-Sandbox-Port`: `13337`
     3.  Navigate to **`http://<GATEWAY_IP>`** (replace with the IP from step 1).
 
     You should see the VSCode interface load immediately.
 
-**For Local Development (via Router Tunnel)**
+**Via Router Port-Forward Tunnel**
 
 For local development, port-forward to the **Router Service** (do not port-forward to the pod directly, as it's not compatible with secure runtimes like gVisor/kata).
 
 1. Start the Tunnel: 
 ```bash 
 # Forward local 8080 to the Router Service
-kubectl port-forward svc/sandbox-router-svc 8080:8080 -n default
+kubectl port-forward svc/sandbox-router-svc 8080:8080 -n agent-sandbox-system
 ```
 
 - **Access via Curl:** You need to send the correct headers to route traffic to your specific sandbox. Via curl, set:
@@ -241,6 +250,19 @@ curl -v -H "X-Sandbox-ID: sandbox-example" \
         -H "X-Sandbox-Port: 13337" \
         http://localhost:8080
 ```
+
+#### Option C: Desktop VS Code (Optional)
+
+The sandbox does not run `sshd`, so Remote-SSH does not apply. To use the
+desktop VS Code instead of `code-server`, attach it to the pod with `kubectl`:
+
+1. Install `kubectl` and the VS Code Dev Containers extension.
+2. Run **Dev Containers: Attach to Running Kubernetes Container...** from the
+   Command Palette and pick the `devcontainer-main` container in
+   `sandbox-example`.
+3. Open the `/workspaces` folder.
+
+See [Attach to a container in a Kubernetes cluster](https://code.visualstudio.com/docs/devcontainers/attach-container#_attach-to-a-container-in-a-kubernetes-cluster).
 
 #### Getting VSCode password
 

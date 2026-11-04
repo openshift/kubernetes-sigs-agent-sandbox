@@ -1,0 +1,685 @@
+# Changelog
+
+All notable changes to `agent-sandbox-rl`. Format loosely follows
+[Keep a Changelog](https://keepachangelog.com/); versions are dev-stage.
+
+## [0.1.0.dev0] — unreleased
+
+### Fixed
+- **Concurrent first acquires build one `SandboxClient` per cluster.**
+  `Cluster.sandbox_client` was built lazily with no lock, so a step of threads
+  acquiring at once on a fresh fleet each built a client and loaded the kubeconfig
+  (160 builds for 160 sync per-claim envs on kind, last start 4.22 s against 1.37 s
+  once fixed). It is now built once under a lock, and the SDK clients get the
+  cluster's `ApiClient`, so no build loads a kubeconfig. Requires
+  `k8s-agent-sandbox>=1.0.6`.
+
+### Added (external step loops and multi-container pods —
+[#1960](https://github.com/kubernetes-sigs/agent-sandbox/pull/1960), [#1962](https://github.com/kubernetes-sigs/agent-sandbox/pull/1962), [#1963](https://github.com/kubernetes-sigs/agent-sandbox/pull/1963), [#1964](https://github.com/kubernetes-sigs/agent-sandbox/pull/1964),
+[#1966](https://github.com/kubernetes-sigs/agent-sandbox/pull/1966), [#1967](https://github.com/kubernetes-sigs/agent-sandbox/pull/1967))
+- **Exec in a chosen container** ([#1960](https://github.com/kubernetes-sigs/agent-sandbox/pull/1960)): `SandboxHandle.target_container`,
+  `exec(container=)` / `open_session(container=)` and `SandboxHandle.runtime_container`
+  pick the container of a multi-container pod; a container is always named (the exec
+  API has no default on such a pod) and recycling stays in the runtime container. The
+  R2E-Gym adapter takes `container=` in `make_fleet_repo_env` / `FleetDockerRuntime`.
+- **OpenHands agent-server preset** ([#1962](https://github.com/kubernetes-sigs/agent-sandbox/pull/1962)):
+  `adapters.openhands.agent_server_template(...)` returns the `TemplateSpec` of an
+  OpenHands pool (server command and probes, a required session key, bounded
+  resources, `server_image=` to copy the server into a plain repo image).
+- **`LookaheadWarmer`** ([#1963](https://github.com/kubernetes-sigs/agent-sandbox/pull/1963)): `agent_sandbox_rl.lookahead` sizes pools for
+  the batches an external step loop has in flight (`add` / `finish` / `add_async` /
+  `close`, errors per image in a `WarmReport`). `SandboxFleet.add_tasks` extends the
+  plan in place and `wait_pools_ready` is a best-effort readiness barrier.
+- **Dataset rows and image manifests as task sources** ([#1964](https://github.com/kubernetes-sigs/agent-sandbox/pull/1964)): `to_tasks` /
+  `JsonlSource` find a row's image and id under the SDK, R2E-Gym and SWE-bench
+  conventions (`image_field=` / `id_field=`); `load_image_list` / `ImageListSource` read
+  one-image-per-line manifests from a local path or `gs://`.
+- **Verified teardown** ([#1966](https://github.com/kubernetes-sigs/agent-sandbox/pull/1966)): `teardown(verify=True)` / `verify_teardown()`
+  run the run-scoped reaper after the sweep and return `{cluster: counts}`: what the
+  reaper found per kind (all zero = the teardown was clean) plus `remaining`, the same
+  kinds re-listed after the reaper ran.
+- **Test double** ([#1967](https://github.com/kubernetes-sigs/agent-sandbox/pull/1967)): `agent_sandbox_rl.testing.FakeFleet` / `FakeHandle`
+  are the `SandboxFleet` surface in memory (`add_tasks` and `wait_pools_ready`
+  included, so a `LookaheadWarmer` runs against it), with the real strategies,
+  sizing and `RunReport`, `exec(container=)` recorded per call, injectable failures
+  and exec outputs.
+
+### Changed (pre-pull at hundreds of images — [#1965](https://github.com/kubernetes-sigs/agent-sandbox/pull/1965))
+- **`prepull` batches**: images are split into DaemonSets of `prepull_images_per_pod`
+  images (default 25); with `wait=True` at most `prepull_max_parallel` (default 4) are
+  live at once, `prepull_delete_when_done` removes finished batches,
+  `prepull_drop_caches` drops the page cache afterwards, and `fleet.prepull` returns
+  whether every cluster finished within the budget. With `wait=False` every batch is
+  created at once and the call returns immediately, without those steps. Tolerations
+  and runtime class come from the template, and the selector no longer carries the
+  run id (it is immutable).
+
+### Added (template knobs for multi-container, hardened sandbox pods)
+- **`ResourceSpec.cpu_limit` / `memory_limit`**: optional limits on the runtime
+  container (requests unchanged; an unset limit stays unlimited).
+- **`{task_image}` placeholder** (`constants.TASK_IMAGE_PLACEHOLDER`): a container or
+  init container in `TemplateSpec.extra_pod_spec` whose image is `{task_image}` runs the
+  template's own task image, resolved per template, so a fresh grading sidecar of the
+  task image is one dict in the spec instead of a patched manifest. A `{task_image}`
+  container that names no `imagePullPolicy` gets the template's; any other container
+  keeps the Kubernetes default.
+- **`TemplateSpec.extra_template_spec`**: extra SandboxTemplate `spec` keys merged next
+  to `podTemplate` and `networkPolicyManagement`. Those two keys are rejected: they
+  have knobs the SDK's own logic reads (`extra_pod_spec`, `network_policy_management`).
+  Keys the CRD does not know are pruned by the API server.
+
+### Changed (pod hardening made explicit)
+- **The rendered pod spec now states its hardening**: `automountServiceAccountToken:
+  false` and `shareProcessNamespace: false`. Pod behavior does not change: the
+  controller already defaults automount to false on the pods it creates, and no shared
+  PID namespace is the Kubernetes default. The values are explicit so a reader of the
+  template (or a policy engine) sees them, and so a grading sidecar never shares the
+  agent's PID namespace by accident. `TemplateSpec.automount_service_account_token` /
+  `share_process_namespace` restore either; `extra_pod_spec` keys still win. Existing
+  templates are not rewritten; the defaults apply to templates a fleet creates.
+
+### Added (one NetworkPolicy per namespace)
+- **`TemplateSpec.network_policy_management`** sets `spec.networkPolicyManagement`
+  on the SandboxTemplates a fleet creates, and patches it onto a pre-existing
+  template the run owns when it differs. The controller creates one NetworkPolicy
+  per template; a fleet has a template per task image and creates and deletes
+  templates as it warms and retires pools, so a namespace ends up with hundreds
+  of policies that churn with the pools, and the per-template label they select
+  on has to stay identity-relevant on GKE Dataplane V2 (Cilium). With `"Unmanaged"` the controller creates none and
+  a single policy on the shared `app=agent-sandbox-rl` pod label covers every
+  sandbox in the namespace; `examples/agent-sandbox-rl-network-policy` has that
+  policy and a verify script. `preflight()` warns when the templates are
+  Unmanaged and no NetworkPolicy in the namespace selects the fleet's pods.
+  Unset (the default) leaves the field out and never flips an existing template,
+  so behavior is unchanged.
+
+### Added (one job, several processes —
+[#1808](https://github.com/kubernetes-sigs/agent-sandbox/issues/1808))
+- **`FleetConfig.run_id`** sets the fleet's run id instead of a random one, so the
+  processes of one job (an orchestrator that warms pools, workers that claim from
+  them) share the job's templates and pools. Before, each process was its own
+  run: a worker that went on demand before the orchestrator warmed an image
+  created the template under its id, and the orchestrator's `warm_image` then
+  raised. With a shared id, a pool is resized and deleted only by the process
+  that created it: warming an image another process already warmed borrows its
+  pool, and the first warm of an on-demand pool (marked with
+  `agent-sandbox-rl/on-demand`) takes it over. `teardown()` deletes only the
+  pools this fleet created, a per-run namespace is kept unless
+  `delete_namespace=True` and is never rolled back after a failed setup hook,
+  and the pod-count circuit breaker is off (`max_live_sandboxes` still caps each
+  process's claims). The default is unchanged.
+- **The resolved template name must be at most 63 characters**, since it is the
+  `sandbox=<template>` pod label value; a longer one (a long prefix or `run_id`)
+  passed validation and then failed every pod at the first warm.
+
+### Fixed (run-id pod safeguards —
+[#1807](https://github.com/kubernetes-sigs/agent-sandbox/issues/1807))
+- **The circuit breaker and the reaper's pod force-delete see this run's pods
+  again.** Both selected pods by `agents.x-k8s.io/asrl-run-id`, but since #894 the
+  Sandbox controller strips `agents.x-k8s.io/*` labels from the pod template before
+  it reaches the pod, so `live_owned_count()` was always 0 (the breaker could never
+  trip on pod count) and `reap(run_id=…)`'s grace-0 pod delete matched nothing. The
+  pod template now also carries the run id as `agent-sandbox-rl/run-id`
+  (`POD_RUN_ID_LABEL`), which the controller leaves alone, and
+  `live_owned_count()` / the reaper's pod sweep select on it
+  (`fleet.pod_run_selector()`). Claims, pools and templates keep
+  `agents.x-k8s.io/asrl-run-id`, and the ownership checks still read it. Warm pods
+  created before the upgrade don't gain the new label (changing a template's
+  pod-template labels doesn't replace pool members), so `reap(run_id=…)` misses
+  them until they cycle.
+- **No provisioning path relabels another run's template** (the relabel half of
+  [#1808](https://github.com/kubernetes-sigs/agent-sandbox/issues/1808)). The
+  on-demand path in `acquire()` and `ensure_templates()` called `ensure_template`
+  without an owner check, so an existing template was relabelled to the calling
+  run even when another live run owned it. That run's teardown and
+  `reap(run_id=…)` then deleted the owner's template, the owner's unwarm skipped
+  it and its next warm raised, and — with the pod label above — the calling
+  run's reap force-deleted the owner's pods. The on-demand path now reuses
+  another run's template as it finds it (as it already did with the pool), and
+  `ensure_templates()` raises a `FleetError` naming the owning run, like the
+  warm path.
+
+### Added (fail fast on claims that cannot start)
+- **`acquire()` fails fast on a pod that will not come up.** The SDK's claim wait
+  can only see the claim, so a pod stuck in `ImagePullBackOff`,
+  `CreateContainerConfigError`, `CrashLoopBackOff`, OOM-killed at start, or
+  `Unschedulable` looked like one still starting and ran out `ready_timeout`
+  (15 minutes) before the caller learned anything. `acquire()` now names its claim
+  and runs a `ClaimWatchdog` (`failfast.py`) next to the wait; when the pod is in a
+  state the controller will not recover from, the watchdog deletes the claim and
+  `acquire()` raises **`SandboxStartError`** with the Kubernetes reason, the pod and
+  the image. Reasons that never clear fail at once. The graced classes are opt-in:
+  transient-looking ones fail after `FailFastPolicy.grace_s` and `Unschedulable`
+  after `unschedulable_grace_s` only when those are set (unset by default: a GPU
+  or node-auto-provisioning scale-up outlasts a few minutes of `Unschedulable`,
+  and failing a pull during registry throttling makes the caller retry on a new
+  pod whose pull starts at once, adding load). A pod being deleted is not a
+  verdict: the controller recreates an evicted or preempted pod under the same
+  name. The retryable reasons of a container share one
+  grace clock, which resets only after the condition has been gone for a full
+  grace period, so a pull flipping between `ErrImagePull` and `ImagePullBackOff`
+  or a crash loop seen between restarts is not restarted on every poll. An
+  earlier OOM kill fails a container only while it is not running again. Off with
+  `FleetConfig(fail_fast=FailFastPolicy(enabled=False))`.
+- **Claim tracking does not grow per episode.** `acquire()` names its claim, which
+  the SDK client records (`_explicit_claims`, next to the Sandbox object in
+  `_active_connection_sandboxes`); `sandbox.terminate()` leaves both in place.
+  `handle.release()` and every rollback path of a failed `acquire()` now prune the
+  claim from the client (`forget_claim_in_client`). The SDK itself is unchanged
+  here; pruning on its terminate path is a separate SDK change.
+- **`FleetConfig.claim_timeout`** bounds one claim's readiness wait separately from
+  `ready_timeout`, which also bounds whole-pool fills and is sized for those.
+  `None` (default) keeps the old behaviour.
+- **`SandboxHandle.is_alive()`** and **`SandboxLostError`**: an `exec()` that fails
+  because the pod is gone (deleted, evicted, OOM-killed, finished) now raises
+  `SandboxLostError` instead of the raw transport error, after one pod read, so an
+  RL loop can release and re-acquire at once instead of spending its step timeout.
+  `acquire()` records the pod's UID and the runtime container's restart count, so
+  `is_alive()` also reports a pod recreated under the same name (eviction,
+  deletion) and an in-place restart (OOM kill). Only the runtime container is
+  judged; a sidecar that exits does not mark the sandbox lost. After a resume or restore, `refresh()` re-records the identity for the new pod, so `is_alive()` does not report the restored pod as a replacement.
+- **`reap_orphans(alive_run_ids)`** / `python -m agent_sandbox_rl.reaper --orphans
+  --alive-run-ids a,b`: reap every run in the namespace whose driver the caller
+  does not list as alive, discovered through the run-id label on its claims,
+  pools and templates (pods and Sandboxes are reached through those).
+  This is the sweep an external reaper should call rather than matching names or
+  ages itself; `--min-age-s` (300) protects runs that just started, `--dry-run`
+  reports only. Runs with only pods or Sandboxes left are not discovered (neither
+  carries the run-id label everywhere). Pools, and their templates, that a claim of
+  a run not being reaped still points at are kept, here and in `reap(run_id)`, and
+  so are their pods and the pods those runs claimed from them, which keep the
+  run-id label of the run that created the pool. If the claims, pools or
+  Sandboxes needed to tell those apart cannot be listed, the reap raises
+  `FleetError` before deleting anything instead of treating the unknown set as
+  empty.
+- **`reap("")`** and `--run-id ""` are rejected; an empty id used to select every
+  managed run.
+- `OwnedByAnotherRunError` is now exported from the package root.
+
+### Fixed
+- **`reap()` reaches a run's Sandboxes and pods without relying on the run-id
+  label.** Sandbox CRs never carry it, and pods created before `POD_RUN_ID_LABEL`
+  ([#1807](https://github.com/kubernetes-sigs/agent-sandbox/issues/1807)) carry no
+  run id at all, so the label-based sweeps alone left them to the owner cascade.
+  The sweep now records, before deleting anything, each pool's `status.selector`
+  and each claim's `status.sandbox.name` (and that Sandbox's `status.labelSelector`),
+  deletes those Sandboxes by name and force-deletes pods by every selector, so a
+  stalled owner cascade still ends with the pods gone.
+
+### Fixed (concurrent runs in one namespace —
+[#1736](https://github.com/kubernetes-sigs/agent-sandbox/issues/1736))
+- **`teardown()` is scoped to this run.** It listed claims, pools and templates by
+  the namespace-wide managed label (`app=agent-sandbox-rl`), which also matches
+  every other agent-sandbox-rl run in the namespace; one run finishing deleted a
+  concurrent tenant's entire warm fleet. Teardown now selects by this run's id
+  label (`run_selector()`), as the reaper and the breaker already did. Leftovers
+  of a run that crashed without tearing down are the reaper's job
+  (`reap(run_id=…)`; the namespace-wide sweep is only `reap(all_managed=True)`).
+- **`wait_for_pool_ready()` fails fast when the pool disappears.** A `DELETED`
+  watch event was read as `0/N ready` and the wait idled until `ready_timeout`
+  (900 s by default); a 404 on the dropped-watch re-check did the same. Both now
+  return `False` immediately, with an error log naming the pool.
+- **A pool carrying another run's id label is never written to** (image-derived
+  names collide across runs). Warming it raises a `FleetError` naming the owning
+  run and pointing at `run_isolation="names"` / `adopt_existing=True` / the
+  reaper, instead of quietly consuming a pool whose depth and lifetime belong to
+  someone else. `unwarm_image()` and `set_pool_replicas()` leave it alone with a
+  warning (erroring mid-cleanup would be worse). An unwarm that cannot read the
+  pool keeps the image and its reserved replicas and raises, so a retry releases
+  them exactly once. The writes are conditional on what was inspected: deletes
+  carry the pool's uid as a precondition (and a pool already gone gets no delete
+  by name), the reconcile patch carries its resourceVersion and re-inspects on a
+  conflict, a 409 on create re-checks who owns the existing pool before resizing
+  it. Templates get the same treatment: warming onto a template labelled with
+  another run's id raises the same `FleetError` (even when that run's pool is
+  already gone, so no 409 would fire), and template deletes, on unwarm and on
+  an on-demand claim's rollback, skip another run's template and carry the
+  inspected uid as a precondition.
+  **Behaviour change:** a run whose image-derived pool name is held by another
+  run (including a crashed run's leftover) now fails at warm instead of sharing
+  and resizing that pool.
+
+### Added (concurrent runs — #1736)
+- **`FleetConfig.run_isolation`** (`"none"` default, naming unchanged): `"names"`
+  bakes the run id into every template/pool name for runs sharing a namespace;
+  `"namespace"` gives each run `<namespace>-<run id>`, created on first use and
+  deleted at teardown if the fleet created it, with `run_namespace_labels` and a
+  `run_namespace_setup(cluster, namespace)` hook for a `LocalQueue`, quota or pull
+  secret. Namespace creation is all-or-nothing per attempt (a create or hook
+  failure rolls back what that attempt created, and a namespace still Terminating
+  is an error, not "existing"). A namespace whose rollback or teardown delete
+  fails stays owned, so the next attempt re-runs a hook that has not yet
+  succeeded and the next teardown retries the delete; the hook must therefore
+  tolerate a re-run. `adopt_existing` is rejected with this mode. A
+  `{run_id}` placeholder is accepted in `template_name_prefix` and
+  `pool_name_format` in any mode.
+
+### Added (warm-pool adoption —
+[#1533](https://github.com/kubernetes-sigs/agent-sandbox/issues/1533))
+- **`FleetConfig.pool_name_format`** (default `pool-{template}`, unchanged
+  behaviour): the pool name is an interface, not an internal detail. `{template}`
+  and `{image_hash}` are the placeholders; `"{template}-pool"` lines up with the
+  multi-cluster fleet layer's convention. Validated to render a DNS-1123 name and
+  **rejected if it has no per-image part** — a constant name silently collapses
+  every image onto one pool. `FleetConfig.pool_name(image)` is the single place
+  the SDK names a pool; override it in a subclass for anything the format string
+  can't express.
+- **`FleetConfig.adopt_existing`** (default `False`): plan against the warm pools
+  already in the namespace instead of creating any. Discovery is **by image**
+  (`Resources.discover_pools` resolves each pool's `sandboxTemplateRef` to its
+  template's container image), so it does not depend on the provisioner and this
+  SDK agreeing on a naming scheme. In adopt mode nothing is written — no template
+  create or label reconcile, no pool create/scale/delete, and teardown skips both
+  while still releasing this run's claims. Readiness is ≥1 ready replica, not the
+  observed depth, which belongs to the provisioner.
+- **`PoolNotFoundError`**: raised by `plan()` for a task image no pool serves, and
+  by `acquire()` for an image added after planning. The message names the missing
+  images, the pool name this SDK looked for, and the pool count found per cluster
+  and namespace.
+
+### Fixed
+- **The on-demand fallthrough is no longer silent.** `acquire()` on an unplanned
+  image builds a size-1 pool, which is correct as a fallback and wrong as a
+  surprise: pointed at a cluster whose warm pools are named differently, a harness
+  found none of them and reported a healthy — but far slower — run over the top of
+  a warm fleet it never touched. It now warns once per (cluster, image), naming
+  the pool it created and pointing at `pool_name_format` / `adopt_existing`. The
+  provisioning behaviour itself is unchanged.
+
+### Added (GKE Pod Snapshots — primitives, opt-in)
+- **`ClusterConfig(snapshots=True)`** builds the SDK's GKE PodSnapshot-capable client
+  for that cluster (bound to the cluster's own context *before* the extension's CRD
+  check, so multi-context fleets check the right cluster). Everything else is unchanged
+  when unset.
+- **`SandboxHandle.snapshot() / suspend() / resume() / restore(uid) / list_snapshots()
+  / delete_snapshot(uid) / delete_snapshots() / snapshot_deleter() / is_suspended /
+  refresh()`** — thin wrappers over the SDK
+  extension. Resume/restore bring up a new pod: the handle refreshes `pod_name` /
+  `pod_ip` and drops its exec session; identity (`hostname` / `sandbox_id` /
+  `claim_name`) is stable. `refresh()` retries reading the new pod name and raises if
+  it cannot, rather than keeping the old pod's name. `suspend(snapshot=False)` skips
+  the capture only: `resume()` still restores the latest older snapshot, and
+  cold-boots only when none exists (delete the snapshots first for a cold boot). Extension result objects map to `SnapshotError`
+  (`error_reason` preserved); a non-snapshot sandbox raises `SnapshotsUnavailable`.
+- **`SandboxFleet.snapshot / suspend / resume / restore`** — timed wrappers (run-report
+  phases `snapshot` / `suspend` / `resume` / `restore`, plus a `restored` / `cold`
+  resume count in the report). **`fleet.acquire(task, snapshot_uid=…,
+  pod_annotations=…)`** pins a claim's pod to one snapshot
+  (`podsnapshot.gke.io/ps-name`) — honored on cold start. **`fleet.release(handle,
+  delete_snapshots=True)`** cleans up the sandbox's snapshots (they outlive the claim
+  otherwise): it lists them first, releases, and deletes them by uid only after the
+  release succeeds, so a failed release keeps them. Cleanup failures are logged,
+  never raised.
+- **Preflight** (only for clusters with `snapshots=True`): PodSnapshot CRDs served and
+  a gVisor runtime class configured are hard failures; a missing `PodSnapshotPolicy`
+  in the namespace is a warning. `agent_sandbox_rl.snapshots.pod_restore_status()`
+  reads a pod's `PodRestored` condition (never raises).
+- **`AsyncSandboxFleet`** mirrors the wrappers (`snapshot / suspend / resume / restore`,
+  `acquire(snapshot_uid=…, pod_annotations=…)`, `release(delete_snapshots=…)`) on its
+  thread pool. **`fleet.recording(label)`** records a `RunReport` around primitive
+  calls made outside `run()` (sets `fleet.report`).
+- README → *Snapshots — suspend / resume / restore* (prerequisites, semantics, limits);
+  `examples/run_snapshot_demo.py` (claim → snapshot → suspend → resume → verify).
+- **Suspension frees the claim slot** (review of #1540): `fleet.suspend` gives the
+  slot back to `max_live_sandboxes` and the cluster's claim count, and
+  `fleet.resume` / `fleet.restore` take one again, raising `FleetOvercommitError` at
+  the cap before touching the sandbox and giving the slot back when the wake fails;
+  `release` of a suspended handle does not free it twice. The bare handle methods keep
+  the old accounting (documented).
+- **Unapplied pins are visible**: after `acquire(task, snapshot_uid=…)` the fleet
+  reads the pod's `PodRestored` condition; when the pin did not apply (an adopted,
+  already-running warm pod — the common case) it logs at INFO and sets
+  `handle.pending_snapshot_uid`, cleared by the next resume or restore.
+- **`release(delete_snapshots=True)` lists snapshots by label**, through the Sandbox's
+  `status.labelSelector` and the PodSnapshot API with a `(3, 10)` s request timeout,
+  instead of the engine's unbounded list, so an eviction never waits on the sandbox it
+  is evicting; a failed list keeps the snapshots and warns, as before.
+- **Preflight checks the policy's grouping label**: a `PodSnapshotPolicy` that does not
+  group by `agents.x-k8s.io/sandbox-name-hash` is named in the warning
+  (`policy_groups_by()`); the ok detail names the policies that do.
+- README → *Limits and failure modes* (wedged sandboxes survive restore, a timed-out
+  trigger blocks the next suspend, the 30 s propagation wait, the grouping label).
+
+### Changed (docs / guidance)
+- **Warm-pool worker guidance updated for Agent Sandbox v0.5.4**: the #1215
+  over-creation churn is fixed upstream by
+  [#1266](https://github.com/kubernetes-sigs/agent-sandbox/pull/1266)
+  (expectations-gated creates, terminating-aware counting), so the long-standing
+  "keep `--sandbox-warm-pool-concurrent-workers` ≤10" advice now applies **only to
+  controllers ≤ v0.5.3**. On v0.5.4+ the recommendation is **`100`** (validated clean
+  at `500` workers with 500 warm pools). `FleetConfig.warm_create_budget` is
+  correspondingly reframed from a required #1215 mitigation to an optional apiserver
+  burst bound. Updated: README (controller-flags table + staged-fill notes),
+  `docs/strategies.md`, `examples/rl_integration.md`, `config.py` field comment,
+  the `plan()` deep-warm advisory in `fleet.py`, and `plan_benchmark()` now emits a
+  controller-flags advisory in its rationale.
+
+Initial implementation (design phases 1–7), live-verified on GKE against Agent
+Sandbox `v0.5.0rc1` (v1beta1).
+
+### Added (safety / runaway safeguards)
+- **Circuit breaker** (`config.py`, `fleet.py`): a background monitor
+  (`fleet.overcommit_guard`) samples the live Sandbox count this run owns (by run-id
+  label) and, if it exceeds `min(expected × overcommit_factor, max_live_sandboxes)`,
+  **tears the fleet down and raises `FleetOvercommitError`**. Keys off *intent*, so it
+  catches accidental over-creation (runaway / orphaned driver / warm-pool #1215)
+  regardless of source, and being in-SDK it acts in-process (aborts the run + tears
+  down) rather than needing an external watchdog. It samples via the apiserver, so on a
+  list error it fails **open** (under-counts, not a false trip) — it is not a substitute
+  for control-plane back-pressure during sustained 429s. Wired into `run()`. Config:
+  `overcommit_factor` (1.5), `max_live_sandboxes` (None), `breaker_poll_s` (5.0).
+- **Best-effort teardown + label reaper** (`fleet.py`, `reaper.py`, `constants.py`):
+  every created resource is stamped with a per-run label (`RUN_ID_LABEL` = `fleet.run_id`);
+  `setup()` installs `atexit` + SIGINT/SIGTERM handlers that tear down on **graceful**
+  exits (`install_teardown_hooks`, default on) — best-effort, they can't catch SIGKILL /
+  OOM / node loss. For those abrupt cases, **`reap(run_id=…)`** / `python -m
+  agent_sandbox_rl.reaper` deletes a run's resources by label — the recovery path for an
+  **orphaned** driver that died without cleanup (the failure mode behind the worst incident).
+- **Capacity/QPS advisory** (`fleet.py`): `plan()` attaches `plan.warnings` (+ logs) when
+  the warm footprint or `max_concurrent` looks beyond what the control plane absorbs
+  (Pending-pod risk, apiserver 429 risk, #1215 deep-warm risk). **Warn only — never
+  refuses**: the customer owns their cluster. See `plans/sdk-runaway-safeguards.md` (notes).
+
+### Added (performance & scale)
+- **`recycle=` flag on `run()`** (`fleet.py`, `async_fleet.py`, `strategies.py`):
+  recycling is now an **orthogonal modifier** on the managed runner —
+  `fleet.run(fn, strategy="naive", recycle=True, …)` (and the async twin) — not a
+  strategy value. The chosen warm-pool `strategy` still governs warming; `recycle`
+  swaps the task→sandbox binding to reset-and-reuse via
+  `reuse_git_restore_sandbox(_async)` (executor injection through the strategy
+  functions). Off by default (a no-op for 1:1 eval; only multi-task-per-image shapes
+  benefit, and not every RL/eval scenario resets cleanly). Recycle opts
+  (`reset`/`max_reuses`/`reset_timeout`/`use_session`/`scale_on_hold`; async also
+  `shards_per_image`/`claim_concurrency`) are forwarded and ignored when
+  `recycle=False`. The low-level executors remain public for use outside `run()`.
+- **Sandbox recycling — `reuse_git_restore_sandbox`** (`recycle.py`): reset-and-reuse
+  one claimed sandbox across same-image tasks so **claims scale with problems, not
+  tasks** (÷ tasks-per-image) — the RL-rollout claim-churn lever. `GitRestoreReset`
+  restores `/testbed` to a pristine tag (`git reset --hard` + `clean -xdff` + detach),
+  sweeps processes + `/tmp`, disables git gc/maintenance (avoids shared-store
+  corruption), then **verifies** the repo is back at the pristine SHA and clean; drift
+  → the sandbox is **quarantined** (released, fresh claim) so contamination never
+  silently biases rewards. Reset is **git-only by default** (fast); the site-packages
+  (`pip freeze`) and git-config/hooks tripwires are opt-in (`check_env`/`check_config`,
+  bounded otherwise by `max_reuses` + the canary). Scales via a **persistent exec
+  session** (`SandboxSession`, `use_session=True`): one held-open `bash` stream per
+  sandbox → exec cost O(sandboxes) not O(tasks). Safe on mixed image sets: a non-git
+  `/testbed` falls back to fresh-claim-per-task; an exec failure mid-reset quarantines
+  rather than aborting. `determinism_canary` asserts byte-identical output across a
+  reset (correctness gate). New `reset`/`quarantine`/`rotate` phases in `RunReport`.
+  Measured (no-op, mc=100): RL shape 50×40 reuse 416s/81 claims/100% vs regular
+  944s/1,987/99.35%. Costlier reset tiers (env-dir restore, overlay/checkpoint) are
+  deferred. Design + deep-research hardening: `plans/sandbox-recycling.md`.
+- **`pipelined` strategy** (`strategies.py`, `async_fleet.py`): double-buffered
+  sliding window — prefetch window N+1's pools (background thread / `asyncio.Task`)
+  while window N's tasks run, so image pull overlaps execution. Footprint bounded
+  ≤ 2 windows; new `prefetch` phase in the `RunReport`.
+- **Cross-epoch warm cache** (`fleet.py`, `async_fleet.py`): `run(..., epochs=N)`
+  runs N passes keeping pools resident between them (re-pulls hit the node layer
+  cache), tearing down once at the end (returns `list[list]`); `keep_warm=True`
+  leaves pools up for a caller-driven loop. `warm_image`/`start_warmpools` gained a
+  reuse guard so reuse never re-creates or double-reserves.
+- **Async fleet dedicated thread pool** (`async_fleet.py`): `AsyncSandboxFleet` runs
+  all blocking k8s calls on its own `ThreadPoolExecutor` sized to `max_concurrent`
+  (`min(1024, max(64, max_concurrent + 2×window + 16))`) instead of
+  `asyncio.to_thread`'s shared default pool (`min(32, cpu+4)`). The default pool is
+  tied to the driver's CPU count, not concurrency: under `pipelined` (which overlaps
+  prefetch + process + unwarm, and `wait_for_pool_ready` holds a thread) it starved
+  teardown and **deadlocked** at scale. Fixes that; live-validated (100/100 where it
+  previously hung). `close()` shuts the pool down (called from `__aexit__`).
+- **Parallel pool warming, all strategies** (`fleet.py`, `strategies.py`):
+  `start_warmpools` and the **windowed strategies** (`sliding`/`pipelined`) now warm
+  pools **concurrently** (bounded by `max_concurrent`). Extracted the fan-out into
+  `fleet._warm_entries` and added `fleet.warm_images(images)` (a window warmed in
+  parallel); `_run_windowed`/`_run_pipelined` use it instead of warming one image at a
+  time. Measured at 500 images: `sliding` dropped **2556s → 279s (9.2×)**, making the
+  windowed strategies competitive with `naive` (the async path was already concurrent).
+- **Staged warm fill (`warm_create_budget`)** (`config.py`, `fleet.py`):
+  `start_warmpools`/`setup` warm pools in **waves** of ≤ `warm_create_budget` sandbox
+  creates in flight (default **1000**), waiting for each wave to reach Ready before the
+  next. Bounds the controller's concurrent create burst (Σ pools×replicas) so a large
+  or deep warm can't trip the SandboxWarmPool over-creation race (upstream
+  [#1215](https://github.com/kubernetes-sigs/agent-sandbox/issues/1215)) — the burst
+  that triggers it is `warm-pool-workers × replicas_per_pool`, and the wait between
+  waves lets the informer cache converge. `warm_create_budget=0` (or `create_budget=0`)
+  restores the old warm-all-at-once behavior; a warm ≤ the budget is a single wave
+  (no change). **Reduces but does not by itself eliminate** the controller-side race —
+  for large/deep *cold* warms it must be paired with a low
+  `--sandbox-warm-pool-concurrent-workers` (the churn is per-pool + lagging pod GC).
+  The robust fix is upstream (expectations pattern on warm-pool creates + counting
+  `Terminating` toward the target); the RL-safe path is to not deep-warm at all
+  (recycle → 1 replica/pool).
+- **Recycle scale-on-hold (`scale_on_hold`, default on)** (`recycle.py`): once
+  `reuse_git_restore_sandbox` claims and holds a recyclable sandbox for its group, it
+  drops that image's warm pool (`unwarm_image`) so the controller doesn't
+  **replenish** a replacement the reuse never claims — removing the *sustained*
+  idle-warm footprint (steady state ~1× the held count instead of ~2×) and the
+  ongoing claim-driven replenishment that feeds #1215 (the peak during the initial
+  concurrent-claim burst can still transiently ~2× until claims are staged too).
+  Quarantine/rotation re-claims JIT re-warm first. Verified safe by probe: a claimed
+  sandbox survives its pool being scaled to 0 / deleted (a `SandboxClaim` detaches it
+  from warm-pool ownership). Non-recyclable (fresh-claim-per-task) images keep their
+  pools. `scale_on_hold=False` restores resident pools.
+- **Async recycle (`reuse_git_restore_sandbox_async`)** (`recycle.py`): coroutine-per-group
+  twin of `reuse_git_restore_sandbox` for `AsyncSandboxFleet`. Blocking git/exec/claim calls
+  are offloaded to the fleet's bounded pool, so it **holds far more concurrent recycled
+  sandboxes than the sync thread-per-group executor** (one OS thread per held sandbox) —
+  lifting the driver-side concurrency ceiling. Effective *exec* concurrency is still bounded
+  by the pool + apiserver exec path (a native async I/O backend would lift that too). Same
+  semantics (reset / quarantine / rotate / `scale_on_hold`); `process_fn` may be sync or
+  async. (`AsyncSandboxFleet.start_warmpools` also gained the `create_budget` staging arg.)
+- **Node-aware disk window sizing** (`sizing.py`, `config.py`, `fleet.py`):
+  `recommend_window_disk` / `recommend_window_pipelined` gained a `nodes` arg so the
+  disk budget is the **whole pool's** usable disk (distinct images spread across nodes),
+  not a single node's. New `FleetConfig.cluster_nodes` feeds it (None = conservative
+  single-node bound). On a 30-node pool this lifted the auto window from 25 → 500 images;
+  the capacity planner sets it from the probed node count.
+- **Instant-claim mode for RL** (`config.py`, `sizing.py`, `fleet.py`,
+  `resources.py`): two opt-in levers (both default off) that trade resources for
+  near-zero claim latency. **`FleetConfig.warm_per_task`** sizes each pool to
+  `min(tasks_image, max_warmpool_size)` (one warm replica per task), so every task
+  claims immediately (`compute_replicas(..., per_task=True)`, threaded through the
+  window/disk sizing so windows shrink for the deeper pools; warns+clamps when an
+  image has more tasks than `max_warmpool_size`). **`TemplateSpec.colocate_replicas`**
+  adds a soft `podAffinity` (`topologyKey: kubernetes.io/hostname` on the shared
+  `sandbox=<template>` label) so a pool's replicas prefer one node — only the first
+  pulls the image, the rest start from the node layer cache. These target **RL**
+  (G rollouts per problem image); for **1:1 eval** they're no-ops. They cut the
+  per-rollout claim *tail* (the synchronous straggler), not batch wall. Pair with
+  `naive`/`sliding`, **not** `pipelined` (deep replicas shrink its window and
+  serialize problems). See the README "Eval vs RL" recipes.
+- **`TemplateSpec.image_pull_policy`** (`config.py`, `resources.py`): default
+  `IfNotPresent` so the node layer cache is reused across runs/epochs.
+- **Disk-aware window sizing** (`sizing.py`, `config.py`, `fleet.py`):
+  `recommend_window_disk` / `recommend_window_pipelined`, with
+  `FleetConfig.avg_image_gb` / `node_ephemeral_gb` / `disk_headroom`; caps the auto
+  window so resident images fit node disk.
+- **Image rewriting** (`registry_rewrite.py`): `rewrite_image` / `make_rewriter`
+  + a `load_tasks(image_rewrite=...)` hook to redirect images at an in-region
+  mirror / pull-through cache (original kept in `metadata['original_image']`).
+- **Load-test harness** (`tests/loadtest.py`): parameterized SWE-bench-style load
+  test — `--images N --tasks-per-image K --strategies all|… --image-template …
+  [--task-duration S]` against a live cluster — emitting a self-explanatory report:
+  a **methodology** section, cluster/nodes, image list, warm-pool plan, a per-stage
+  benchmark per strategy (prep create+wait, pool-ready avg/max, **claim latency
+  avg/max = time-to-sandbox**, claims, net task time, warm-pool peak/total/created,
+  wall, efficiency), and a **metric glossary** for the raw RunReport phases. Pure
+  helpers unit-tested in `tests/test_loadtest.py`.
+- **Capacity-aware preload planner** (`agent_sandbox_rl/capacity.py`): a first-class,
+  importable API — `probe_capacity` (reads a pool's allocatable CPU + ephemeral storage +
+  pod density), `plan_benchmark` (optimal plan: strategy `naive` warm-all when it fits, else
+  a disk-bounded `pipelined` window; `max_concurrent`; per-image replicas; binding
+  bottleneck cpu/disk/pods), and `render_plan` (no extra deps). Exposed via
+  `from agent_sandbox_rl import probe_capacity, plan_benchmark, render_plan`. Three entry
+  points: the API, an **interactive wizard** (`examples/plan_capacity.py` — prompts for
+  cluster/pool/batch, prints the plan, offers to run; plan-only/read-only by default), and
+  the benchmark CLI (`tests/run_full_swebench_benchmark.py`, plan-only by default;
+  `--execute` runs it and reports **preload vs task** wall separately). Pure helpers
+  unit-tested in `tests/test_capacity.py`.
+- **Docs**: `docs/strategies.md` — consolidated strategies / sizing / tuning guide
+  (decision table, all-levers table, the four strategies, instant-claim sizing,
+  caching levers incl. pre-pull, Image Streaming, AR mirror, secondary boot disk);
+  README `pipelined`/`epochs`/`keep_warm` + Performance tuning section.
+
+### Fixed (from PR #1049 review)
+- **Async `close()` blocks + cancels by default** (`async_fleet.py`): explicit
+  `close()` / `__aexit__` now `shutdown(wait=True, cancel_futures=True)` so no
+  non-daemon worker thread outlives the close; `__del__` keeps `wait=False` to
+  avoid hanging during GC/finalization.
+- **Explicit empty registry honored** (`fleet.py`): `SandboxFleet(..., registry=ClusterRegistry([]))`
+  no longer falls back to a default ambient `Cluster` (which loads kube-config and
+  failed CI where none exists). `ClusterRegistry` defines `__len__`, so the old
+  `registry or default` treated an empty registry as falsy — now `is not None`.
+  This was the failing `presubmit-agent-sandbox-unit-test` (two `test_registry_rewrite`
+  tests passed locally only because a kube-config was present).
+- **Pipelined peak-pod estimate** (`capacity.py`): `plan.total_warm_pods` for the
+  pipelined branch now reports `2 × window × replicas` (double-buffered: current +
+  prefetch window), matching the x2 per-node disk estimate, instead of one window.
+- **`_warm_entry` honors `wait=True` on reuse** (`fleet.py`): an already-warm image
+  no longer skips the readiness wait when re-warmed with `wait=True` (a prior warm
+  may have used `wait=False`), so the "optionally wait for readiness" contract holds.
+- **`plan_benchmark` validates numeric args** (`capacity.py`): raises `ValueError`
+  for `cpu_request_milli < 1` (was `ZeroDivisionError`), `max_pool < 1`,
+  `avg_image_gb <= 0`, and `disk_headroom` outside `[0, 1)`.
+- **`_disk_spec` docstring corrected** (`fleet.py`): documents that `usable` is
+  `None` (disk cap disabled) unless *both* disk hints are set.
+- **Epoch teardown on failure** (`fleet.py`, `async_fleet.py`): a non-final
+  `epochs>1` pass that raised left warm pools/claims resident (only the last epoch
+  carried `teardown=True`). Both fleets now tear down on a mid-run epoch error when
+  `keep_warm=False`.
+- **Warm-pool replica reconcile + delta reserve** (`resources.py`, `fleet.py`):
+  `create_warmpool(..., reconcile=True)` upserts `spec.replicas` on 409 so a reused
+  pool that needs *more* replicas converges instead of being pinned at its old size
+  (which hung `wait_for_pool_ready`); `_warm_entry` reserves only the delta so reuse
+  never double-counts `active_replicas`. The on-demand claim path keeps the prior
+  idempotent-no-op behavior (no patch on every reused claim).
+- **Bounded async window warming** (`async_fleet.py`): `sliding`/`pipelined` warm a
+  window via `fleet.warm_images` (capped by `max_concurrent`) instead of one
+  `to_thread` per image, so a large window can't fan out hundreds of concurrent API
+  watches.
+- **Registry rewrite normalizes explicit Docker Hub official images**
+  (`registry_rewrite.py`): `docker.io/ubuntu` now mirrors to the same
+  `library/ubuntu` path as the implicit `ubuntu` form.
+- **`warm_images` de-duplicates** its input (`fleet.py`) so a caller's duplicate
+  image can't warm the same pool from two threads at once.
+- **Capacity pipelined disk estimate is per-node** (`capacity.py`): reports
+  `ceil(window/nodes) * replicas * gb * 2` (double-buffer) instead of a cluster
+  total, matching the planner's per-node fit budget.
+- **Tooling**: the capacity wizard forwards `--cpu-request`/`--max-warmpool-size`
+  to the runner (`plan_capacity.py`); the load-test harness closes its fleet even
+  if planning fails (`loadtest.py`); the SWE-bench runner rejects
+  `--tasks-per-image > 1` (it executes one task/image — use `loadtest.py`).
+
+### Changed / hardening (from PR #1000 review)
+- **Prometheus is now an optional `metrics` extra** (`pyproject.toml`,
+  `observability.py`): moved off the core deps, and the `asrl_*` collectors are
+  registered **lazily** on the first metrics-enabled run rather than at import —
+  so importing the package no longer mutates the global Prometheus registry.
+  `RunReport` stays always-on and dependency-free.
+- **Router-free `exec` no longer leaks clients** (`handles.py`, `cluster.py`):
+  reuses a **thread-local** `CoreV1Api` (`Cluster.exec_core_api`) instead of
+  building a fresh `ApiClient` (urllib3 pool + thread pool) per call.
+- **Scoped WarmPool watch** (`resources.py`): `wait_for_pool_ready` passes
+  `field_selector=metadata.name=<name>` so it no longer fans out every other
+  pool's events in the namespace.
+- **CRD manifest dry-run validation** (`resources.py`, `preflight.py`):
+  `Resources.validate_manifests` + a `dry_run` path on `ensure_template` /
+  `create_warmpool` server-side dry-run (`dryRun=All`) the hand-built
+  SandboxTemplate/WarmPool against the live CRD schema; preflight runs it
+  (hard-fails on 400/422 schema rejection, warns otherwise) to catch drift the
+  mocked tests can't.
+- **`_split_budget` cleanup** (`fleet.py`): compute the weight sum once, drop the
+  dead all-zero branch, single-cluster fast path.
+- **Docs**: reconciled the removed `r2egym` extra; surfaced the sizing old-vs-new
+  table and featured pre-pull in the README.
+
+### Added
+- **Config** (`config.py`): `FleetConfig`, `ClusterConfig`, `TemplateSpec`,
+  `ResourceSpec`; deterministic `template_name()`.
+- **Sizing** (`sizing.py`): concurrency-aware `compute_replicas`,
+  `recommend_window`, `plan` (+ `python -m agent_sandbox_rl.sizing` demo).
+- **Constants/exceptions**: v1beta1 groups/versions/plurals incl. the
+  SandboxTemplate/WarmPool ones the SDK lacks; `FleetError` hierarchy.
+- **Multi-cluster** (`cluster.py`): `Cluster` (per-context `ApiClient`, lazy
+  SDK `K8sHelper`/`SandboxClient` via attribute injection) + `ClusterRegistry`.
+- **Resource CRUD** (`resources.py`): SandboxTemplate/SandboxWarmPool create/
+  delete/list + `wait_for_pool_ready` + claim sweep helpers. `wait_for_pool_ready`
+  uses a Kubernetes **watch** (event-driven, near-exact readiness timing, no fixed
+  poll grid; reconnects + falls back to a short re-check on drops).
+- **Environment in RunReport**: `SandboxFleet.describe_environment()` collects
+  per-cluster context/namespace/k8s-version/nodes/node-pools/instance-types/region;
+  `run()` attaches it to `report.environment` (rendered in `summary()`/`to_dict()`).
+  `examples/run_swebench_fleet.py` writes a timestamped `.txt`+`.json` report to
+  `REPORT_DIR` when set.
+- **Sources** (`sources.py`): `Task`, `TaskSource`, `ListSource`, `JsonlSource`,
+  `to_tasks`.
+- **Placement** (`placement.py`): `RoundRobin`, `LeastLoaded`,
+  `CapacityWeighted`, `ImageAffinity`, capacity-aware, `get_placement`.
+- **Handles** (`handles.py`): `SandboxHandle` with `hostname`, `pod_name`,
+  `pod_ip`, `endpoint`, router-free `exec` (thread-safe), `release`.
+- **Fleet** (`fleet.py`): `SandboxFleet` — `load_tasks`, `preflight`, `plan`,
+  `ensure_templates`, `start_warmpools`, `warm_image`/`unwarm_image`, `prepull`,
+  `setup`, `acquire`/`acquire_batch`, `handles`/`hostnames`/`endpoints`,
+  `release`/`release_all`, `teardown`, `run`, context manager.
+- **Strategies + parallelism** (`strategies.py`): `none`/`naive`/`sliding` +
+  `process_parallel` (bounded ThreadPool; per-task errors captured).
+- **Preflight** (`preflight.py`): per-cluster checks → `PreflightReport`.
+- **Pre-pull** (`prepull.py`): DaemonSet image cache (one init container/image).
+- **Async** (`async_fleet.py`): `AsyncSandboxFleet` — awaitable parity over the
+  sync core (thread-backed; `gather`+`Semaphore`; sync or coroutine `process_fn`).
+- **SWE-bench adapter** (`adapters/swebench.py`): `SweBenchSource` (HF dataset),
+  `swebench_probe`.
+- **Observability** (`observability.py`, design phase 8): always-on `RunReport`
+  (per-phase count/total/max, claims, tasks ok/err, warm-replica total+peak;
+  `summary()`/`to_dict()`); opt-in Prometheus `asrl_*` series on the default
+  registry (`asrl_phase_latency_seconds`, `asrl_task_latency_seconds`,
+  `asrl_run_latency_seconds`, `asrl_claims_total`, `asrl_tasks_total`,
+  `asrl_warm_replicas`; labels `phase·cluster·family·strategy·status`); opt-in
+  OpenTelemetry spans that reuse the SDK's tracer/provider so fleet spans nest
+  with the SDK's claim/exec spans; `repo_family()` cardinality bound;
+  `serve_metrics()` HTTP helper. Wired through `fleet.py`/`strategies.py`/
+  `async_fleet.py`; `ObservabilityConfig` on `FleetConfig.observability`;
+  `fleet.report` after `run()`. Prometheus via the optional `metrics` extra
+  (lazy collectors, no import side effects); OTel via the `tracing` extra (no-op
+  when absent).
+- **R2E-Gym adapter** (`adapters/r2egym.py`): `make_fleet_repo_env`,
+  `FleetRepoEnv`, `FleetDockerRuntime`, `r2egym_command_files` — bind a
+  fleet-pre-warmed pod into R2E-Gym's `RepoEnv` (overriding the cold
+  `_start_kubernetes_sandbox`, no-op teardown so the fleet owns the pod, and
+  namespace-forwarding exec/copy) so SWE-bench rollouts reuse warm pools and tunix
+  deepswe benefits transitively. Lazy/guarded (core imports without R2E-Gym).
+  `SweBenchSource(keep_row=True)` stores the full dataset row under
+  `metadata["ds"]` (required by the adapter). R2E-Gym isn't on PyPI, so it's
+  installed from its checkout — there is no `r2egym` extra.
+- **Examples**: `examples/run_swebench_fleet.py` (multi-cluster CLI),
+  `examples/deepswe_eval_nb.ipynb` (no-model R2E-Gym-on-warm-pools demo),
+  `examples/rl_integration.md` (tunix / R2E-Gym / TorchRL / SkyRL).
+- **Docs**: README, `docs/architecture.md`, this changelog.
+- **Tests**: 220 mocked unit tests (sizing incl. disk-aware, config, resources incl. watch-based
+  pool readiness + fail-fast on terminal errors, cluster, sources, placement,
+  fleet incl. 2-cluster routing + acquire rollback + idempotent release,
+  strategies/parallel, preflight, prepull, async, swebench incl. `keep_row`,
+  r2egym adapter (guard + injected-fake-base override logic + namespace isolation
+  under concurrency + bind-failure + thread-safe build), observability incl. the
+  RunReport environment block + duplicate-registration guard).
+
+### Hardening (from an internal code review)
+- r2egym adapter: namespace forwarded explicitly per-call (no global mutation) so
+  concurrent multi-namespace rollouts don't race; thread-safe lazy class build;
+  bind-failure surfaced instead of a half-built runtime.
+- `fleet.acquire()`: roll back + terminate on partial failure (no leaked sandbox
+  / capacity counter); `release()` idempotent under concurrent double-release.
+- `wait_for_pool_ready` fails fast on terminal API errors (401/403/404);
+  `prepull` returns (with a warning) when no nodes match instead of hanging.
+- Observability: Prometheus registration idempotent across re-import; warm-replica
+  gauge updated under the lock. Placement: round-robin thread-safe over a stable
+  ordering; image-affinity hash order-independent. Async `run()` reports the
+  environment block. Misc: SWE-bench `keep_row` deep-copies the row; clearer
+  errors for missing image fields and a non-404 namespace preflight result.
+
+### Notes / known follow-ups
+- Async backend is a thread-backed wrapper; a native `kubernetes_asyncio` path
+  may replace the internals later (API stays the same).
+- Candidate upstreams into `k8s-agent-sandbox`: SandboxTemplate/WarmPool
+  constants + CRUD, and a `K8sHelper(api_client=...)` parameter.
+- Version is dynamic/dev (`0.1.0.dev0`); switch to setuptools-scm on release.

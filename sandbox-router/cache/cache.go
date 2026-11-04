@@ -1,0 +1,515 @@
+// Copyright 2026 The Kubernetes Authors.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+// Package cache maintains an in-memory map from Sandbox UID to Pod IP,
+// populated by a Kubernetes Pod informer. It is the single piece of
+// K8s-aware state in the sandbox-router; the ext_proc handler reads from
+// it on every request to drive Envoy's ORIGINAL_DST cluster.
+//
+// The Sandbox UID is taken from the Pod's controller OwnerReference,
+// not from a Pod label (the controller does not stamp the Sandbox UID as
+// a label today; see sandbox-router/README.md "Why OwnerReferences" for
+// the rationale).
+package cache
+
+import (
+	"context"
+	"errors"
+	"sync"
+	"time"
+
+	"github.com/go-logr/logr"
+
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/fields"
+	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/selection"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/informers"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/tools/cache"
+
+	sandboxv1beta1 "sigs.k8s.io/agent-sandbox/api/v1beta1"
+)
+
+const (
+	// SandboxAPIGroup is the API group of the Sandbox CR. We match on this
+	// + Kind="Sandbox" when inspecting Pod OwnerReferences to identify
+	// sandbox-owned Pods regardless of which CRD version created them.
+	SandboxAPIGroup = "agents.x-k8s.io"
+
+	// SandboxKind is the kind of the controlling resource for sandbox Pods.
+	SandboxKind = "Sandbox"
+
+	// defaultResync is the informer relist period. Short enough to catch
+	// missed events; long enough to not hammer the API server. Matches
+	// typical controller-runtime defaults.
+	defaultResync = 10 * time.Minute
+)
+
+// Entry is a single cached mapping. Returned by Get so future fields
+// (e.g. ready timestamp, ownership labels for authz) can be added without
+// breaking call sites.
+type Entry struct {
+	// SandboxUID is the canonical UID of the Sandbox that owns the Pod.
+	// Authorization consumes this value from the cache rather than
+	// trusting the caller's routing header.
+	SandboxUID types.UID
+
+	// PodUID identifies the Pod that supplied PodIP. It fences delayed
+	// delete and NotReady events from an older Pod after the Sandbox has
+	// been recreated with the same owner UID.
+	PodUID types.UID
+
+	// PodIP is the IPv4/IPv6 address of the sandbox Pod. The ext_proc
+	// handler combines this with the inbound X-Sandbox-Port to build the
+	// upstream target.
+	PodIP string
+
+	// SandboxName is the human-readable Sandbox CR name, taken from the
+	// Pod's controller OwnerReference. It usually equals Pod.Name, but not
+	// for a Pod adopted from a warm pool before warm pools created Sandbox
+	// objects. Together with Namespace it is the key material for the
+	// byName index; also used for logging.
+	SandboxName string
+
+	// Namespace is the K8s namespace of the Sandbox / Pod.
+	Namespace string
+}
+
+// ResolutionSource identifies the cache index that selected an entry.
+type ResolutionSource uint8
+
+const (
+	// ResolutionByUID means the requested UID selected the entry. This
+	// includes unclaimed warm-pool members, which intentionally have no
+	// name-index entry until adoption.
+	ResolutionByUID ResolutionSource = iota + 1
+	// ResolutionByName means the canonical namespace/name index selected
+	// the entry. When a requested UID differs, the name index wins so a
+	// stale incarnation can never override the current Sandbox owner.
+	ResolutionByName
+)
+
+// Cache is a thread-safe Sandbox-UID → Entry map kept up to date by a
+// background Pod informer. Lookups are O(1) and lock-free for the common
+// path (RLock + map read).
+type Cache struct {
+	log      logr.Logger
+	informer cache.SharedIndexInformer
+	factory  informers.SharedInformerFactory
+	stopOnce sync.Once
+	stopCh   chan struct{}
+
+	mu      sync.RWMutex
+	entries map[types.UID]Entry
+	// byName is a secondary index over entries keyed "namespace/name",
+	// maintained under mu in lock-step with entries. SDK traffic carries
+	// only X-Sandbox-Id (no UID), and warm-pool sandboxes have no
+	// per-sandbox Service, so without a name-keyed lookup those requests
+	// fall through to a DNS form that can never resolve (issue #883).
+	byName map[string]types.UID
+}
+
+// Options configure the cache. Namespace is empty for cluster-wide
+// (recommended for the router; sandbox Pods can live in many namespaces).
+type Options struct {
+	Client    kubernetes.Interface
+	Log       logr.Logger
+	Namespace string
+	Resync    time.Duration
+}
+
+// New constructs a Cache backed by a filtered Pod SharedInformer. The
+// informer is NOT started; call Start to launch it and WaitForSync to
+// gate readiness.
+func New(o Options) (*Cache, error) {
+	if o.Client == nil {
+		return nil, errors.New("cache: Client is required")
+	}
+	if o.Resync == 0 {
+		o.Resync = defaultResync
+	}
+	// Server-side filter: only Pods carrying the sandbox-name-hash label.
+	// Reduces informer memory and API traffic substantially in mixed
+	// clusters where most Pods are NOT sandboxes.
+	hashSel, err := labels.NewRequirement(sandboxv1beta1.SandboxNameHashLabel, selection.Exists, nil)
+	if err != nil {
+		return nil, err
+	}
+	tweak := func(opts *metav1.ListOptions) {
+		opts.LabelSelector = labels.NewSelector().Add(*hashSel).String()
+		// Skip Pods that have been scheduled but have no IP yet — they
+		// can't be a useful routing target. Apiserver-side filter.
+		opts.FieldSelector = fields.OneTermNotEqualSelector("status.podIP", "").String()
+	}
+
+	factory := informers.NewSharedInformerFactoryWithOptions(
+		o.Client, o.Resync,
+		informers.WithNamespace(o.Namespace),
+		informers.WithTweakListOptions(tweak),
+	)
+	podInformer := factory.Core().V1().Pods().Informer()
+
+	c := &Cache{
+		log:      o.Log,
+		informer: podInformer,
+		factory:  factory,
+		stopCh:   make(chan struct{}),
+		entries:  make(map[types.UID]Entry),
+		byName:   make(map[string]types.UID),
+	}
+
+	if _, err := podInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
+		AddFunc:    c.onAddOrUpdate,
+		UpdateFunc: c.onUpdate,
+		DeleteFunc: c.onDelete,
+	}); err != nil {
+		return nil, err
+	}
+	return c, nil
+}
+
+// Start launches the informer goroutines. Safe to call once; subsequent
+// calls are no-ops.
+func (c *Cache) Start(ctx context.Context) {
+	go func() {
+		<-ctx.Done()
+		c.stop()
+	}()
+	c.factory.Start(c.stopCh)
+}
+
+// WaitForSync blocks until the informer's initial LIST has been
+// processed, or ctx is canceled. Returns true on successful sync.
+// The gRPC health check should gate SERVING on this.
+func (c *Cache) WaitForSync(ctx context.Context) bool {
+	return cache.WaitForCacheSync(ctx.Done(), c.informer.HasSynced)
+}
+
+// Get looks up the cached entry for the given Sandbox UID. Returns
+// (Entry, true) when known, (Entry{}, false) on cache miss. Lock-free in
+// the common case via sync.RWMutex.
+func (c *Cache) Get(uid types.UID) (Entry, bool) {
+	c.mu.RLock()
+	e, ok := c.entries[uid]
+	c.mu.RUnlock()
+	return e, ok
+}
+
+// GetByName looks up the cached entry by sandbox namespace and Sandbox
+// name (see Entry.SandboxName). Resolution path for callers that send only
+// X-Sandbox-Id / X-Sandbox-Namespace; see byName.
+func (c *Cache) GetByName(namespace, name string) (Entry, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	uid, ok := c.byName[nameKey(namespace, name)]
+	if !ok {
+		return Entry{}, false
+	}
+	e, ok := c.entries[uid]
+	return e, ok
+}
+
+// Resolve returns one canonical entry for a sandbox request under a
+// single read lock. The current namespace/name owner wins whenever the
+// name is indexed, including while an older UID entry still exists after
+// replacement. When the name is not indexed, an exact UID may select an
+// unclaimed warm-pool member after its namespace and name are verified.
+func (c *Cache) Resolve(namespace, name string, requestedUID types.UID) (Entry, ResolutionSource, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	if currentUID, ok := c.byName[nameKey(namespace, name)]; ok {
+		e, exists := c.entries[currentUID]
+		if !exists || e.Namespace != namespace || e.SandboxName != name {
+			return Entry{}, 0, false
+		}
+		if requestedUID != "" && requestedUID == currentUID {
+			return e, ResolutionByUID, true
+		}
+		return e, ResolutionByName, true
+	}
+
+	if requestedUID == "" {
+		return Entry{}, 0, false
+	}
+	e, ok := c.entries[requestedUID]
+	if !ok || e.Namespace != namespace || e.SandboxName != name {
+		return Entry{}, 0, false
+	}
+	return e, ResolutionByUID, true
+}
+
+// Len returns the current number of cached entries. Primarily for tests
+// and metrics; not on the request hot path.
+func (c *Cache) Len() int {
+	c.mu.RLock()
+	n := len(c.entries)
+	c.mu.RUnlock()
+	return n
+}
+
+func (c *Cache) stop() {
+	c.stopOnce.Do(func() { close(c.stopCh) })
+}
+
+// onAddOrUpdate is invoked by the informer for every Add and Update
+// event. We extract the controlling Sandbox UID from OwnerReferences and
+// store (or refresh) the entry only when the Pod is Ready and has an IP.
+//
+// A Pod that flips from Ready to NotReady is removed from the cache so
+// requests don't get routed to a Pod that isn't accepting traffic.
+func (c *Cache) onAddOrUpdate(obj any) {
+	pod, ok := obj.(*corev1.Pod)
+	if !ok {
+		return
+	}
+	owner, ok := sandboxOwnerOf(pod)
+	if !ok {
+		return
+	}
+	uid := owner.UID
+	if !podReady(pod) || pod.Status.PodIP == "" {
+		c.removePod(uid, pod.UID)
+		return
+	}
+	// Unclaimed warm-pool Pods stay out of the name index: before the
+	// index existed they were reachable only with the UID (a de-facto
+	// capability), and keeping that property prevents a caller from
+	// reaching — and pre-poisoning — a pool Pod another workload will
+	// adopt, just by guessing pool-generated names. Adoption removes the
+	// label, and the resulting Pod update indexes the entry.
+	_, unclaimed := pod.Labels[sandboxv1beta1.SandboxWarmPoolLabel]
+	c.upsert(uid, Entry{
+		PodUID:      pod.UID,
+		PodIP:       pod.Status.PodIP,
+		SandboxName: owner.Name,
+		Namespace:   pod.Namespace,
+	}, !unclaimed)
+}
+
+func (c *Cache) onUpdate(oldObj, newObj any) {
+	newPod, ok := newObj.(*corev1.Pod)
+	if !ok {
+		return
+	}
+	c.onAddOrUpdate(newPod)
+
+	oldPod, ok := oldObj.(*corev1.Pod)
+	if !ok {
+		return
+	}
+	oldUID, oldOwned := sandboxUIDOf(oldPod)
+	newUID, newOwned := sandboxUIDOf(newPod)
+	if oldOwned && (!newOwned || oldUID != newUID) {
+		// Publish the new owner first, then remove the old UID. The guarded
+		// name-index delete keeps the new owner canonical in either event
+		// order while preventing the old UID entry from leaking. The Pod
+		// UID fence leaves the old owner's entry alone when a different
+		// Pod already supplies it.
+		c.removePod(oldUID, oldPod.UID)
+	}
+}
+
+func (c *Cache) onDelete(obj any) {
+	// DeletedFinalStateUnknown wraps the last-known state when the
+	// informer missed the delete event. Unwrap it.
+	if d, ok := obj.(cache.DeletedFinalStateUnknown); ok {
+		obj = d.Obj
+	}
+	pod, ok := obj.(*corev1.Pod)
+	if !ok {
+		return
+	}
+	if uid, ok := sandboxUIDOf(pod); ok {
+		c.removePod(uid, pod.UID)
+	}
+}
+
+// upsert stores (or refreshes) the entry. indexName controls whether the
+// entry is reachable through the byName index; unclaimed warm-pool Pods
+// pass false so they stay UID-only.
+func (c *Cache) upsert(uid types.UID, e Entry, indexName bool) {
+	c.mu.Lock()
+	e.SandboxUID = uid
+	prev, existed := c.entries[uid]
+	c.entries[uid] = e
+	// Drop a stale name key only when it still points at this UID, so a
+	// newer Pod that already claimed the name is never clobbered. This
+	// also unindexes an entry whose update flipped indexName to false.
+	if existed {
+		if pk := nameKey(prev.Namespace, prev.SandboxName); (pk != nameKey(e.Namespace, e.SandboxName) || !indexName) && c.byName[pk] == uid {
+			delete(c.byName, pk)
+		}
+	}
+	if indexName {
+		// Last writer wins on name collisions (relist/compaction edge
+		// cases where delete-then-add ordering isn't contractual).
+		c.byName[nameKey(e.Namespace, e.SandboxName)] = uid
+	}
+	c.mu.Unlock()
+	if !existed {
+		c.log.V(1).Info("cache add", "uid", uid, "pod", e.SandboxName, "pod_uid", e.PodUID, "ip", e.PodIP, "ns", e.Namespace)
+	} else if prev.PodIP != e.PodIP {
+		c.log.V(1).Info("cache update", "uid", uid, "pod", e.SandboxName, "pod_uid", e.PodUID, "ip", e.PodIP, "ns", e.Namespace, "prev_ip", prev.PodIP)
+	}
+}
+
+func (c *Cache) remove(uid types.UID) {
+	c.removePod(uid, "")
+}
+
+// removePod removes the entry for uid only when either Pod UID is empty
+// (unknown Pod identity or an internal unconditional eviction) or podUID
+// matches the Pod that currently supplies the entry. Matching the Pod UID
+// prevents a delayed delete or NotReady event for an older Pod from evicting
+// a replacement Pod with the same Sandbox owner, while falling back to
+// unconditional removal when either UID is empty ensures an entry is never
+// stranded with nothing able to evict it.
+func (c *Cache) removePod(uid, podUID types.UID) {
+	c.mu.Lock()
+	cur, found := c.entries[uid]
+	stale := found && cur.PodUID != "" && podUID != "" && cur.PodUID != podUID
+	var existed bool
+	if !stale {
+		existed = c.removeLocked(uid)
+	}
+	c.mu.Unlock()
+	switch {
+	case stale:
+		c.log.V(1).Info("cache remove ignored: event from a replaced pod",
+			"uid", uid, "event_pod_uid", podUID, "cached_pod_uid", cur.PodUID)
+	case existed:
+		c.log.V(1).Info("cache remove", "uid", uid, "pod_uid", podUID)
+	}
+}
+
+// removeLocked deletes the entry for uid and its name-index key. The
+// name key is dropped only when it still points at this UID, so a
+// recreated Pod (same sandbox name, new UID) that already claimed the
+// key keeps its fresh entry. Caller must hold c.mu.
+func (c *Cache) removeLocked(uid types.UID) bool {
+	prev, existed := c.entries[uid]
+	delete(c.entries, uid)
+	if existed {
+		if k := nameKey(prev.Namespace, prev.SandboxName); c.byName[k] == uid {
+			delete(c.byName, k)
+		}
+	}
+	return existed
+}
+
+// Invalidate evicts the entry that dialed describes, returning true when
+// an entry was actually removed. This is the public hook the KEP's
+// "active cache invalidation on connection error" calls for: the proxy
+// invokes it from its ErrorHandler when a dispatch using the cached IP
+// fails, so the next request for the same sandbox falls through to DNS
+// while the informer catches up.
+//
+// dialed is the entry the failed dispatch resolved. Eviction requires the
+// cached entry for dialed.SandboxUID to still carry the same Pod UID and
+// Pod IP, so an entry refreshed while the dial was failing, by a
+// replacement Pod or a new address, survives.
+//
+// Safe to call for an unknown UID — the operation is a no-op.
+func (c *Cache) Invalidate(dialed Entry) bool {
+	c.mu.Lock()
+	cur, found := c.entries[dialed.SandboxUID]
+	refreshed := found && (cur.PodUID != dialed.PodUID || cur.PodIP != dialed.PodIP)
+	var existed bool
+	if found && !refreshed {
+		existed = c.removeLocked(dialed.SandboxUID)
+	}
+	c.mu.Unlock()
+	switch {
+	case refreshed:
+		c.log.V(1).Info("cache invalidation ignored: entry refreshed after the failed dial",
+			"uid", dialed.SandboxUID, "failed_pod_uid", dialed.PodUID, "failed_ip", dialed.PodIP,
+			"cached_pod_uid", cur.PodUID, "cached_ip", cur.PodIP)
+	case existed:
+		c.log.V(1).Info("cache invalidated by caller", "uid", dialed.SandboxUID, "pod_uid", dialed.PodUID, "ip", dialed.PodIP)
+	}
+	return existed
+}
+
+// nameKey builds the byName index key. Namespace and Sandbox names are
+// DNS labels (no "/"), so the separator is unambiguous.
+func nameKey(namespace, name string) string {
+	return namespace + "/" + name
+}
+
+// sandboxUIDOf extracts the Sandbox CR UID from a Pod's controller
+// OwnerReference. Returns ("", false) for Pods not owned by a Sandbox
+// (which shouldn't reach us thanks to the label filter, but the check is
+// cheap insurance against stray events).
+func sandboxUIDOf(pod *corev1.Pod) (types.UID, bool) {
+	ref, ok := sandboxOwnerOf(pod)
+	if !ok {
+		return "", false
+	}
+	return ref.UID, true
+}
+
+// sandboxOwnerOf returns the Pod's controlling Sandbox OwnerReference.
+// Its Name is the canonical Sandbox name: a Pod adopted from a warm pool
+// before warm pools created Sandbox objects keeps its own name, so
+// Pod.Name is not always the Sandbox name.
+func sandboxOwnerOf(pod *corev1.Pod) (*metav1.OwnerReference, bool) {
+	for i := range pod.OwnerReferences {
+		ref := &pod.OwnerReferences[i]
+		if ref.Controller == nil || !*ref.Controller {
+			continue
+		}
+		if ref.Kind != SandboxKind {
+			continue
+		}
+		// OwnerReference.APIVersion looks like "agents.x-k8s.io/v1beta1";
+		// match the group prefix so we don't break across API versions.
+		if !apiVersionInGroup(ref.APIVersion, SandboxAPIGroup) {
+			continue
+		}
+		return ref, true
+	}
+	return nil, false
+}
+
+// apiVersionInGroup reports whether apiVersion ("group/version") is in
+// the given group. Handles versionless input gracefully.
+func apiVersionInGroup(apiVersion, group string) bool {
+	if apiVersion == group {
+		return true
+	}
+	for i := range len(apiVersion) {
+		if apiVersion[i] == '/' {
+			return apiVersion[:i] == group
+		}
+	}
+	return false
+}
+
+// podReady reports whether the Pod's status carries a PodReady=True
+// condition. We require Ready (not just Running) because containers may
+// still be initializing or failing probes; routing to such a Pod produces
+// noisy 502s for the caller.
+func podReady(pod *corev1.Pod) bool {
+	for i := range pod.Status.Conditions {
+		c := &pod.Status.Conditions[i]
+		if c.Type == corev1.PodReady {
+			return c.Status == corev1.ConditionTrue
+		}
+	}
+	return false
+}

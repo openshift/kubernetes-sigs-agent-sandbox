@@ -1,0 +1,28 @@
+# Service name matches the Python router's: existing Gateway/HTTPRoute
+# resources that point at `sandbox-router-svc` keep working when the Go
+# router is the backing deployment. See the package README for the
+# header contract clients use.
+apiVersion: v1
+kind: Service
+metadata:
+  name: sandbox-router-svc
+  namespace: agent-sandbox-system
+  labels:
+    app.kubernetes.io/name: sandbox-router
+    app.kubernetes.io/component: sandbox-router
+  annotations:
+    service.beta.openshift.io/serving-cert-secret-name: sandbox-router-tls
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: sandbox-router
+    app.kubernetes.io/component: sandbox-router
+  ports:
+  - name: proxy
+    port: 8080
+    targetPort: proxy
+    protocol: TCP
+  - name: proxy-tls
+    port: 8443
+    targetPort: proxy-tls
+    protocol: TCP

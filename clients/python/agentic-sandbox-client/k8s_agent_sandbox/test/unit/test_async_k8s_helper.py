@@ -12,6 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import asyncio
+import json
+import os
+import tempfile
 import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -19,8 +23,15 @@ import pytest
 
 pytest.importorskip("kubernetes_asyncio")
 
+import aiohttp
+import certifi
+from kubernetes_asyncio import client
+from kubernetes_asyncio.config import incluster_config
+
+from k8s_agent_sandbox.models import AdditionalPodMetadata
 from k8s_agent_sandbox.async_k8s_helper import AsyncK8sHelper
-from k8s_agent_sandbox.exceptions import SandboxMetadataError, SandboxTemplateNotFoundError
+from k8s_agent_sandbox.exceptions import SandboxClaimFailedError, SandboxMetadataError, SandboxNotFoundError, SandboxTemplateNotFoundError
+from k8s_agent_sandbox.constants import CLIENT_REQUEST_TIME_ANNOTATION
 
 
 class TestAsyncK8sHelperCreateSandboxClaim(unittest.IsolatedAsyncioTestCase):
@@ -31,6 +42,24 @@ class TestAsyncK8sHelperCreateSandboxClaim(unittest.IsolatedAsyncioTestCase):
         self.helper.custom_objects_api = MagicMock()
         self.helper.custom_objects_api.create_namespaced_custom_object = AsyncMock()
         self.helper.core_v1_api = MagicMock()
+
+    async def test_env_included_in_manifest(self):
+        await self.helper.create_sandbox_claim(
+            "test-claim",
+            "test-warmpool",
+            "test-namespace",
+            env={"FOO": "bar", "DEBUG": "true"},
+        )
+
+        call_kwargs = self.helper.custom_objects_api.create_namespaced_custom_object.call_args.kwargs
+        body = call_kwargs["body"]
+        self.assertEqual(
+            body["spec"]["env"],
+            [
+                {"name": "FOO", "value": "bar"},
+                {"name": "DEBUG", "value": "true"},
+            ],
+        )
 
     async def test_lifecycle_included_in_manifest(self):
         lifecycle = {
@@ -54,6 +83,7 @@ class TestAsyncK8sHelperCreateSandboxClaim(unittest.IsolatedAsyncioTestCase):
         call_kwargs = self.helper.custom_objects_api.create_namespaced_custom_object.call_args.kwargs
         body = call_kwargs["body"]
         self.assertNotIn("lifecycle", body["spec"])
+        self.assertEqual(body["metadata"]["labels"], {"agents.x-k8s.io/created-by": "python-client"})
 
     async def test_lifecycle_with_labels_and_annotations(self):
         lifecycle = {
@@ -70,8 +100,52 @@ class TestAsyncK8sHelperCreateSandboxClaim(unittest.IsolatedAsyncioTestCase):
         call_kwargs = self.helper.custom_objects_api.create_namespaced_custom_object.call_args.kwargs
         body = call_kwargs["body"]
         self.assertEqual(body["spec"]["lifecycle"], lifecycle)
-        self.assertEqual(body["metadata"]["labels"], {"agent": "test"})
-        self.assertEqual(body["metadata"]["annotations"], {"key": "val"})
+        self.assertEqual(body["metadata"]["labels"], {"agent": "test", "agents.x-k8s.io/created-by": "python-client"})
+        self.assertEqual(body["metadata"]["annotations"]["key"], "val")
+        self.assertIn(CLIENT_REQUEST_TIME_ANNOTATION, body["metadata"]["annotations"])
+
+    async def test_pod_metadata_included_in_manifest(self):
+        pod_metadata = AdditionalPodMetadata(labels={"client-id": "tenant-a"})
+        await self.helper.create_sandbox_claim(
+            "test-claim", "test-warmpool", "test-namespace", pod_metadata=pod_metadata
+        )
+
+        call_kwargs = self.helper.custom_objects_api.create_namespaced_custom_object.call_args.kwargs
+        body = call_kwargs["body"]
+        self.assertEqual(
+            body["spec"]["additionalPodMetadata"]["labels"]["client-id"], "tenant-a"
+        )
+
+    async def test_pod_metadata_dict_backward_compatible(self):
+        await self.helper.create_sandbox_claim(
+            "test-claim", "test-warmpool", "test-namespace",
+            pod_metadata={"labels": {"client-id": "tenant-a"}, "annotations": {"a": "b"}},
+        )
+
+        call_kwargs = self.helper.custom_objects_api.create_namespaced_custom_object.call_args.kwargs
+        self.assertEqual(
+            call_kwargs["body"]["spec"]["additionalPodMetadata"],
+            {"labels": {"client-id": "tenant-a"}, "annotations": {"a": "b"}},
+        )
+
+    async def test_no_pod_metadata_omits_key(self):
+        await self.helper.create_sandbox_claim(
+            "test-claim", "test-warmpool", "test-namespace"
+        )
+
+        call_kwargs = self.helper.custom_objects_api.create_namespaced_custom_object.call_args.kwargs
+        body = call_kwargs["body"]
+        self.assertNotIn("additionalPodMetadata", body["spec"])
+
+    async def test_created_by_label_override_rejected(self):
+        await self.helper.create_sandbox_claim(
+            "test-claim", "test-warmpool", "test-namespace",
+            labels={"agent": "test", "agents.x-k8s.io/created-by": "foo"},
+        )
+
+        call_kwargs = self.helper.custom_objects_api.create_namespaced_custom_object.call_args.kwargs
+        body = call_kwargs["body"]
+        self.assertEqual(body["metadata"]["labels"], {"agent": "test", "agents.x-k8s.io/created-by": "python-client"})
 
 
 class TestAsyncK8sHelperResolveSandboxName(unittest.IsolatedAsyncioTestCase):
@@ -136,6 +210,227 @@ class TestAsyncK8sHelperResolveSandboxName(unittest.IsolatedAsyncioTestCase):
 
         self.assertIn("SandboxClaim 'test-claim' was deleted while resolving sandbox name", str(context.exception))
 
+    @patch("k8s_agent_sandbox.async_k8s_helper.watch.Watch")
+    async def test_async_wait_for_claim_ready_single_event(self, mock_watch_class):
+        """Warm-pool fast path: name + Ready arrive in one claim status update."""
+        mock_watch = MagicMock()
+        mock_watch.close = AsyncMock()
+        mock_event = {
+            "type": "MODIFIED",
+            "object": {
+                "metadata": {"name": "test-claim"},
+                "status": {
+                    "conditions": [{"type": "Ready", "status": "True"}],
+                    "sandbox": {"name": "warm-sandbox-1", "podIPs": ["10.0.0.5"]},
+                },
+            },
+        }
+
+        async def mock_stream(*args, **kwargs):
+            yield mock_event
+
+        mock_watch.stream = mock_stream
+        mock_watch_class.return_value = mock_watch
+
+        name = await self.helper.wait_for_claim_ready("test-claim", "default", timeout=5)
+        self.assertEqual(name, "warm-sandbox-1")
+        self.assertEqual(mock_watch_class.call_count, 1)
+
+    @patch("k8s_agent_sandbox.async_k8s_helper.watch.Watch")
+    async def test_async_wait_for_claim_ready_name_before_ready(self, mock_watch_class):
+        """Cold-start path: the name lands first, Ready arrives on a later event."""
+        mock_watch = MagicMock()
+        mock_watch.close = AsyncMock()
+        name_only_event = {
+            "type": "MODIFIED",
+            "object": {
+                "metadata": {"name": "test-claim"},
+                "status": {
+                    "conditions": [{"type": "Ready", "status": "False", "reason": "SandboxNotReady"}],
+                    "sandbox": {"name": "cold-sandbox-1"},
+                },
+            },
+        }
+        ready_event = {
+            "type": "MODIFIED",
+            "object": {
+                "metadata": {"name": "test-claim"},
+                "status": {
+                    "conditions": [{"type": "Ready", "status": "True"}],
+                    "sandbox": {"name": "cold-sandbox-1", "podIPs": ["10.0.0.9"]},
+                },
+            },
+        }
+
+        async def mock_stream(*args, **kwargs):
+            yield name_only_event
+            yield ready_event
+
+        mock_watch.stream = mock_stream
+        mock_watch_class.return_value = mock_watch
+
+        name = await self.helper.wait_for_claim_ready("test-claim", "default", timeout=5)
+        self.assertEqual(name, "cold-sandbox-1")
+
+    @patch("k8s_agent_sandbox.async_k8s_helper.watch.Watch")
+    async def test_async_wait_for_claim_ready_terminal_reason_fails_fast(self, mock_watch_class):
+        """A terminal Ready=False reason raises immediately instead of waiting out the timeout."""
+        cases = [
+            ("InvalidConfiguration", "Service 'test-claim' is invalid: must be no more than 63 characters"),
+            ("PodFailed", "Pod failed"),
+            ("PodSucceeded", "Pod completed successfully"),
+        ]
+        for reason, message in cases:
+            with self.subTest(reason=reason):
+                mock_watch = MagicMock()
+                mock_watch.close = AsyncMock()
+                mock_event = {
+                    "type": "MODIFIED",
+                    "object": {
+                        "metadata": {"name": "test-claim"},
+                        "status": {
+                            "conditions": [
+                                {"type": "Ready", "status": "False", "reason": reason, "message": message}
+                            ]
+                        },
+                    },
+                }
+
+                async def mock_stream(*args, **kwargs):
+                    yield mock_event
+
+                mock_watch.stream = mock_stream
+                mock_watch_class.return_value = mock_watch
+
+                with self.assertRaises(SandboxClaimFailedError) as context:
+                    await self.helper.wait_for_claim_ready("test-claim", "default", timeout=5)
+                self.assertIn(reason, str(context.exception))
+
+    @patch("k8s_agent_sandbox.async_k8s_helper.watch.Watch")
+    async def test_async_watch_resource_version_passthrough(self, mock_watch_class):
+        """The ready-wait watch starts from the supplied resourceVersion
+        ("0" by default) so it never forces a quorum etcd read."""
+        mock_watch = MagicMock()
+        mock_watch.close = AsyncMock()
+        mock_event = {
+            "type": "MODIFIED",
+            "object": {
+                "metadata": {"name": "test-claim", "resourceVersion": "7"},
+                "status": {
+                    "conditions": [{"type": "Ready", "status": "True"}],
+                    "sandbox": {"name": "warm-sandbox-1"},
+                },
+            },
+        }
+
+        seen_kwargs = {}
+
+        async def mock_stream(*args, **kwargs):
+            seen_kwargs.update(kwargs)
+            yield mock_event
+
+        mock_watch.stream = mock_stream
+        mock_watch_class.return_value = mock_watch
+
+        name = await self.helper.wait_for_claim_ready(
+            "test-claim", "default", timeout=5, resource_version="12345")
+        self.assertEqual(name, "warm-sandbox-1")
+        self.assertEqual(seen_kwargs["resource_version"], "12345")
+
+        seen_kwargs.clear()
+        name = await self.helper.wait_for_claim_ready("test-claim", "default", timeout=5)
+        self.assertEqual(seen_kwargs["resource_version"], "0")
+
+    @patch("k8s_agent_sandbox.async_k8s_helper.watch.Watch")
+    async def test_async_watch_410_gone_restarts_from_zero(self, mock_watch_class):
+        """A compacted-away resourceVersion (410 Gone) restarts the watch
+        from "0" instead of failing the wait."""
+        mock_watch = MagicMock()
+        mock_watch.close = AsyncMock()
+        mock_event = {
+            "type": "MODIFIED",
+            "object": {
+                "metadata": {"name": "test-claim", "resourceVersion": "7"},
+                "status": {
+                    "conditions": [{"type": "Ready", "status": "True"}],
+                    "sandbox": {"name": "warm-sandbox-1"},
+                },
+            },
+        }
+
+        stream_rvs = []
+
+        async def mock_stream(*args, **kwargs):
+            stream_rvs.append(kwargs.get("resource_version"))
+            if len(stream_rvs) == 1:
+                raise client.ApiException(status=410)
+            yield mock_event
+
+        mock_watch.stream = mock_stream
+        mock_watch_class.return_value = mock_watch
+
+        name = await self.helper.wait_for_claim_ready(
+            "test-claim", "default", timeout=5, resource_version="12345")
+        self.assertEqual(name, "warm-sandbox-1")
+        self.assertEqual(stream_rvs, ["12345", "0"])
+
+    @patch("k8s_agent_sandbox.async_k8s_helper.watch.Watch")
+    async def test_async_watch_transient_disconnect_resumes_from_tracked_resource_version(self, mock_watch_class):
+        """A transient network disconnect (aiohttp.ClientError) resumes from the tracked
+        resourceVersion instead of resetting to '0'."""
+        mock_watch = MagicMock()
+        mock_watch.close = AsyncMock()
+        first_event = {
+            "type": "MODIFIED",
+            "object": {
+                "metadata": {"name": "test-claim", "resourceVersion": "5555"},
+                "status": {"conditions": []},
+            },
+        }
+        ready_event = {
+            "type": "MODIFIED",
+            "object": {
+                "metadata": {"name": "test-claim", "resourceVersion": "7777"},
+                "status": {
+                    "conditions": [{"type": "Ready", "status": "True"}],
+                    "sandbox": {"name": "warm-sandbox-1"},
+                },
+            },
+        }
+
+        stream_rvs = []
+
+        async def mock_stream(*args, **kwargs):
+            stream_rvs.append(kwargs.get("resource_version"))
+            if len(stream_rvs) == 1:
+                yield first_event
+                raise aiohttp.ClientConnectionError("Connection reset by peer")
+            yield ready_event
+
+        mock_watch.stream = mock_stream
+        mock_watch_class.return_value = mock_watch
+
+        name = await self.helper.wait_for_claim_ready(
+            "test-claim", "default", timeout=5, resource_version="12345")
+        self.assertEqual(name, "warm-sandbox-1")
+        self.assertEqual(stream_rvs, ["12345", "5555"])
+
+    @patch("k8s_agent_sandbox.async_k8s_helper.watch.Watch")
+    async def test_async_watch_non_transient_network_exception_reraises(self, mock_watch_class):
+        """Non-transient exceptions (such as ClientSSLError) must not be caught and retried."""
+        mock_watch = MagicMock()
+        mock_watch.close = AsyncMock()
+
+        async def mock_stream(*args, **kwargs):
+            raise aiohttp.ClientSSLError(MagicMock(), OSError("certificate verify failed"))
+            yield  # make this an async generator
+
+        mock_watch.stream = mock_stream
+        mock_watch_class.return_value = mock_watch
+
+        with self.assertRaises(aiohttp.ClientSSLError):
+            await self.helper.wait_for_claim_ready("test-claim", "default", timeout=5)
+
 
 class TestAsyncK8sHelperWaitForSandboxReady(unittest.IsolatedAsyncioTestCase):
 
@@ -151,7 +446,7 @@ class TestAsyncK8sHelperWaitForSandboxReady(unittest.IsolatedAsyncioTestCase):
                 "object": {
                     "status": {
                         "conditions": [{"type": "Ready", "status": "True"}],
-                        "podIPs": ["10.244.0.5", "fd00::5"],
+                        "podIPs": ["::ffff:10.244.0.5", "fd00::5"],
                     }
                 },
             }
@@ -186,6 +481,646 @@ class TestAsyncK8sHelperWaitForSandboxReady(unittest.IsolatedAsyncioTestCase):
             result = await self.helper.wait_for_sandbox_ready("my-sandbox", "default", timeout=10)
 
         self.assertIsNone(result)
+
+    async def test_wait_for_sandbox_ready_transient_disconnect_reconnects(self):
+        """wait_for_sandbox_ready reconnects upon transient aiohttp.ClientError."""
+        ready_event = {
+            "type": "MODIFIED",
+            "object": {
+                "metadata": {"name": "my-sandbox"},
+                "status": {
+                    "conditions": [{"type": "Ready", "status": "True"}],
+                    "podIPs": ["10.244.0.5"],
+                },
+            },
+        }
+
+        call_count = 0
+
+        async def _async_gen(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                raise aiohttp.ClientConnectionError("Connection lost")
+            yield ready_event
+
+        with patch("k8s_agent_sandbox.async_k8s_helper.watch.Watch") as MockWatch:
+            mock_watch = MagicMock()
+            mock_watch.stream = _async_gen
+            mock_watch.close = AsyncMock()
+            MockWatch.return_value = mock_watch
+
+            result = await self.helper.wait_for_sandbox_ready("my-sandbox", "default", timeout=10)
+
+        self.assertEqual(result, "10.244.0.5")
+        self.assertEqual(call_count, 2)
+
+
+class TestAsyncK8sHelperDeleteSandboxClaim(unittest.IsolatedAsyncioTestCase):
+
+    async def asyncSetUp(self):
+        self.helper = AsyncK8sHelper()
+        self.helper._initialized = True
+        self.helper.custom_objects_api = MagicMock()
+        self.helper.core_v1_api = MagicMock()
+
+    async def test_delete_404_is_ignored(self):
+        from kubernetes_asyncio import client as async_client
+        exc = async_client.ApiException(status=404)
+        self.helper.custom_objects_api.delete_namespaced_custom_object = AsyncMock(side_effect=exc)
+
+        await self.helper.delete_sandbox_claim("missing-claim", "default")
+
+    async def test_delete_non_404_reraises(self):
+        from kubernetes_asyncio import client as async_client
+        exc = async_client.ApiException(status=403)
+        self.helper.custom_objects_api.delete_namespaced_custom_object = AsyncMock(side_effect=exc)
+
+        with self.assertRaises(async_client.ApiException) as ctx:
+            await self.helper.delete_sandbox_claim("claim", "default")
+        self.assertEqual(ctx.exception.status, 403)
+
+
+class TestAsyncK8sHelperWaitForGatewayIP(unittest.IsolatedAsyncioTestCase):
+
+    async def asyncSetUp(self):
+        self.helper = AsyncK8sHelper()
+        self.helper._initialized = True
+        self.helper.custom_objects_api = MagicMock()
+
+    async def test_wait_for_gateway_ip_valid_ip(self):
+        async def _async_gen(*args, **kwargs):
+            yield {
+                "type": "MODIFIED",
+                "object": {
+                    "metadata": {"name": "test-gateway"},
+                    "status": {
+                        "addresses": [{"value": "192.168.1.1"}]
+                    }
+                }
+            }
+
+        with patch("k8s_agent_sandbox.async_k8s_helper.watch.Watch") as MockWatch:
+            mock_watch = MagicMock()
+            mock_watch.stream = _async_gen
+            mock_watch.close = AsyncMock()
+            MockWatch.return_value = mock_watch
+
+            ip = await self.helper.wait_for_gateway_ip("test-gateway", "default", timeout=5)
+            self.assertEqual(ip, "192.168.1.1")
+
+    async def test_wait_for_gateway_ip_valid_hostname(self):
+        async def _async_gen(*args, **kwargs):
+            yield {
+                "type": "MODIFIED",
+                "object": {
+                    "metadata": {"name": "test-gateway"},
+                    "status": {
+                        "addresses": [{"value": "gateway.example.com"}]
+                    }
+                }
+            }
+
+        with patch("k8s_agent_sandbox.async_k8s_helper.watch.Watch") as MockWatch:
+            mock_watch = MagicMock()
+            mock_watch.stream = _async_gen
+            mock_watch.close = AsyncMock()
+            MockWatch.return_value = mock_watch
+
+            ip = await self.helper.wait_for_gateway_ip("test-gateway", "default", timeout=5)
+            self.assertEqual(ip, "gateway.example.com")
+
+    async def test_wait_for_gateway_ip_invalid_address_special_chars(self):
+        async def _async_gen(*args, **kwargs):
+            yield {
+                "type": "MODIFIED",
+                "object": {
+                    "metadata": {"name": "test-gateway"},
+                    "status": {
+                        "addresses": [{"value": "192.168.1.1/path"}]
+                    }
+                }
+            }
+            yield {
+                "type": "MODIFIED",
+                "object": {
+                    "metadata": {"name": "test-gateway"},
+                    "status": {
+                        "addresses": [{"value": "192.168.1.1"}]
+                    }
+                }
+            }
+
+        with patch("k8s_agent_sandbox.async_k8s_helper.watch.Watch") as MockWatch:
+            mock_watch = MagicMock()
+            mock_watch.stream = _async_gen
+            mock_watch.close = AsyncMock()
+            MockWatch.return_value = mock_watch
+
+            ip = await self.helper.wait_for_gateway_ip("test-gateway", "default", timeout=5)
+            self.assertEqual(ip, "192.168.1.1")
+
+    async def test_wait_for_gateway_ip_invalid_hostname(self):
+        async def _async_gen(*args, **kwargs):
+            yield {
+                "type": "MODIFIED",
+                "object": {
+                    "metadata": {"name": "test-gateway"},
+                    "status": {
+                        "addresses": [{"value": "bad_hostname"}]
+                    }
+                }
+            }
+            yield {
+                "type": "MODIFIED",
+                "object": {
+                    "metadata": {"name": "test-gateway"},
+                    "status": {
+                        "addresses": [{"value": "192.168.1.1"}]
+                    }
+                }
+            }
+
+        with patch("k8s_agent_sandbox.async_k8s_helper.watch.Watch") as MockWatch:
+            mock_watch = MagicMock()
+            mock_watch.stream = _async_gen
+            mock_watch.close = AsyncMock()
+            MockWatch.return_value = mock_watch
+
+            ip = await self.helper.wait_for_gateway_ip("test-gateway", "default", timeout=5)
+            self.assertEqual(ip, "192.168.1.1")
+
+    async def test_wait_for_gateway_ip_multiple_addresses_in_event(self):
+        async def _async_gen(*args, **kwargs):
+            yield {
+                "type": "MODIFIED",
+                "object": {
+                    "metadata": {"name": "test-gateway"},
+                    "status": {
+                        "addresses": [
+                            {"value": "bad_hostname"},
+                            {"value": "192.168.1.2"},
+                        ]
+                    }
+                }
+            }
+
+        with patch("k8s_agent_sandbox.async_k8s_helper.watch.Watch") as MockWatch:
+            mock_watch = MagicMock()
+            mock_watch.stream = _async_gen
+            mock_watch.close = AsyncMock()
+            MockWatch.return_value = mock_watch
+
+            ip = await self.helper.wait_for_gateway_ip("test-gateway", "default", timeout=5)
+            self.assertEqual(ip, "192.168.1.2")
+
+    async def test_wait_for_gateway_ip_accepts_ipv6(self):
+        async def _async_gen(*args, **kwargs):
+            yield {
+                "type": "MODIFIED",
+                "object": {
+                    "metadata": {"name": "test-gateway"},
+                    "status": {
+                        "addresses": [{"value": "2001:db8::1"}]
+                    }
+                }
+            }
+
+        with patch("k8s_agent_sandbox.async_k8s_helper.watch.Watch") as MockWatch:
+            mock_watch = MagicMock()
+            mock_watch.stream = _async_gen
+            mock_watch.close = AsyncMock()
+            MockWatch.return_value = mock_watch
+
+            ip = await self.helper.wait_for_gateway_ip("test-gateway", "default", timeout=5)
+            self.assertEqual(ip, "2001:db8::1")
+
+    async def test_wait_for_gateway_ip_disguised_ip_decimal(self):
+        async def _async_gen(*args, **kwargs):
+            yield {
+                "type": "MODIFIED",
+                "object": {
+                    "metadata": {"name": "test-gateway"},
+                    "status": {
+                        "addresses": [{"value": "2130706433"}]
+                    }
+                }
+            }
+            yield {
+                "type": "MODIFIED",
+                "object": {
+                    "metadata": {"name": "test-gateway"},
+                    "status": {
+                        "addresses": [{"value": "192.168.1.1"}]
+                    }
+                }
+            }
+
+        with patch("k8s_agent_sandbox.async_k8s_helper.watch.Watch") as MockWatch:
+            mock_watch = MagicMock()
+            mock_watch.stream = _async_gen
+            mock_watch.close = AsyncMock()
+            MockWatch.return_value = mock_watch
+
+            ip = await self.helper.wait_for_gateway_ip("test-gateway", "default", timeout=5)
+            self.assertEqual(ip, "192.168.1.1")
+
+    async def test_wait_for_gateway_ip_disguised_ip_hex(self):
+        async def _async_gen(*args, **kwargs):
+            yield {
+                "type": "MODIFIED",
+                "object": {
+                    "metadata": {"name": "test-gateway"},
+                    "status": {
+                        "addresses": [{"value": "0x7f000001"}]
+                    }
+                }
+            }
+            yield {
+                "type": "MODIFIED",
+                "object": {
+                    "metadata": {"name": "test-gateway"},
+                    "status": {
+                        "addresses": [{"value": "192.168.1.1"}]
+                    }
+                }
+            }
+
+        with patch("k8s_agent_sandbox.async_k8s_helper.watch.Watch") as MockWatch:
+            mock_watch = MagicMock()
+            mock_watch.stream = _async_gen
+            mock_watch.close = AsyncMock()
+            MockWatch.return_value = mock_watch
+
+            ip = await self.helper.wait_for_gateway_ip("test-gateway", "default", timeout=5)
+            self.assertEqual(ip, "192.168.1.1")
+
+    async def test_wait_for_gateway_ip_disguised_ip_dotted_hex(self):
+        async def _async_gen(*args, **kwargs):
+            yield {
+                "type": "MODIFIED",
+                "object": {
+                    "metadata": {"name": "test-gateway"},
+                    "status": {
+                        "addresses": [{"value": "0x7f.0x0.0x0.0x1"}]
+                    }
+                }
+            }
+            yield {
+                "type": "MODIFIED",
+                "object": {
+                    "metadata": {"name": "test-gateway"},
+                    "status": {
+                        "addresses": [{"value": "192.168.1.1"}]
+                }
+            }
+        }
+
+        with patch("k8s_agent_sandbox.async_k8s_helper.watch.Watch") as MockWatch:
+            mock_watch = MagicMock()
+            mock_watch.stream = _async_gen
+            mock_watch.close = AsyncMock()
+            MockWatch.return_value = mock_watch
+
+            ip = await self.helper.wait_for_gateway_ip("test-gateway", "default", timeout=5)
+            self.assertEqual(ip, "192.168.1.1")
+
+    async def test_wait_for_gateway_ip_bare_hex_prefix_ip(self):
+        async def _async_gen(*args, **kwargs):
+            yield {
+                "type": "MODIFIED",
+                "object": {
+                    "metadata": {"name": "test-gateway"},
+                    "status": {
+                        "addresses": [{"value": "0x.1"}]
+                    }
+                }
+            }
+            yield {
+                "type": "MODIFIED",
+                "object": {
+                    "metadata": {"name": "test-gateway"},
+                    "status": {
+                        "addresses": [{"value": "192.168.1.1"}]
+                    }
+                }
+            }
+
+        with patch("k8s_agent_sandbox.async_k8s_helper.watch.Watch") as MockWatch:
+            mock_watch = MagicMock()
+            mock_watch.stream = _async_gen
+            mock_watch.close = AsyncMock()
+            MockWatch.return_value = mock_watch
+
+            ip = await self.helper.wait_for_gateway_ip("test-gateway", "default", timeout=5)
+            self.assertEqual(ip, "192.168.1.1")
+
+    async def test_wait_for_gateway_ip_bare_hex_prefix_ip_dotted(self):
+        async def _async_gen(*args, **kwargs):
+            yield {
+                "type": "MODIFIED",
+                "object": {
+                    "metadata": {"name": "test-gateway"},
+                    "status": {
+                        "addresses": [{"value": "00.0x.0x.1"}]
+                    }
+                }
+            }
+            yield {
+                "type": "MODIFIED",
+                "object": {
+                    "metadata": {"name": "test-gateway"},
+                    "status": {
+                        "addresses": [{"value": "192.168.1.1"}]
+                    }
+                }
+            }
+
+        with patch("k8s_agent_sandbox.async_k8s_helper.watch.Watch") as MockWatch:
+            mock_watch = MagicMock()
+            mock_watch.stream = _async_gen
+            mock_watch.close = AsyncMock()
+            MockWatch.return_value = mock_watch
+
+            ip = await self.helper.wait_for_gateway_ip("test-gateway", "default", timeout=5)
+            self.assertEqual(ip, "192.168.1.1")
+
+    async def test_wait_for_gateway_ip_invalid_label_length(self):
+        long_label = "a" * 64
+        async def _async_gen(*args, **kwargs):
+            yield {
+                "type": "MODIFIED",
+                "object": {
+                    "metadata": {"name": "test-gateway"},
+                    "status": {
+                        "addresses": [{"value": f"{long_label}.example.com"}]
+                    }
+                }
+            }
+            yield {
+                "type": "MODIFIED",
+                "object": {
+                    "metadata": {"name": "test-gateway"},
+                    "status": {
+                        "addresses": [{"value": "gateway.example.com"}]
+                    }
+                }
+            }
+
+        with patch("k8s_agent_sandbox.async_k8s_helper.watch.Watch") as MockWatch:
+            mock_watch = MagicMock()
+            mock_watch.stream = _async_gen
+            mock_watch.close = AsyncMock()
+            MockWatch.return_value = mock_watch
+
+            ip = await self.helper.wait_for_gateway_ip("test-gateway", "default", timeout=5)
+            self.assertEqual(ip, "gateway.example.com")
+
+    async def test_wait_for_gateway_ip_non_dict_address(self):
+        async def _async_gen(*args, **kwargs):
+            yield {
+                "type": "MODIFIED",
+                "object": {
+                    "metadata": {"name": "test-gateway"},
+                    "status": {
+                        "addresses": ["not-a-dict"]
+                    }
+                }
+            }
+            yield {
+                "type": "MODIFIED",
+                "object": {
+                    "metadata": {"name": "test-gateway"},
+                    "status": {
+                        "addresses": [{"value": "192.168.1.1"}]
+                    }
+                }
+            }
+
+        with patch("k8s_agent_sandbox.async_k8s_helper.watch.Watch") as MockWatch:
+            mock_watch = MagicMock()
+            mock_watch.stream = _async_gen
+            mock_watch.close = AsyncMock()
+            MockWatch.return_value = mock_watch
+
+            ip = await self.helper.wait_for_gateway_ip("test-gateway", "default", timeout=5)
+            self.assertEqual(ip, "192.168.1.1")
+
+    async def test_wait_for_gateway_ip_integer_value(self):
+        async def _async_gen(*args, **kwargs):
+            yield {
+                "type": "MODIFIED",
+                "object": {
+                    "metadata": {"name": "test-gateway"},
+                    "status": {
+                        "addresses": [{"value": 2130706433}]
+                    }
+                }
+            }
+            yield {
+                "type": "MODIFIED",
+                "object": {
+                    "metadata": {"name": "test-gateway"},
+                    "status": {
+                        "addresses": [{"value": "192.168.1.1"}]
+                    }
+                }
+            }
+
+        with patch("k8s_agent_sandbox.async_k8s_helper.watch.Watch") as MockWatch:
+            mock_watch = MagicMock()
+            mock_watch.stream = _async_gen
+            mock_watch.close = AsyncMock()
+            MockWatch.return_value = mock_watch
+
+            ip = await self.helper.wait_for_gateway_ip("test-gateway", "default", timeout=5)
+            self.assertEqual(ip, "192.168.1.1")
+
+
+@patch("k8s_agent_sandbox.async_k8s_helper.client.CoreV1Api")
+@patch("k8s_agent_sandbox.async_k8s_helper.client.CustomObjectsApi")
+@patch("k8s_agent_sandbox.async_k8s_helper.client.ApiClient")
+@patch("k8s_agent_sandbox.async_k8s_helper.config")
+class TestAsyncK8sHelperApiClientInjection(unittest.IsolatedAsyncioTestCase):
+
+    async def test_injected_api_client_used_and_no_config_loaded(
+        self, mock_config, mock_api_client_cls, mock_custom_cls, mock_core_cls
+    ):
+        injected = AsyncMock(name="ApiClient")
+        helper = AsyncK8sHelper(api_client=injected)
+        await helper._ensure_initialized()
+        mock_config.load_incluster_config.assert_not_called()
+        mock_config.load_kube_config.assert_not_called()
+        mock_api_client_cls.assert_not_called()
+        mock_custom_cls.assert_called_once_with(injected)
+        mock_core_cls.assert_called_once_with(injected)
+
+        # A caller-injected client must not be closed by the helper.
+        await helper.close()
+        injected.close.assert_not_awaited()
+
+    async def test_injected_api_client_is_exposed_only_when_injected(
+        self, mock_config, mock_api_client_cls, mock_custom_cls, mock_core_cls
+    ):
+        injected = AsyncMock(name="ApiClient")
+        self.assertIs(AsyncK8sHelper(api_client=injected).injected_api_client, injected)
+
+        ambient = AsyncK8sHelper()
+        await ambient._ensure_initialized()
+        self.assertIsNone(ambient.injected_api_client)
+
+    async def test_injected_api_client_still_used_after_close(
+        self, mock_config, mock_api_client_cls, mock_custom_cls, mock_core_cls
+    ):
+        injected = AsyncMock(name="ApiClient")
+        helper = AsyncK8sHelper(api_client=injected)
+
+        await helper.close()
+        await helper._ensure_initialized()
+
+        mock_config.load_incluster_config.assert_not_called()
+        mock_config.load_kube_config.assert_not_called()
+        mock_api_client_cls.assert_not_called()
+        mock_custom_cls.assert_called_once_with(injected)
+        mock_core_cls.assert_called_once_with(injected)
+
+    async def test_internally_created_api_client_is_closed(
+        self, mock_config, mock_api_client_cls, mock_custom_cls, mock_core_cls
+    ):
+        created = AsyncMock(name="ApiClient")
+        mock_api_client_cls.return_value = created
+        helper = AsyncK8sHelper()
+        await helper._ensure_initialized()
+        mock_api_client_cls.assert_called_once_with()
+
+        # A client the helper created must be closed.
+        await helper.close()
+        created.close.assert_awaited_once()
+
+
+class TestAsyncK8sHelperClientCompatibility(unittest.IsolatedAsyncioTestCase):
+    async def test_incluster_token_and_uid_reach_the_request(self):
+        """Exercise real in-cluster auth and delete serialization without network I/O."""
+        original = client.Configuration.get_default_copy()
+        self.addCleanup(client.Configuration.set_default, original)
+        helper = AsyncK8sHelper()
+        self.addAsyncCleanup(helper.close)
+        with tempfile.TemporaryDirectory() as tmp:
+            token_path = os.path.join(tmp, "token")
+            with open(token_path, "w") as f:
+                f.write("test-token")
+            with patch.dict(os.environ, {
+                "KUBERNETES_SERVICE_HOST": "10.0.0.1",
+                "KUBERNETES_SERVICE_PORT": "443",
+            }), patch.object(
+                incluster_config, "SERVICE_TOKEN_FILENAME", token_path
+            ), patch.object(incluster_config, "SERVICE_CERT_FILENAME", certifi.where()):
+                await helper._ensure_initialized()
+
+            api_client = helper.custom_objects_api.api_client
+            response = MagicMock(status=200, data=b"{}")
+            response.getheader.return_value = "application/json"
+            # Keep the generated API, serialization and auth code; replace only I/O.
+            with patch.object(api_client, "request", AsyncMock(return_value=response)) as request:
+                await helper.delete_sandbox_claim("claim", "default", expected_uid="claim-uid")
+            self.assertEqual(request.call_args.args[0], "DELETE")
+            self.assertEqual(request.call_args.kwargs["headers"]["authorization"], "Bearer test-token")
+            self.assertEqual(request.call_args.kwargs["body"]["preconditions"], {"uid": "claim-uid"})
+
+    async def test_real_watch_preserves_readiness_uid_and_cancellation(self):
+        """Exercise the installed Watch across adoption, replacement and cancellation."""
+        async with client.ApiClient() as api_client:
+            helper = AsyncK8sHelper(api_client=api_client)
+            for outcome in ("ready", "replaced", "cancelled"):
+                with self.subTest(outcome=outcome):
+                    response = MagicMock()
+                    events = [
+                        {"type": "ADDED", "object": {
+                            "metadata": {"uid": "claim-uid", "resourceVersion": "10"},
+                            "status": {"sandbox": {"name": "adopted-sandbox"}},
+                        }},
+                        {"type": "MODIFIED", "object": {
+                            "metadata": {"uid": "replacement" if outcome == "replaced" else "claim-uid",
+                                         "resourceVersion": "11", "generation": 2},
+                            "status": {"sandbox": {"name": "adopted-sandbox"},
+                                       "conditions": [{"type": "Ready", "status": "True", "observedGeneration": 2}]},
+                        }},
+                    ]
+                    response.content.readline = AsyncMock(side_effect=(
+                        asyncio.CancelledError() if outcome == "cancelled" else
+                        [(json.dumps(event) + "\n").encode() for event in events]
+                    ))
+                    with patch.object(api_client, "request", AsyncMock(return_value=response)) as request:
+                        wait = helper.wait_for_claim_ready(
+                            "claim", "default", timeout=5, resource_version="9",
+                            expected_uid="claim-uid", require_current_generation=True,
+                        )
+                        if outcome == "ready":
+                            self.assertEqual(await wait, "adopted-sandbox")
+                        else:
+                            with self.assertRaises(SandboxNotFoundError if outcome == "replaced" else asyncio.CancelledError):
+                                await wait
+                    query = dict(request.call_args.kwargs["query_params"])
+                    self.assertEqual(query["resourceVersion"], "9")
+                    self.assertEqual(query["fieldSelector"], "metadata.name=claim")
+                    self.assertTrue(query["watch"])
+                    response.release.assert_called_once()
+                    await helper.close()
+                    self.assertFalse(api_client.rest_client.pool_manager.closed)
+
+
+class TestAsyncK8sHelperWatchTimeout(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.helper = AsyncK8sHelper()
+        self.helper._initialized = True
+        self.helper.custom_objects_api = MagicMock()
+
+    async def test_one_second_wait_observes_ready_resource(self):
+        ready = {"type": "Ready", "status": "True"}
+        cases = [
+            ("resolve_sandbox_name", {"sandbox": {"name": "sandbox"}}, "sandbox"),
+            ("wait_for_claim_ready", {"sandbox": {"name": "sandbox"}, "conditions": [ready]}, "sandbox"),
+            ("wait_for_sandbox_ready", {"conditions": [ready], "podIPs": [{"ip": "10.0.0.1"}]}, "10.0.0.1"),
+            ("wait_for_gateway_ip", {"addresses": [{"value": "10.0.0.2"}]}, "10.0.0.2"),
+        ]
+        for method, status, expected in cases:
+            async def events():
+                yield {"type": "ADDED", "object": {"status": status}}
+
+            with self.subTest(method=method), patch(
+                "k8s_agent_sandbox.async_k8s_helper.time", **{"monotonic.side_effect": [100.0, 100.1]}
+            ), patch("k8s_agent_sandbox.async_k8s_helper.watch.Watch") as watch_cls:
+                watch_cls.return_value.stream.return_value = events()
+                watch_cls.return_value.close = AsyncMock()
+                self.assertEqual(await getattr(self.helper, method)("resource", "default", timeout=1), expected)
+                self.assertEqual(watch_cls.return_value.stream.call_args.kwargs["timeout_seconds"], 1)
+
+    async def test_claim_watch_restarts_during_final_fractional_second(self):
+        async def empty_events():
+            if False:
+                yield None
+
+        async def ready_events():
+            yield {"type": "ADDED", "object": {"status": {"sandbox": {"name": "sandbox"}}}}
+
+        with patch(
+            "k8s_agent_sandbox.async_k8s_helper.time", **{"monotonic.side_effect": [100.0, 100.1, 104.5]}
+        ), patch("k8s_agent_sandbox.async_k8s_helper.watch.Watch") as watch_cls:
+            watch_cls.return_value.stream.side_effect = [empty_events(), ready_events()]
+            watch_cls.return_value.close = AsyncMock()
+            self.assertEqual(await self.helper.resolve_sandbox_name("claim", "default", timeout=5), "sandbox")
+            self.assertEqual(watch_cls.return_value.stream.call_count, 2)
+            self.assertEqual(watch_cls.return_value.stream.call_args.kwargs["timeout_seconds"], 1)
+
+    async def test_expired_wait_does_not_start_watch(self):
+        with patch(
+            "k8s_agent_sandbox.async_k8s_helper.time", **{"monotonic.side_effect": [100.0, 101.0]}
+        ), patch("k8s_agent_sandbox.async_k8s_helper.watch.Watch") as watch_cls:
+            with self.assertRaises(TimeoutError):
+                await self.helper.resolve_sandbox_name("claim", "default", timeout=1)
+            watch_cls.assert_not_called()
+
+
 
 if __name__ == "__main__":
     unittest.main()

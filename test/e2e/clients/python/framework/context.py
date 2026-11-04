@@ -20,6 +20,7 @@ from test.e2e.clients.python.framework.predicates import (
     deployment_ready,
     warmpool_ready,
     gateway_address_ready,
+    httproute_accepted,
 )
 import subprocess
 from urllib3.exceptions import ReadTimeoutError
@@ -32,6 +33,9 @@ DEFAULT_TIMEOUT_SECONDS = 120
 
 class TestContext:
     """Context for E2E tests, managing Kubernetes interactions"""
+    # This is a helper class for tests, not a test class. Setting __test__ = False
+    # prevents pytest from warning about it due to the "Test" prefix.
+    __test__ = False
 
     def __init__(self, kubeconfig_path: Optional[str] = None):
         self.kubeconfig_path = kubeconfig_path or os.environ.get(
@@ -228,6 +232,32 @@ class TestContext:
             timeout,
         )
 
+    def wait_for_httproute_accepted(
+        self,
+        name: str,
+        namespace: Optional[str] = None,
+        timeout=DEFAULT_TIMEOUT_SECONDS,
+    ):
+        """Waits for an HTTPRoute to be accepted by its parent Gateway(s)"""
+        if namespace is None:
+            namespace = self.namespace
+        if not namespace:
+            raise ValueError("Namespace must be provided.")
+
+        custom_objects_api = self.get_custom_objects_api()
+
+        return self.wait_for_object(
+            functools.partial(
+                custom_objects_api.list_namespaced_custom_object,
+                group="gateway.networking.k8s.io",
+                version="v1beta1",  # matches gateway-kind.yaml
+                plural="httproutes",
+            ),
+            name,
+            namespace,
+            httproute_accepted(),
+            timeout,
+        )
 
 if __name__ == "__main__":
     # Example Usage
