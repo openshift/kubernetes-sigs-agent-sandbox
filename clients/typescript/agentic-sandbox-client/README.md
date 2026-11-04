@@ -2,7 +2,7 @@
 
 This TypeScript client provides a high-level interface for creating and interacting with sandboxes managed by the Agent Sandbox controller, mirroring the [Go client](../../go/README.md) and [Python client](../../python/agentic-sandbox-client/README.md).
 
-The surface covers the Kubernetes resource layer (provisioning a `SandboxClaim`, watching it to readiness, and tearing it down via `SandboxClient` / `Sandbox`) and the sandboxd runtime layer (`sandbox.commands.{run,start}()`, `sandbox.files.{read,write,readStream,writeStream,exists,list,delete}()`, `sandbox.health()`, and `sandbox.metadata()`), plus `sandbox.status()` for the Sandbox's Kubernetes readiness. `start()` covers long-running and interactive processes: streamed output, stdin, signals, and a PTY with resizing.
+The surface covers the Kubernetes resource layer (provisioning a `SandboxClaim`, watching it to readiness, and tearing it down via `SandboxClient` / `Sandbox`) and the sandboxd runtime layer (`sandbox.commands.{run,start}()`, `sandbox.files.{read,write,readStream,writeStream,exists,list,delete,mkdir,move,copy}()`, `sandbox.health()`, and `sandbox.metadata()`), plus `sandbox.status()` for the Sandbox's Kubernetes readiness. `start()` covers long-running and interactive processes: streamed output, stdin, signals, and a PTY with resizing.
 
 ## Usage
 
@@ -27,6 +27,9 @@ try {
   await sandbox.files.write("greeting.txt", "hello from the SDK\n");
   const contents = await sandbox.files.read("greeting.txt");
   console.log(new TextDecoder().decode(contents));
+
+  await sandbox.files.mkdir("backup", { parents: true });
+  await sandbox.files.copy("greeting.txt", "backup/greeting.txt");
 
   const listing = await sandbox.files.list(".");
   console.log(listing.entries.map((e) => e.name));
@@ -267,7 +270,7 @@ A few things differ from the buffered methods:
 
 - **Ownership**: `readStream()` resolves once the response headers are validated, before the file is fully downloaded — you must read the returned `ReadableStream` to completion or cancel it (e.g. `reader.cancel()`). An abandoned, unread stream keeps its operation in flight until `opts.timeoutMs` elapses or the sandbox is closed. `writeStream()` consumes its input stream at most once; the SDK cancels it on any termination after consumption starts (timeout, abort, an oversized upload, a non-204 response), but a validation failure that happens *before* the stream is touched (an invalid mode, or content that's already locked by another reader) leaves the stream with you.
 - **Timeouts**: `opts.timeoutMs` (same option as the buffered methods, default 60000) is a total budget from the call through full consumption. For `readStream()` it keeps running even while you're not reading; for `writeStream()` it includes time spent waiting on your input stream. A timeout errors the stream/promise and releases the operation without waiting for another read or write.
-- **Size limits**: `sandboxd.maxDownloadSize` / `sandboxd.maxUploadSize` are enforced incrementally as bytes arrive or are sent, not against a `Content-Length` header — an oversized transfer is aborted mid-stream rather than buffered in full and then rejected. On an oversized upload, sandboxd may already have received a prefix within the limit before the abort; its atomic rename (see "No automatic retry" below) still keeps that prefix from ever becoming the target file's visible content.
+- **Size limits**: `sandboxd.maxDownloadSize` / `sandboxd.maxUploadSize` are enforced incrementally as bytes arrive or are sent, not against a `Content-Length` header — an oversized transfer is aborted mid-stream rather than buffered in full and then rejected. On an oversized upload, sandboxd may already have received a prefix within the limit before the abort; its atomic rename (see "No automatic retry" below) still keeps that prefix from ever becoming the target file's visible content. With `append`, the prefix can stay in the target, so check the file before retrying.
 - **`close()`**: an unconsumed `readStream()` or an in-flight `writeStream()` counts toward `close()`'s in-flight drain, bounded by the same cleanup timeout as every other operation.
 
 ### Health and metadata
@@ -339,7 +342,7 @@ await shell.write("stty size\nexit\n");
 
 All file paths are sandbox-root-relative POSIX paths and are validated **before any network request**, without being decoded or normalized first:
 
-- `""` and `"."` (and equivalent all-dot/empty-segment forms) refer to the sandbox root. `list()` and `exists()` accept it; `read()` passes validation but then rejects because the root is a directory; `write()`/`delete()` reject it up front, as they do a trailing `/`.
+- `""` and `"."` (and equivalent all-dot/empty-segment forms) refer to the sandbox root. `list()` and `exists()` accept it; `read()` passes validation but then rejects because the root is a directory; `write()`, `delete()`, `mkdir()`, `move()`, and `copy()` reject it up front, and `write()`/`delete()` also reject a trailing `/`.
 - An absolute path (leading `/`) is always rejected.
 - Any `..` path segment is always rejected, including for `exists()` (which never silently reports `false` for a rejected path — it throws).
 
@@ -358,10 +361,14 @@ What "retrying" safely means differs per method:
 | `start()` and its handle's `write()`/`signal()`/`resize()` | No | Start the process again | A failed `start()` may have launched the process; a failed `write()` may have delivered a prefix of its data. A process interrupted by a lost connection is killed, not resumed. |
 | `read()` | No | Call it again | The file may have changed between attempts. |
 | `write()` | No | Resend the same `content` | sandboxd replaces the target atomically via a temporary file and rename, so a failed call never leaves the target partially written. But if the acknowledgement was lost, the write may already have committed server-side, and a retry can overwrite a concurrent update from someone else. |
+| `write()` with `append` | No | Check the file first | The append is not atomic, and a retry adds the content again. |
+| `write()` with `createOnly` | No | Call it again | If the acknowledgement was lost, the retry fails with `FAILED_PRECONDITION` because the file exists. A sandboxd that predates `append` and `createOnly` ignores them and replaces the file, so use them only with a matching sandboxd. |
+| `mkdir()` | No | Call it again | Idempotent: it succeeds when the directory already exists. |
+| `move()` / `copy()` | No | Check the source and destination first | If the acknowledgement was lost, the operation may already have happened. A repeated `move()` then fails with `NOT_FOUND` because the source is gone. A repeated `copy()` fails with `CONFLICT` because the destination exists, unless `overwrite` replaces a destination file. |
 | `readStream()` | No | Call it again from the beginning | Discard any partial output and reset your destination first — a partial download is never resumed. The file may have changed between attempts. |
-| `writeStream()` | No | Provide a fresh stream producing the same content | The input stream is consumed at most once, so retrying needs a new stream instance, not the same one rewound. Same atomicity/acknowledgement/concurrent-update caveats as `write()`. |
+| `writeStream()` | No | Provide a fresh stream producing the same content | The input stream is consumed at most once, so retrying needs a new stream instance, not the same one rewound. Same atomicity/acknowledgement/concurrent-update caveats as `write()`. With `append`, an oversized or interrupted stream can leave a prefix in the target, and a retry adds it again. |
 
-The atomicity guarantee — the target path never briefly shows partial content — is independent of whether *you* can tell a given call actually completed server-side, and of whether a retry might overwrite someone else's concurrent write.
+Replacement writes never briefly show partial content at the target path (`append` does not). That guarantee is independent of whether *you* can tell a given call actually completed server-side, and of whether a retry might overwrite someone else's concurrent write.
 
 ### Trust boundary
 

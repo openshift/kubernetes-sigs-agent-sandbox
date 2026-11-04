@@ -25,10 +25,13 @@ This directory contains examples of how to use the Agent Sandbox. Each subdirect
 - [**firecracker-sandbox**](./firecracker-sandbox): An example of running a sandbox on Kata Containers with the Firecracker VMM (`kata-fc`) plus an envd-compatible runtime that matches the E2B data-plane contract.
 - [**gemini-cu-sandbox**](./gemini-cu-sandbox): An example of a Python runtime sandbox for Gemini Computer Use Agent.
 - [**gke-swap**](./gke-swap): Demonstrates how to configure GKE node memory swap with dedicated Local SSDs to drastically increase Chrome pod density from 120 to 200 pods per node.
+- [**gpu-l4-snapshot-sandbox**](./gpu-l4-snapshot-sandbox): Snapshot an L4 GPU sandbox on GKE, suspend it to release the GPU, and resume it with its process and GPU memory restored.
+- [**harbor-terminal-bench**](./harbor-terminal-bench): Terminal-Bench 2.0 through the Harbor evaluation framework with every trial in a `SandboxClaim` (the `clients/integrations/harbor` environment): kind smoke run with the oracle agent, the full benchmark on GKE, and a results report.
 - [**hello-world-sandbox**](./hello-world-sandbox): A simple "Hello World" sandbox example.
 - [**hermes-agent**](./hermes-agent): An example of running Hermes Agent with persistence and custom skills.
 - [**hermes-agents-as-a-service**](./hermes-agents-as-a-service): The multi-user platform pattern distilled from a real agents-as-a-service product: per-user claims over a warm pool, suspend/resume as the cost dial, PVC state survival, and injection-policy enforcement.
 - [**hpa-swp-scaling**](./hpa-swp-scaling): An example of scaling a SandboxWarmPool using Kubernetes Horizontal Pod Autoscaler (HPA).
+- [**hyperlight-sandbox**](./hyperlight-sandbox): An example of running the python runtime sandbox in a Hyperlight micro-VM, with a Unikraft guest kernel and no guest agent, in an ordinary pod that gets `/dev/kvm` from a device plugin, resumed from a saved snapshot in tens of milliseconds so warm pools refill quickly.
 - [**irsa-simulation-localstack**](./irsa-simulation-localstack): Simulating IAM Roles for Service Accounts (IRSA) credential flows for sandboxes using LocalStack.
 - [**jupyterlab**](./jupyterlab): An example of running JupyterLab on Agent-Sandbox.
 - [**kata-aks**](./kata-aks): Full end-to-end example — Python agent, Go client, and sandbox-router — on AKS with Kata Containers (Hyper-V) VM isolation and the warm-pool/claim pattern.

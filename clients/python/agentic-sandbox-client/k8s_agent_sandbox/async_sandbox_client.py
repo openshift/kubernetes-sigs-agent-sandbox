@@ -36,6 +36,7 @@ from kubernetes_asyncio.client import ApiException
 
 from .claim_adoption import validate_claim_name, validate_claim_for_adoption
 from .async_k8s_helper import AsyncK8sHelper
+from .async_connector import _DefaultSSLContext
 from .async_sandbox import AsyncSandbox
 from .exceptions import SandboxNotFoundError
 from .k8s_helper import K8sHelper
@@ -193,15 +194,20 @@ class AsyncSandboxClient(Generic[T]):
         self.tracing_manager, self.tracer = create_tracer_manager(self.tracer_config)
 
         self.k8s_helper = AsyncK8sHelper(api_client=api_client)
-        # Held so atexit cleanup can read configuration/default_headers/cookie live at cleanup time
-        self._injected_api_client = api_client
 
+        # The exit hook holds these two containers, so the client changes them in place and never rebinds them.
         self._active_connection_sandboxes: dict[tuple[str, str], T] = {}
         self._explicit_claims: set[tuple[str, str]] = set()
         self._lock = asyncio.Lock()
+        self._default_ssl_context = _DefaultSSLContext()
 
         if cleanup:
-            atexit.register(self._atexit_cleanup)
+            # Register a static method bound to the cleanup data with functools.partial, so the hook
+            # never keeps the client alive. A bound method of the client would keep it alive until exit.
+            # Pass the api_client itself, not a copy, so exit cleanup reads its settings as they are at exit.
+            atexit.register(functools.partial(
+                AsyncSandboxClient._atexit_cleanup, self._active_connection_sandboxes, self._explicit_claims, api_client
+            ))
 
     async def __aenter__(self) -> Self:
         return self
@@ -232,6 +238,13 @@ class AsyncSandboxClient(Generic[T]):
                 else:
                     self._active_connection_sandboxes.pop(key, None)
         await self.k8s_helper.close()
+        self._default_ssl_context = _DefaultSSLContext()
+
+    def _attach_handle(self, sandbox: T) -> None:
+        """Attach client-owned TLS setup and termination tracking to a handle."""
+        # Preserve existing sandbox_class constructor signatures.
+        sandbox.connector._default_ssl_context = self._default_ssl_context
+        sandbox._on_terminated = functools.partial(self._untrack, self._active_connection_sandboxes)
 
     async def create_sandbox(
         self,
@@ -363,6 +376,7 @@ class AsyncSandboxClient(Generic[T]):
                 k8s_helper=self.k8s_helper,
                 **({"file_config": self.file_config} if self.file_config is not None else {}),
             )
+            self._attach_handle(sandbox)
         except (Exception, asyncio.CancelledError):
             if cleanup_generated:
                 # Preserve legacy rollback even if the create response was lost.
@@ -375,7 +389,6 @@ class AsyncSandboxClient(Generic[T]):
 
         async with self._lock:
             previous = self._active_connection_sandboxes.get((namespace, claim_name))
-            sandbox._on_terminated = functools.partial(self._untrack, self._active_connection_sandboxes)
             self._active_connection_sandboxes[(namespace, claim_name)] = sandbox
         if previous is not None:
             await previous.close_connection()
@@ -470,9 +483,9 @@ class AsyncSandboxClient(Generic[T]):
             k8s_helper=self.k8s_helper,
             **({"file_config": self.file_config} if self.file_config is not None else {}),
         )
+        self._attach_handle(new_handle)
 
         async with self._lock:
-            new_handle._on_terminated = functools.partial(self._untrack, self._active_connection_sandboxes)
             self._active_connection_sandboxes[key] = new_handle
         return new_handle
 
@@ -543,7 +556,12 @@ class AsyncSandboxClient(Generic[T]):
             if (namespace, claim_name) not in self._explicit_claims:
                 await self.delete_sandbox(claim_name, namespace)
 
-    def _atexit_cleanup(self) -> None:
+    @staticmethod
+    def _atexit_cleanup(
+        registry: dict[tuple[str, str], T],
+        explicit_claims: set[tuple[str, str]],
+        injected_api_client: async_client.ApiClient | None,
+    ) -> None:
         """Best-effort atexit cleanup for claims and local sandbox resources.
 
         Tracked sandbox handles use their synchronous, loop-independent
@@ -556,9 +574,9 @@ class AsyncSandboxClient(Generic[T]):
         failures and top-level errors are reported to ``sys.stderr`` rather than raised.
         """
         try:
-            claims = list(self._active_connection_sandboxes.keys())
+            claims = list(registry.keys())
             tracked = [
-                (key, self._active_connection_sandboxes[key]) for key in claims
+                (key, registry[key]) for key in claims
             ]
             if not tracked:
                 return
@@ -575,12 +593,12 @@ class AsyncSandboxClient(Generic[T]):
                         )
 
             atexit_api_client = None
-            if self._injected_api_client is not None:
+            if injected_api_client is not None:
                 atexit_api_client = sync_client.ApiClient(
-                    configuration=_sync_configuration_from_async(self._injected_api_client.configuration),
-                    cookie=self._injected_api_client.cookie,
+                    configuration=_sync_configuration_from_async(injected_api_client.configuration),
+                    cookie=injected_api_client.cookie,
                 )
-                for name, value in dict(self._injected_api_client.default_headers).items():
+                for name, value in dict(injected_api_client.default_headers).items():
                     atexit_api_client.set_default_header(name, value)
 
             # kubernetes registers its own atexit removal of extracted inline cert files, but Python drops
@@ -592,7 +610,7 @@ class AsyncSandboxClient(Generic[T]):
             with kube_config_dir_cm as kube_config_dir:
                 helper = K8sHelper(api_client=atexit_api_client, kube_config_temp_dir=kube_config_dir)
                 for ns, claim_name in (key for key, _ in tracked):
-                    if (ns, claim_name) in self._explicit_claims:
+                    if (ns, claim_name) in explicit_claims:
                         continue
                     try:
                         helper.delete_sandbox_claim(
