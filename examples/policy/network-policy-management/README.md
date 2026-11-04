@@ -237,6 +237,97 @@ spec:
 ```
 
 
+**Example 4: In-cluster Service by DNS name**
+
+This template lets a sandbox call `memory-service` in the `memory` namespace by name. The Service listens on port 80 and forwards to container port 8080. The Secure-by-Default policy blocks this in two ways:
+
+- It points the pod at 8.8.8.8 and 1.1.1.1, which return NXDOMAIN for `memory-service.memory.svc.cluster.local`.
+- It blocks egress to `10.0.0.0/8`, `172.16.0.0/12` and `192.168.0.0/16`, where CoreDNS and the `memory-service` pods have their IPs.
+
+```yaml
+apiVersion: extensions.agents.x-k8s.io/v1beta1
+kind: SandboxTemplate
+metadata:
+  name: in-cluster-service-template
+spec:
+  networkPolicyManagement: Managed
+  networkPolicy:
+    ingress:
+      # Re-allow the standard Sandbox Router
+      - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: agent-sandbox-system
+          podSelector:
+            matchLabels:
+              app: sandbox-router
+    egress:
+      # 1. DNS to CoreDNS (see the note on Service name enumeration below)
+      - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+        ports:
+          - protocol: UDP
+            port: 53
+          - protocol: TCP
+            port: 53
+
+      # 2. The memory-service pods, on the container port (8080), not the Service port (80)
+      - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: memory
+          podSelector:
+            matchLabels:
+              app: memory-service
+        ports:
+          - protocol: TCP
+            port: 8080
+
+      # 3. Public internet, same excepts as the secure default
+      - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 10.0.0.0/8
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+              - 169.254.0.0/16
+        - ipBlock:
+            cidr: "::/0"
+            except:
+              - "fc00::/7"
+              - "fe80::/10"
+
+  podTemplate:
+    spec:
+      dnsPolicy: ClusterFirst
+      # ... rest of the pod template spec (containers, volumes, etc.)
+```
+
+- Rule 1 lets the sandbox resolve any Service name in the cluster, not just `memory-service`. Secure-by-Default points sandboxes at public resolvers so that untrusted code cannot list the cluster's Services; this rule gives that back. Rule 3 still blocks connecting to them. If that is not acceptable, keep the public resolvers and reach the target by IP as in Example 2.
+
+- `dnsPolicy: ClusterFirst` opts the pod out of the public-resolver override, which the controller applies only when `dnsPolicy` is empty. It does nothing else. If the `networkPolicy` block is removed later, the secure default blocks egress to CoreDNS and, with `ClusterFirst` set, DNS fails closed.
+
+- Port 8080 in rule 2: a `NetworkPolicyPort` is a port on the destination pod, not on the Service, so the rule needs the container port. Port 80 here would block every request. This holds for plugins that apply egress policy after the Service address is translated (GKE Dataplane V2, Calico, Cilium). A plugin that applies it before translation would need the Service port; check yours.
+
+- Selectors instead of IPs: rule 2 keeps matching when `memory-service` pods are rescheduled. Every other pod in the cluster stays blocked only if the cluster's pod and Service CIDRs fall inside the excepts in rule 3. If they do not (for example, a pod range in `100.64.0.0/10`), add those CIDRs to the `except` lists.
+
+- NodeLocal DNSCache: pods send DNS to `169.254.20.10` instead of to CoreDNS, so rule 1 does not match. Add an `ipBlock` rule for `169.254.20.10/32` on port 53.
+
+To check from inside a sandbox:
+
+```bash
+getent hosts memory-service.memory.svc.cluster.local   # prints the ClusterIP
+curl -sS -m 5 http://memory-service.memory/            # gets a response
+curl -sS -m 5 http://other-service.other-namespace/    # any other Service: times out
+```
+
+
 
 ## Troubleshooting
 
@@ -264,7 +355,9 @@ Look at the `SandboxTemplate` referenced by your claim's `SandboxWarmPool`.
 
 Not using the built-in `networkPolicy` field, as it relies on standard Kubernetes NetworkPolicies (L3/L4).
 
-However, admins can manage L7 policies by changing the template's management mode:
+For cluster-wide defaults and egress by domain name (FQDN) you still can use `Managed` mode. The [Network Policy API](https://network-policy-api.sigs.k8s.io/) `ClusterNetworkPolicy` works together with Kubernetes `NetworkPolicy`: Admin-tier rules are evaluated before the template-managed policy, `Pass` rules delegate to it, and Baseline-tier rules apply to pods that no `NetworkPolicy` selects. [examples/network-policy-api-sandbox](../../network-policy-api-sandbox/README.md) keeps the templates `Managed` and adds a default deny plus FQDN allowlists on top, using [kube-network-policies](https://kube-network-policies.sigs.k8s.io/) (the SIG Network reference implementation, which can run alongside any CNI) or any other implementation of the API. The FQDN rules use the experimental `domainNames` field, so an implementation that only supports the standard channel has to omit or replace them.
+
+For L7 inspection (HTTP paths, headers, gRPC methods) that only a CNI- or mesh-specific policy object provides, admins can change the template's management mode:
 
 ```yaml
 spec:

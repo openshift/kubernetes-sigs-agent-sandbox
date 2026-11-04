@@ -24,6 +24,7 @@ import (
 	"os/exec"
 	"reflect"
 	"strings"
+	"sync"
 	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -36,6 +37,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/client-go/dynamic"
+	"k8s.io/client-go/rest"
 	"k8s.io/client-go/util/retry"
 	sandboxv1beta1 "sigs.k8s.io/agent-sandbox/api/v1beta1"
 	sandboxextensionsv1beta1 "sigs.k8s.io/agent-sandbox/extensions/api/v1beta1"
@@ -44,16 +46,24 @@ import (
 	"sigs.k8s.io/yaml"
 )
 
-const (
-	// DefaultTimeout is the default timeout for WaitForObject and WaitForObjectNotFound.
-	DefaultTimeout = 60 * time.Second
-)
+// DefaultTimeout is the fallback timeout for WaitForObject and WaitForObjectNotFound
+// when the context carries no deadline. Override via SANDBOX_DEFAULT_TIMEOUT (e.g. "5m")
+// for runtimes with slower pod startup such as kata-remote.
+var DefaultTimeout = func() time.Duration {
+	if v := os.Getenv("SANDBOX_DEFAULT_TIMEOUT"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil && d > 0 {
+			return d
+		}
+	}
+	return 60 * time.Second
+}()
 
 // ClusterClient is an abstraction layer for test cases to interact with the cluster.
 type ClusterClient struct {
 	T
 	client        client.Client
 	dynamicClient dynamic.Interface
+	restConfig    *rest.Config
 	scheme        *runtime.Scheme
 	watchSet      *WatchSet
 }
@@ -237,9 +247,7 @@ func (cl *ClusterClient) PollUntilObjectMatches(obj client.Object, p ...predicat
 
 	timeout := DefaultTimeout
 	if deadline, ok := ctx.Deadline(); ok {
-		if remaining := time.Until(deadline); remaining < timeout {
-			timeout = remaining
-		}
+		timeout = time.Until(deadline)
 	}
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
@@ -269,8 +277,8 @@ func (cl *ClusterClient) PollUntilObjectMatches(obj client.Object, p ...predicat
 // the provided predicates.
 // It will wait for the object to be created, but if the object is deleted,
 // it will return an error.
-// The timeout is capped at DefaultTimeout (1 minute). A shorter timeout can
-// be specified via the context.
+// When the context carries a deadline, that deadline controls the timeout.
+// Otherwise DefaultTimeout (1 minute) is applied.
 // It uses a watch for more precise timing than polling.
 // It uses a shared WatchSet to avoid per-call watch setup latency.
 func (cl *ClusterClient) WaitForObject(ctx context.Context, obj client.Object, p ...predicates.ObjectPredicate) error {
@@ -278,9 +286,7 @@ func (cl *ClusterClient) WaitForObject(ctx context.Context, obj client.Object, p
 
 	timeout := DefaultTimeout
 	if deadline, ok := ctx.Deadline(); ok {
-		if remaining := time.Until(deadline); remaining < timeout {
-			timeout = remaining
-		}
+		timeout = time.Until(deadline)
 	}
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
@@ -422,7 +428,8 @@ func MustWatch[T client.Object](ctx context.Context, cl *ClusterClient, gvr sche
 	if err != nil {
 		// Only fail the test if this isn't the normal "context cancelled" shutdown error.
 		if !errors.Is(err, context.Canceled) {
-			cl.Fatalf("Watch(%v, %+v) failed with: %v", gvr, watchFilter, err)
+			// Note we probably aren't on the main test goroutine, so can't call t.Fatalf.
+			cl.Errorf("Watch(%v, %+v) failed with: %v", gvr, watchFilter, err)
 		}
 	}
 	return done
@@ -549,59 +556,112 @@ func (cl *ClusterClient) validateAgentSandboxInstallation() error {
 	return nil
 }
 
+const (
+	// portForwardReadyMarker is kubectl's bind banner. It is what tells us this
+	// child owns the listener, not an orphan from an earlier attempt.
+	portForwardReadyMarker = "Forwarding from"
+
+	portForwardReadyTimeout = 60 * time.Second
+	portForwardPollInterval = 5 * time.Millisecond
+)
+
+// syncBuffer is a goroutine-safe bytes.Buffer for concurrent write/read of cmd output.
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+// PortForward starts a background `kubectl port-forward` and returns once kubectl
+// reports it has bound localPort, erroring if kubectl exits first or stays silent
+// past portForwardReadyTimeout. Cancelling ctx kills kubectl, so cancellation
+// surfaces as an exit. The forward is torn down when the owning test completes.
 func (cl *ClusterClient) PortForward(ctx context.Context, pod types.NamespacedName, localPort, remotePort int) error {
 	cl.Helper()
-	// Set up a port-forward to the Chrome Debug Port
 	portForward := exec.CommandContext(ctx, "kubectl", "-n", pod.Namespace,
 		"port-forward", "pod/"+pod.Name, fmt.Sprintf("%d:%d", localPort, remotePort))
 	cl.Logf("starting port-forward: %s", portForward.String())
-	var stdout bytes.Buffer
-	var stderr bytes.Buffer
-	portForward.Stdout = io.MultiWriter(os.Stdout, &stdout)
-	portForward.Stderr = io.MultiWriter(os.Stderr, &stderr)
-	if err := portForward.Start(); err != nil {
+	return cl.startPortForward(portForward, portForwardReadyTimeout)
+}
+
+// startPortForward supervises cmd until its stdout reports portForwardReadyMarker.
+// Split from PortForward so tests can supply their own command.
+func (cl *ClusterClient) startPortForward(cmd *exec.Cmd, timeout time.Duration) error {
+	cl.Helper()
+
+	var stdout, stderr syncBuffer
+	cmd.Stdout = io.MultiWriter(os.Stdout, &stdout)
+	cmd.Stderr = io.MultiWriter(os.Stderr, &stderr)
+	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("failed to start port-forward: %w", err)
 	}
 
-	stopProcess := func() {
-		if portForward.ProcessState != nil {
-			if portForward.ProcessState.Exited() {
-				return
-			}
-		}
-		cl.Log("killing port-forward")
-		if err := portForward.Process.Kill(); err != nil && !errors.Is(err, os.ErrProcessDone) {
-			cl.Errorf("failed to kill port-forward: %s", err)
-		}
-	}
-	cl.Cleanup(stopProcess)
-
+	// ProcessState is racy with Wait, and Exited() is false for signalled
+	// children; a channel closed by Wait covers every exit reason.
+	var waitErr error
+	exited := make(chan struct{})
 	go func() {
-		cl.Helper()
-		if err := portForward.Wait(); err != nil {
-			cl.Logf("port-forward exited with error: %s", err)
-		} else {
-			cl.Log("port-forward exited")
-		}
+		waitErr = cmd.Wait()
+		close(exited)
 	}()
 
-	// There is a delay after starting the process before it starts listening.
-	// Wait for the "Forwarding from" message
+	cl.Cleanup(func() {
+		select {
+		case <-exited:
+			cl.Logf("port-forward already exited: %v", waitErr)
+			return
+		default:
+		}
+		cl.Log("killing port-forward")
+		if err := cmd.Process.Kill(); err != nil && !errors.Is(err, os.ErrProcessDone) {
+			cl.Errorf("failed to kill port-forward: %s", err)
+			return
+		}
+		// Callers reuse fixed local ports, which stay bound until kubectl exits.
+		<-exited
+	})
+
+	readyTimer := time.NewTimer(timeout)
+	defer readyTimer.Stop()
+	pollTick := time.NewTicker(portForwardPollInterval)
+	defer pollTick.Stop()
+
 	for {
-		if portForward.ProcessState != nil {
-			if portForward.ProcessState.Exited() {
-				return fmt.Errorf("port-forward process exited unexpectedly: stdout=%q stderr=%q", stdout.String(), stderr.String())
-			}
+		if strings.Contains(stdout.String(), portForwardReadyMarker) {
+			cl.Logf("port-forward is ready\nstdout: %s\nstderr: %s", stdout.String(), stderr.String())
+			return nil
 		}
 
-		// Check stdout for the "Forwarding from" message
-		if strings.Contains(stdout.String(), "Forwarding from") {
-			cl.Logf("port-forward is ready\nstdout: %s\nstderr: %s", stdout.String(), stderr.String())
-			break
+		select {
+		case <-exited:
+			// Wait drains the output copiers, so the buffers are complete here.
+			reason := "before readiness was observed"
+			if strings.Contains(stdout.String(), portForwardReadyMarker) {
+				reason = "after binding the port"
+			}
+			if waitErr != nil {
+				return fmt.Errorf("port-forward exited %s: %w (stdout=%q stderr=%q)",
+					reason, waitErr, stdout.String(), stderr.String())
+			}
+			return fmt.Errorf("port-forward exited %s (stdout=%q stderr=%q)",
+				reason, stdout.String(), stderr.String())
+		case <-readyTimer.C:
+			return fmt.Errorf("port-forward did not report %q within %s (stdout=%q stderr=%q)",
+				portForwardReadyMarker, timeout, stdout.String(), stderr.String())
+		case <-pollTick.C:
 		}
-		time.Sleep(5 * time.Millisecond)
 	}
-	return nil
 }
 
 var sandboxGVK = schema.GroupVersionKind{
@@ -653,6 +713,21 @@ func (cl *ClusterClient) WaitForWarmPoolReady(ctx context.Context, sandboxWarmpo
 	}
 	return nil
 
+}
+
+// WaitForWarmPoolMinReady watches until at least minReady replicas are ready.
+// Returns an error if minReady exceeds spec.replicas — the caller must pass a valid count.
+func (cl *ClusterClient) WaitForWarmPoolMinReady(ctx context.Context, sandboxWarmpoolID types.NamespacedName, minReady int32) error {
+	cl.Helper()
+	cl.Logf("Waiting for SandboxWarmPool %s to have at least %d ready replicas", sandboxWarmpoolID, minReady)
+
+	warmpool := &unstructured.Unstructured{}
+	warmpool.SetGroupVersionKind(sandboxWarmpoolGVK)
+	if err := cl.client.Get(ctx, sandboxWarmpoolID, warmpool); err != nil {
+		return fmt.Errorf("getting warmpool %s: %w", sandboxWarmpoolID, err)
+	}
+
+	return cl.WaitForObject(ctx, warmpool, &predicates.MinReadyReplicasPredicate{MinReady: int(minReady)})
 }
 
 // GetSandbox returns the Sandbox object from the cluster.
@@ -708,12 +783,13 @@ func (cl *ClusterClient) IsKindCluster() bool {
 		if strings.HasPrefix(node.Spec.ProviderID, "kind://") {
 			return true
 		}
-		if strings.HasPrefix(node.Spec.ProviderID, "gce://") {
+		// Any other provider id (gce://, aws://, azure://, ...) is a real cluster.
+		if node.Spec.ProviderID != "" {
 			return false
 		}
-		cl.Logf("Unknown node provider id %q", node.Spec.ProviderID)
+		cl.Logf("Node %q has no provider id", node.Name)
 	}
 
-	cl.Fatalf("cannot determine if cluster is kind (no node with recognized providerID)")
+	cl.Fatalf("cannot determine if cluster is kind (no node with a providerID)")
 	return false
 }

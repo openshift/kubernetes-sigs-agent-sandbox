@@ -12,22 +12,28 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import atexit
 import logging
-import requests
-from .trace_manager import create_tracer_manager, trace_span, trace
+from typing import Callable
+from .trace_manager import create_tracer_manager
+from .trace_manager import trace_span
 from .commands.command_executor import CommandExecutor
 from .files.filesystem import Filesystem
+from .watcher.file_watcher import FileWatcher
 from .models import (
     SandboxConnectionConfig,
-    SandboxInClusterConnectionConfig,
+    SandboxFileConfig,
+    SandboxHealth,
     SandboxLocalTunnelConnectionConfig,
+    SandboxMetadata,
     SandboxTracerConfig,
 )
-from .exceptions import SandboxNotFoundError
 from .k8s_helper import K8sHelper
 from .connector import SandboxConnector
-from .constants import POD_NAME_ANNOTATION, SANDBOX_NAME_HASH_LABEL
+from .constants import POD_NAME_ANNOTATION
+from .utils import select_pod_ip, extract_sandbox_name_hash
+
+logger = logging.getLogger(__name__)
+
 
 class Sandbox:
     """
@@ -39,6 +45,11 @@ class Sandbox:
     - Handling the underlying connection.
     - Integrating with OpenTelemetry for tracing operations.
     """
+
+    # The client that tracks this handle sets this hook, so terminate() can drop the
+    # client's entry once the claim is gone.
+    _on_terminated: Callable[["Sandbox"], None] | None = None
+
     def __init__(
         self,
         claim_name: str,
@@ -47,9 +58,11 @@ class Sandbox:
         connection_config: SandboxConnectionConfig | None = None,
         tracer_config: SandboxTracerConfig | None = None,
         k8s_helper: K8sHelper | None = None,
-    ):
+        *,
+        file_config: SandboxFileConfig | None = None,
+    ) -> None:
         # Sandbox Related Configuration
-        self.claim_name = claim_name
+        self.claim_name: str | None = claim_name
         self.sandbox_id = sandbox_id
         self.namespace = namespace
         self.connection_config = connection_config or SandboxLocalTunnelConnectionConfig()
@@ -63,6 +76,8 @@ class Sandbox:
             connection_config=self.connection_config,
             k8s_helper=self.k8s_helper,
             get_pod_ip=self.get_pod_ip,
+            get_pod_name=self.get_pod_name,
+            get_service_fqdn=self.get_service_fqdn,
         )
 
         # Tracer initialization
@@ -71,13 +86,17 @@ class Sandbox:
         self.tracing_manager, self.tracer = create_tracer_manager(self.tracer_config)
 
         # Initialisation of namespaced engines
-        self._commands = CommandExecutor(self.connector, self.tracer, self.trace_service_name)
-        self._files = Filesystem(self.connector, self.tracer, self.trace_service_name)
+        self._commands: CommandExecutor | None = CommandExecutor(self.connector, self.tracer, self.trace_service_name)
+        self._files: Filesystem | None = Filesystem(
+            self.connector, self.tracer, self.trace_service_name,
+            **({"file_config": file_config} if file_config is not None else {}),
+        )
+        self._watcher: FileWatcher | None = FileWatcher(self.connector, self.tracer, self.trace_service_name)
         
         # Internal state tracking
         self._is_closed = False
-        self._pod_name = None
-        self._sandbox_name_hash = None
+        self._pod_name: str | None = None
+        self._sandbox_name_hash: str | None = None
         
     def get_pod_name(self) -> str:
         """Fetches the Sandbox object from Kubernetes and retrieves its current pod name."""
@@ -88,7 +107,7 @@ class Sandbox:
         metadata = sandbox_object.get('metadata') or {}
         annotations = metadata.get('annotations') or {}
         pod_name = annotations.get(POD_NAME_ANNOTATION)
-        self._pod_name = pod_name if pod_name is not None else self.sandbox_id
+        self._pod_name = pod_name if pod_name else self.sandbox_id
         return self._pod_name
 
 
@@ -101,27 +120,31 @@ class Sandbox:
             return self._sandbox_name_hash
 
         sandbox_object = self.k8s_helper.get_sandbox(self.sandbox_id, self.namespace) or {}
-        status = sandbox_object.get('status') or {}
-        selector = status.get('selector') or ""
-        if "=" in selector:
-            key, value = selector.split("=")
-            if key == SANDBOX_NAME_HASH_LABEL:
-                self._sandbox_name_hash = value
-                return value
-                
-        return None
+        sandbox_name_hash = extract_sandbox_name_hash(sandbox_object)
+        if sandbox_name_hash:
+            self._sandbox_name_hash = sandbox_name_hash
+
+        return sandbox_name_hash
 
     def get_pod_ip(self) -> str | None:
-        """Fetches the first pod IP from the Sandbox status.
+        """Selects a pod IP from the Sandbox status (prefers IPv4, normalizes canonical form).
 
         Always queries the K8s API for the latest IP — the pod IP can change
-        after a pod restart (e.g. when spec.operatingMode is set to Suspended and resumed 
+        after a pod restart (e.g. when spec.operatingMode is set to Suspended and resumed
         via setting spec.operatingMode to Running).
-        Returns None if the controller does not populate podIPs.
+        Returns None if no valid IP can be selected.
         """
         sandbox_object = self.k8s_helper.get_sandbox(self.sandbox_id, self.namespace) or {}
-        pod_ips = sandbox_object.get('status', {}).get('podIPs', [])
-        return pod_ips[0] if pod_ips else None
+        status_data = sandbox_object.get("status") or {}
+        pod_ips = status_data.get('podIPs', [])
+        return select_pod_ip(pod_ips)
+
+    def get_service_fqdn(self) -> str | None:
+        """Return the controller-reported Service FQDN, when available."""
+        sandbox_object = self.k8s_helper.get_sandbox(self.sandbox_id, self.namespace) or {}
+        status_data = sandbox_object.get("status") or {}
+        fqdn = status_data.get("serviceFQDN")
+        return fqdn if isinstance(fqdn, str) and fqdn else None
 
     def status(self) -> tuple[str, str]:
         """
@@ -135,8 +158,8 @@ class Sandbox:
         if not sandbox_object:
             return "SandboxNotFound", "Sandbox object not found in Kubernetes."
 
-        status_data = sandbox_object.get("status", {})
-        for cond in status_data.get("conditions", []):
+        status_data = sandbox_object.get("status") or {}
+        for cond in status_data.get("conditions") or []:
             if cond.get("type") == "Ready":
                 message = cond.get("message", "")
                 if cond.get("status") == "True":
@@ -145,6 +168,39 @@ class Sandbox:
                     return "SandboxNotReady", message
 
         return "SandboxNotReady", "Unknown message"
+
+    @trace_span("health")
+    def health(self, timeout: int = 60) -> SandboxHealth:
+        """Query sandboxd's /v1/health endpoint. sandboxd runtime only.
+
+        The legacy python-runtime has no equivalent endpoint and raises
+        ``NotImplementedError``.
+        """
+        if not self.connector.is_sandboxd():
+            raise NotImplementedError(
+                "health() is only supported by the sandboxd runtime; the "
+                "legacy python-runtime has no equivalent endpoint"
+            )
+        response = self.connector.send_request(
+            "GET", "v1/health", timeout=timeout)
+        return SandboxHealth.from_sandboxd(response.json())
+
+    @trace_span("metadata")
+    def metadata(self, timeout: int = 60) -> SandboxMetadata:
+        """Query sandboxd's /v1/metadata endpoint. sandboxd runtime only.
+
+        Returns orchestrator-injected, non-sensitive runtime configuration
+        (e.g. sandbox id, workspace path, env). The legacy python-runtime
+        has no equivalent endpoint and raises ``NotImplementedError``.
+        """
+        if not self.connector.is_sandboxd():
+            raise NotImplementedError(
+                "metadata() is only supported by the sandboxd runtime; the "
+                "legacy python-runtime has no equivalent endpoint"
+            )
+        response = self.connector.send_request(
+            "GET", "v1/metadata", timeout=timeout)
+        return SandboxMetadata.from_sandboxd(response.json())
 
     @property
     def commands(self) -> CommandExecutor | None:
@@ -155,6 +211,11 @@ class Sandbox:
         return self._files
 
     @property
+    def watcher(self) -> FileWatcher | None:
+        """Filesystem event streaming interface (sandboxd runtime only)."""
+        return self._watcher
+
+    @property
     def is_active(self) -> bool:
         """
         Returns True if the connection hasn't been explicitly closed 
@@ -162,7 +223,7 @@ class Sandbox:
         """
         return not self._is_closed and self._commands is not None and self._files is not None
 
-    def close_connection(self):
+    def close_connection(self) -> None:
         """
         Closes the client-side connection and disables execution engines locally,
         but leaves the remote Kubernetes Sandbox infrastructure running.
@@ -171,31 +232,41 @@ class Sandbox:
         """
         if self._is_closed:
             return
+        # Invalidate the cached pod name: a suspend/resume can bind this
+        # sandbox to a differently-named pod, and a stale name would make the
+        # next reconnect port-forward to a pod that no longer exists.
+        self._pod_name = None
         # Close client side connection
         self.connector.close()
+        # SandboxConnector.close() also resets live connections on errors and
+        # during snapshot suspend and resume, so it keeps the sandbox callbacks.
+        # close_connection() drops them here once this Sandbox closes for good.
+        # AsyncSandboxConnector.close() is final and drops them itself.
+        self.connector._release_sandbox_callbacks()
         
         # Don't allow anymore further executions.
         self._commands = None
         self._files = None
+        self._watcher = None
         
         # Cleanup Trace if it exists
         if self.tracing_manager:
             try:
                 self.tracing_manager.end_lifecycle_span()
             except Exception as e:
-                logging.error(f"Failed to end tracing span: {e}")
+                logger.error(f"Failed to end tracing span: {e}")
         
         self._is_closed = True
-        logging.info(f"Connection to sandbox claim '{self.claim_name}' has been closed.")
+        logger.info(f"Connection to sandbox claim '{self.claim_name}' has been closed.")
     
-    def terminate(self):
+    def terminate(self) -> None:
         """
         Permanent deletion of all server side infrastructure and client side connection.
 
-        This method is idempotent. Calling ``terminate()`` repeatedly after a
-        successful deletion is a safe no-op. If the remote infrastructure has
-        already been removed, subsequent calls will handle the API 404 gracefully
-        rather than raising an error.
+        This method is idempotent. After a successful delete, ``claim_name`` is
+        cleared so later calls are a local no-op and do not issue another DELETE.
+        If the claim is already gone remotely, ``delete_sandbox_claim`` treats a
+        404 as success rather than raising.
         """
         # Close the client side connection and trace manager lifecycle
         self.close_connection()
@@ -204,14 +275,14 @@ class Sandbox:
             # Already deleted (or never successfully created a claim).
             return
 
-        try:
-            self.k8s_helper.delete_sandbox_claim(self.claim_name, self.namespace)
-        except SandboxNotFoundError:
-            return
-        except Exception as e:
-            raise e
+        self.k8s_helper.delete_sandbox_claim(self.claim_name, self.namespace)
 
-        # Clear after successful delete so a retry does not 404.
+        # The client stops tracking the handle here because its claim is gone. Call
+        # _on_terminated before clearing claim_name, because that name is the client's key.
+        # Drop the hook afterwards, so a kept handle does not keep the client's registry alive.
+        if self._on_terminated is not None:
+            self._on_terminated(self)
+            self._on_terminated = None
+
+        # Clear only after success so a failed delete can be retried.
         self.claim_name = None
-
- 

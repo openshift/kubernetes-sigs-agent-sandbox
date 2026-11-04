@@ -1,0 +1,2161 @@
+# Copyright 2026 The Kubernetes Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""`SandboxFleet` — the synchronous orchestrator.
+
+Drives the full lifecycle across one or many clusters: load tasks → preflight →
+plan (compute replicas) → ensure templates → start warm pools → acquire (claim a
+sandbox per task, returning a `SandboxHandle` with a hostname/endpoint) →
+release → teardown. Use the primitives directly from an RL loop, or the managed
+`run()`. (Strategies + parallelism land in phase 4; async in phase 6.)
+"""
+
+from __future__ import annotations
+
+import atexit
+import collections
+import contextlib
+import logging
+import math
+import signal
+import threading
+import time
+import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
+from collections.abc import Mapping
+from typing import Optional
+from collections.abc import Callable
+
+from kubernetes import client
+
+from . import constants, sizing
+from .cluster import Cluster, ClusterRegistry
+from .config import ClusterConfig, FleetConfig, run_namespace
+from .exceptions import (
+    SandboxStartError,
+    FleetError,
+    FleetOvercommitError,
+    OwnedByAnotherRunError,
+    PoolNotFoundError,
+    PreflightError,
+)
+from .handles import SandboxHandle, forget_claim_in_client
+from .failfast import ClaimWatchdog
+from .observability import Observer, repo_family
+from .placement import get_placement
+from .snapshots import pod_restore_status
+from .sources import Task, to_tasks
+
+# verify_teardown re-lists after the reaper; force-deleted pods take a moment to go.
+_VERIFY_SETTLE_S: tuple[float, ...] = (1.0, 2.0, 4.0)
+
+logger = logging.getLogger("agent_sandbox_rl.fleet")
+
+
+def _split_budget(total: int, weights: "dict[str, float]") -> "dict[str, int]":
+  """Split an integer ``total`` across keys by ``weights`` using largest-remainder
+  (Hamilton) allocation, so the result sums to exactly ``total`` (no rounding
+  overshoot)."""
+  if not weights:
+    return {}
+  if len(weights) == 1:                         # common case — no allocation math
+    return {next(iter(weights)): total}
+  tw = sum(weights.values())                    # ClusterConfig.weight is > 0, so tw > 0
+  ideal = {k: total * (w / tw) for k, w in weights.items()}
+  alloc = {k: int(math.floor(v)) for k, v in ideal.items()}
+  remainder = total - sum(alloc.values())
+  # hand out the leftover units to the largest fractional parts
+  for k in sorted(weights, key=lambda k: ideal[k] - alloc[k], reverse=True)[:remainder]:
+    alloc[k] += 1
+  return alloc
+
+
+@dataclass
+class PlanEntry:
+  """One image's provisioning plan on a chosen cluster."""
+
+  cluster: str
+  image: str
+  template: str
+  pool: str
+  replicas: int
+  tasks: int
+  # True when this pool already existed and was adopted (``adopt_existing``)
+  # rather than sized and created by this fleet. An adopted entry's ``replicas``
+  # is the pool's *observed* depth, which nothing here owns or may change.
+  adopted: bool = False
+  # Container that runs the task image in this entry's pods: None for a
+  # template this fleet writes (always ``agent-runtime``), the discovered name
+  # for an adopted template, whose lone container may be called anything.
+  runtime_container: Optional[str] = None
+
+
+class FleetPlan:
+  """The result of `SandboxFleet.plan()`: per-image placement + sizing."""
+
+  def __init__(self, entries: list[PlanEntry]):
+    self.entries = entries
+    self._by_image = {e.image: e for e in entries}
+    self.warnings: list[str] = []            # (#5) advisory notes, never fatal
+
+  def for_image(self, image: str) -> Optional[PlanEntry]:
+    return self._by_image.get(image)
+
+  def add(self, entry: PlanEntry) -> None:
+    """Append an entry (see `SandboxFleet.add_tasks`); an image already planned
+    is replaced."""
+    old = self._by_image.get(entry.image)
+    if old is not None:
+      self.entries.remove(old)
+    self.entries.append(entry)
+    self._by_image[entry.image] = entry
+
+  @property
+  def total_replicas(self) -> int:
+    return sum(e.replicas for e in self.entries)
+
+  def by_cluster(self) -> "dict[str, list[PlanEntry]]":
+    out: dict[str, list[PlanEntry]] = collections.defaultdict(list)
+    for e in self.entries:
+      out[e.cluster].append(e)
+    return dict(out)
+
+
+class SandboxFleet:
+  """Synchronous multi-cluster warm-pool orchestrator."""
+
+  def __init__(self, config: FleetConfig | None = None,
+               registry: ClusterRegistry | None = None):
+    # Copy the caller's config so we don't mutate their object when stamping the
+    # run-id label below.
+    src = config or FleetConfig()
+    self.config = (src.model_copy(deep=True) if hasattr(src, "model_copy")
+                   else src.copy(deep=True))
+    # Stamp a per-run label on everything this fleet creates so an orphaned run
+    # can always be swept by the reaper (#4). Set before the registry is built so
+    # it flows into every create call's labels.
+    self.run_id = self.config.run_id or uuid.uuid4().hex[:12]
+    # Other processes may share a caller-supplied id, so the id doesn't mean "mine".
+    self._shared_run_id = self.config.run_id is not None
+    self.config.labels = {**self.config.labels, constants.RUN_ID_LABEL: self.run_id}
+    # Resolve the run-dependent parts of the config (`{run_id}` in names, the
+    # per-run namespace) before the registry is built, so every cluster, template
+    # and pool name sees the final values.
+    self.config.apply_run_isolation(self.run_id)
+    self._created_namespaces: set[tuple[str, str]] = set()  # (cluster, ns) this run made
+    self._deleted_namespaces: set[tuple[str, str]] = set()  # deleted by a teardown
+    # Owned namespaces whose `run_namespace_setup` hook completed. Separate from
+    # ownership: a namespace whose rollback delete failed stays owned, and the
+    # next attempt must still run the hook on it.
+    self._namespaces_set_up: set[tuple[str, str]] = set()
+    self._namespaces_ensured = False
+    self._ns_lock = threading.Lock()         # create/rollback of run namespaces is atomic
+    self._prev_handlers: dict = {}           # signum -> previous handler (to restore)
+    self._atexit_registered = False
+    self._torndown = False
+    self._teardown_lock = threading.Lock()   # makes _teardown idempotent/reentrant
+    # Held for the whole sweep: a second caller returns early on _torndown, and
+    # its verify_teardown must wait for the sweep instead of reaping beside it.
+    self._sweep_lock = threading.Lock()
+    # Honor an explicitly-passed registry even when empty — `ClusterRegistry`
+    # defines `__len__`, so `registry or …` would treat `ClusterRegistry([])` as
+    # falsy and build a default ambient Cluster (which loads kube-config). Only
+    # fall back when no registry was given at all.
+    self.registry = (registry if registry is not None
+                     else self._default_registry(self.config))
+    # A caller-supplied registry was built before the run-id was stamped above, so
+    # its clusters' Resources.labels lack it — the pods it creates would then carry
+    # no run-id and be invisible to the breaker/reaper. Ensure every cluster
+    # (default or supplied) carries this run's labels. Idempotent for the default.
+    for _c in self.registry:
+      try:
+        _c.resources.labels.update(self.config.labels)
+      except Exception:  # noqa: BLE001 — a non-standard registry may differ; best-effort
+        pass
+    if self.config.run_isolation == "namespace":
+      # Likewise, a caller-supplied registry was built from the pre-isolation
+      # namespaces; point it at the per-run ones. `Cluster.namespace` and
+      # `Resources.namespace` are what every API call reads. The default registry
+      # already comes from the resolved config and is left alone.
+      for _c in self.registry:
+        if _c.namespace.endswith(f"-{self.run_id}"):
+          continue
+        _c.namespace = run_namespace(_c.namespace, self.run_id)
+        try:
+          _c.resources.namespace = _c.namespace
+        except Exception:  # noqa: BLE001 — best-effort, as above
+          pass
+    self.placement = get_placement(self.config.placement)
+    self.tasks: list[Task] = []
+    self.plan_: FleetPlan | None = None
+    self._handles: list[SandboxHandle] = []
+    # Claims live or in flight on this fleet, counted SYNCHRONOUSLY (reserved
+    # in acquire() before the remote create, released on failure/release). The
+    # async pod-count breaker cannot enforce max_live_sandboxes in adopt mode
+    # — adopted pods carry the provisioner's labels, not this run's — so this
+    # counter is what makes the hard cap real there.
+    self._claims_reserved = 0
+    self._warmed: dict[str, int] = {}        # image -> replicas currently warmed
+    self._ondemand: set[tuple[str, str]] = set()   # (cluster, image) pools made via acquire()
+    # (cluster, name) of pools/templates adopted under `adopt_existing`. Someone
+    # else owns these; teardown must not sweep them even if they happen to carry
+    # our management label (e.g. left behind by an earlier run of this SDK).
+    self._adopted_pools: set[tuple[str, str]] = set()
+    self._adopted_templates: set[tuple[str, str]] = set()
+    self._lock = threading.Lock()            # guards bookkeeping under parallel run
+    self._guard_active = False                # re-entrancy flag for overcommit_guard
+    self._guard_lock = threading.Lock()      # guards _guard_active
+    self._obs = Observer(self.config.observability)
+    self.report = None                       # set by run()/the Observer
+    if self.config.observability.enable_tracing:
+      self._enable_sdk_tracing()
+
+  def _enable_sdk_tracing(self) -> None:
+    """Point each cluster's SDK SandboxClient at our tracer/provider so the SDK's
+    create_claim/wait_ready spans nest under our fleet spans."""
+    try:
+      from k8s_agent_sandbox.models import SandboxTracerConfig
+      tc = SandboxTracerConfig(
+          enable_tracing=True,
+          trace_service_name=self.config.observability.trace_service_name)
+      for c in self.registry:
+        c.tracer_config = tc
+    except Exception:  # noqa: BLE001  (SDK without tracing support)
+      pass
+
+  @property
+  def observer(self):
+    return self._obs
+
+  # --- runaway safeguards (plans/sdk-runaway-safeguards.md) --------------- #
+  def run_selector(self) -> str:
+    """Label selector for resources this run owns (the reaper key)."""
+    return f"{constants.RUN_ID_LABEL}={self.run_id}"
+
+  def pod_run_selector(self) -> str:
+    """Label selector for sandbox pods this run owns. Pods carry the run id under
+    POD_RUN_ID_LABEL, not RUN_ID_LABEL: the Sandbox controller strips
+    `agents.x-k8s.io/*` labels from pods."""
+    return f"{constants.POD_RUN_ID_LABEL}={self.run_id}"
+
+  def live_owned_count(self) -> int:
+    """Live sandbox **pods** this run owns (by run-id label), across clusters.
+
+    The Sandbox controller does not copy the run-id label onto Sandbox CRs, so we
+    count pods instead — the pod template carries the run id (as
+    POD_RUN_ID_LABEL), so this reflects the actual live footprint, including
+    #1215 over-creation."""
+    sel = self.pod_run_selector()
+    n = 0
+    for c in self.registry:
+      try:
+        n += c.resources.count_pods(label_selector=sel)
+      except Exception as e:  # noqa: BLE001 — a transient list error must not crash the breaker
+        # Fail open (don't crash the poll) but surface it: the breaker under-counts
+        # this poll, so operators can see when it's blind (e.g. apiserver 429s).
+        logger.warning("live_owned_count: pod count failed on cluster %s (%s); "
+                       "breaker under-counts this poll", c.name, e)
+    return n
+
+  @contextlib.contextmanager
+  def overcommit_guard(self, expected: int | None = None):
+    """Circuit breaker (#1): a background thread samples ``live_owned_count`` and, if
+    it exceeds ``min(expected × overcommit_factor, max_live_sandboxes)``, tears the
+    fleet down and raises `FleetOvercommitError` on exit. Keys off *intent* so it
+    trips on accidental over-creation (runaway / orphan / #1215), not a large-but-
+    intended run. Disabled when both knobs are off."""
+    factor = self.config.overcommit_factor
+    hard = self.config.max_live_sandboxes
+    if expected is None:
+      expected = self.plan_.total_replicas if self.plan_ else 0
+    if self.config.adopt_existing:
+      # The intent-based ceiling is meaningless here and would be actively
+      # misleading: an adopted plan's `total_replicas` is the provisioner's depth
+      # (large), while `live_owned_count` sees only pods carrying THIS run's
+      # label — of which adoption creates none. Ceiling × 1.5 against a count
+      # that is structurally ~0 is a breaker that cannot fire — and for the
+      # same reason the hard ceiling cannot fire HERE either. In adopt mode
+      # `max_live_sandboxes` is enforced synchronously by the claim
+      # reservation in acquire(); this thread stays useful only as a runaway
+      # detector for pods that DO carry the run label.
+      expected = 0
+    if self._shared_run_id:
+      # The pod count is job-wide, so no per-process ceiling fits; the bug this
+      # guards (#1215) is fixed since v0.5.4. acquire() still enforces the claim cap.
+      yield
+      return
+    ceilings = []
+    if factor and factor > 0 and expected > 0:
+      ceilings.append(int(expected * factor))
+    if hard:
+      ceilings.append(int(hard))
+    ceiling = min(ceilings) if ceilings else None
+    if ceiling is None:
+      yield
+      return
+    # Re-entrancy: `run(recycle=True)` opens this guard around the strategy/executor,
+    # and the recycle executor opens it again — nesting on the same fleet. Run only
+    # the outer monitor: a second thread would double the pod-list load per poll (a
+    # full filtered list under a selector) and race into teardown on a trip. Direct
+    # executor callers (no surrounding run) still get their own guard.
+    with self._guard_lock:
+      if self._guard_active:
+        reentrant = True
+      else:
+        self._guard_active = True
+        reentrant = False
+    if reentrant:
+      yield
+      return
+    stop = threading.Event()
+    tripped = {"n": 0}
+
+    need = max(1, self.config.breaker_trip_polls)
+
+    def _loop():
+      breaches = 0
+      while not stop.wait(self.config.breaker_poll_s):
+        n = self.live_owned_count()
+        if n > ceiling:
+          breaches += 1
+          logger.warning("circuit breaker: %d live pods > ceiling %d (breach %d/%d "
+                         "consecutive; expected %d)", n, ceiling, breaches, need, expected)
+          if breaches < need:
+            continue                          # transient spike — wait for a sustained breach
+          logger.error("circuit breaker TRIPPED: %d live pods > ceiling %d for %d "
+                       "consecutive polls (expected %d) — aborting run + tearing down",
+                       n, ceiling, breaches, expected)
+          tripped["n"] = n
+          try:
+            self.teardown()
+          except Exception:  # noqa: BLE001
+            logger.warning("teardown during breaker trip failed", exc_info=True)
+          return
+        else:
+          breaches = 0                        # healthy poll resets; only SUSTAINED breach trips
+
+    th = threading.Thread(target=_loop, name="asrl-breaker", daemon=True)
+    th.start()
+    try:
+      yield
+    finally:
+      stop.set()
+      th.join(timeout=2)
+      with self._guard_lock:
+        self._guard_active = False
+    if tripped["n"]:
+      raise FleetOvercommitError(
+          f"live sandboxes {tripped['n']} exceeded ceiling {ceiling} (expected "
+          f"{expected}, factor {factor}) — run aborted, fleet torn down")
+
+  def _install_teardown_hooks(self) -> None:
+    """(#4) atexit + SIGINT/SIGTERM → teardown so a killed/crashing driver still
+    cleans up. Signal install is a no-op off the main thread; atexit always set."""
+    if not self._atexit_registered:
+      atexit.register(self._safe_teardown)
+      self._atexit_registered = True
+    for sig in (signal.SIGINT, signal.SIGTERM):
+      if sig in self._prev_handlers:
+        continue
+      try:
+        self._prev_handlers[sig] = signal.getsignal(sig)
+        signal.signal(sig, self._on_signal)
+      except (ValueError, OSError):        # not main thread / unsupported
+        self._prev_handlers.pop(sig, None)
+
+  def _on_signal(self, signum, frame):
+    # Do NOT tear down inline: this handler can fire while the main thread holds
+    # self._lock, and teardown → release_all → release re-acquires it → deadlock.
+    # Instead unwind (raise), which releases any held lock, and let the atexit hook
+    # (_safe_teardown, registered in _install_teardown_hooks) run teardown outside
+    # the signal context.
+    prev = self._prev_handlers.get(signum)
+    if prev == signal.SIG_IGN:
+      logger.debug("signal %d ignored (previous handler was SIG_IGN)", signum)
+      return                                   # honor an explicit ignore — don't turn it into an abort
+    logger.warning("signal %d → aborting fleet run %s (teardown via atexit)",
+                   signum, self.run_id)
+    if callable(prev) and prev != signal.SIG_DFL:
+      prev(signum, frame)                      # chain to a custom handler first
+    # Always unwind after chaining (a prior callable that returns normally must not
+    # silently resume the run when we've logged "aborting"); SIG_DFL falls through here too.
+    if signum == signal.SIGINT:
+      raise KeyboardInterrupt
+    raise SystemExit(128 + signum)
+
+  def _safe_teardown(self) -> None:
+    if self._torndown:
+      return
+    try:
+      self.teardown()
+    except Exception:  # noqa: BLE001
+      logger.warning("teardown hook failed", exc_info=True)
+
+  def _remove_teardown_hooks(self) -> None:
+    if self._atexit_registered:
+      with contextlib.suppress(Exception):
+        atexit.unregister(self._safe_teardown)
+      self._atexit_registered = False
+    # signal.signal only works on the main thread — when teardown runs from the
+    # breaker thread we can't restore here; leave the (idempotent) handlers in
+    # place rather than silently failing. They're cleared on the next main-thread
+    # teardown / process exit.
+    if threading.current_thread() is threading.main_thread():
+      for sig, prev in list(self._prev_handlers.items()):
+        with contextlib.suppress(ValueError, OSError):
+          signal.signal(sig, prev)
+      self._prev_handlers.clear()
+
+  @staticmethod
+  def _default_registry(config: FleetConfig) -> ClusterRegistry:
+    if config.clusters:
+      return ClusterRegistry.from_configs(config.clusters, labels=config.labels)
+    # Single cluster from the ambient kube context.
+    return ClusterRegistry([Cluster(ClusterConfig(), labels=config.labels)])
+
+  # --- inputs ------------------------------------------------------------ #
+  def load_tasks(self, source, *, image_rewrite=None, image_field=None,
+                 id_field=None) -> list[Task]:
+    """Load tasks from ``source``. ``image_rewrite`` is an optional
+    ``image -> image`` hook (e.g. ``registry_rewrite.make_rewriter(...)``) applied
+    to each task's image; the original is stashed in ``metadata['original_image']``.
+    ``image_field`` / ``id_field`` say where dataset rows keep their image and id
+    (see `extract_image`)."""
+    tasks = to_tasks(source, image_field=image_field, id_field=id_field)
+    if image_rewrite is not None:
+      # Copy rather than mutate: to_tasks may hand back the caller's own Task
+      # objects (e.g. a list[Task] / caching TaskSource), so rewriting in place
+      # would alias and corrupt their images/metadata.
+      rewritten = []
+      for t in tasks:
+        new = image_rewrite(t.image)
+        if new != t.image:
+          t = t.model_copy(update={
+              "image": new,
+              "metadata": {**t.metadata, "original_image": t.image}})
+        rewritten.append(t)
+      tasks = rewritten
+    self.tasks = tasks
+    logger.info("Loaded %d tasks (%d unique images)",
+                len(self.tasks), len({t.image for t in self.tasks}))
+    return self.tasks
+
+  def add_tasks(self, source, *, image_rewrite=None) -> list[Task]:
+    """Append tasks to the fleet and extend the current plan in place.
+
+    The streaming counterpart of `load_tasks` + `plan`: a trainer that learns its
+    prompts batch by batch registers each batch's images here, instead of
+    reloading every task and re-planning per new image. New images are placed
+    and sized like `plan` does (same placement, same per-cluster budget split,
+    same ``max_warmpool_size`` cap); images already planned only gain task
+    counts (their pool size is not revisited). Without a plan yet this only
+    appends; with ``adopt_existing`` the plan is rebuilt against the namespace's
+    pools (an unserved image raises `PoolNotFoundError`, as in `plan`).
+    Thread-safe; returns the tasks added.
+    """
+    new_tasks = to_tasks(source)
+    if image_rewrite is not None:
+      rewritten = []
+      for t in new_tasks:
+        new = image_rewrite(t.image)
+        if new != t.image:
+          t = t.model_copy(update={
+              "image": new, "metadata": {**t.metadata, "original_image": t.image}})
+        rewritten.append(t)
+      new_tasks = rewritten
+    if not new_tasks:
+      return []
+    counts = collections.Counter(t.image for t in new_tasks)
+    fresh: list[tuple[str, int, Cluster]] = []
+    with self._lock:
+      plan = self.plan_
+      # Adopt mode validates even before a plan exists: otherwise an unserved
+      # image is appended, the later plan() raises for it, and every plan after
+      # that fails too.
+      adopt = self.config.adopt_existing
+      if plan is not None and not adopt:
+        # Resolve every placement before touching the tasks or the plan: a
+        # NoClusterAvailableError must leave both as they were, or a retry
+        # appends the batch twice and double-counts the known images.
+        cluster_totals: dict[str, int] = collections.defaultdict(int)
+        for e in plan.entries:
+          cluster_totals[e.cluster] += e.tasks
+        bump: list[tuple[PlanEntry, int]] = []
+        for image, n in counts.items():
+          e = plan.for_image(image)
+          if e is not None:
+            cluster_totals[e.cluster] += n          # counts toward the budget split
+            bump.append((e, n))
+            continue
+          c = self.placement.select(image, self.registry)
+          cluster_totals[c.name] += n
+          fresh.append((image, n, c))
+        entries: list[PlanEntry] = []
+        if fresh:
+          used = [self.registry.get(name) for name in cluster_totals]
+          budget = _split_budget(self.config.max_concurrent,
+                                 {c.name: c.config.weight for c in used})
+          for image, n, c in fresh:
+            replicas = sizing.compute_replicas(
+                n, cluster_totals[c.name], budget[c.name],
+                self.config.max_warmpool_size, per_task=self.config.warm_per_task)
+            entries.append(PlanEntry(
+                cluster=c.name, image=image, template=self.config.template_name(image),
+                pool=self.config.pool_name(image), replicas=replicas, tasks=n))
+        for e, n in bump:
+          e.tasks += n
+        for entry in entries:
+          plan.add(entry)
+      self.tasks = list(self.tasks) + list(new_tasks)
+    if adopt:
+      try:
+        self._plan_adopt()
+      except Exception:
+        with self._lock:                            # an unserved image: undo the append
+          added = {id(t) for t in new_tasks}
+          self.tasks = [t for t in self.tasks if id(t) not in added]
+        raise
+    if plan is not None:
+      logger.info("add_tasks: %d task(s), %d new image(s) added to the plan",
+                  len(new_tasks), len(fresh))
+    return new_tasks
+
+  def wait_pools_ready(self, images, *, timeout: float | None = None,
+                       replicas: "Mapping[str, int] | None" = None) -> dict[str, bool]:
+    """Best-effort readiness barrier: ``image -> ready`` for each planned image,
+    waiting up to ``timeout`` seconds (default ``ready_timeout``) on each pool
+    concurrently. Never raises: a pool that is slow, an image not in the plan, a
+    missing plan or a watch error reads as ``False`` and is logged. The replica
+    count waited for is what this fleet asked of the pool (one for an adopted or
+    borrowed pool), lowered to ``replicas[image]`` when given: a caller that
+    shares a pool across batches waits for its own share, not the sum."""
+    images = list(dict.fromkeys(images))
+    if not images:
+      return {}
+    try:
+      plan = self.plan_ or self.plan()
+    except Exception as exc:  # noqa: BLE001 — best-effort by contract
+      logger.warning("wait_pools_ready: no plan (%s)", exc)
+      return {img: False for img in images}
+    limit = self.config.ready_timeout if timeout is None else timeout
+    with self._lock:
+      warmed = dict(self._warmed)
+
+    def _one(image: str) -> bool:
+      e = plan.for_image(image)
+      if e is None:
+        logger.warning("wait_pools_ready: image %s is not in the plan", image)
+        return False
+      want = 1 if (e.adopted or image not in warmed) else max(1, warmed[image])
+      if replicas and replicas.get(image):
+        want = max(1, min(int(replicas[image]), want))
+      try:
+        c = self.registry.get(e.cluster)
+        return bool(c.resources.wait_for_pool_ready(e.pool, want, timeout=limit))
+      except Exception as exc:  # noqa: BLE001 — best-effort by contract
+        logger.warning("wait_pools_ready: pool %s on %s: %s", e.pool, e.cluster, exc)
+        return False
+
+    workers = max(1, min(len(images), self.config.max_concurrent))
+    if workers == 1:
+      return {img: _one(img) for img in images}
+    with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="pool-ready") as ex:
+      return dict(zip(images, ex.map(_one, images)))
+
+  def image_counts(self) -> "collections.OrderedDict[str, int]":
+    counts: "collections.OrderedDict[str, int]" = collections.OrderedDict()
+    for t in self.tasks:
+      counts[t.image] = counts.get(t.image, 0) + 1
+    return counts
+
+  def _disk_spec(self) -> "tuple[float | None, float | None]":
+    """``(avg_image_gb, usable_disk_gb)`` for disk-aware window sizing. ``usable`` is
+    ``None`` (disk cap disabled) unless **both** ``avg_image_gb`` and
+    ``node_ephemeral_gb`` are set; ``avg`` is returned as-configured for reference.
+    ``usable`` is per-node ephemeral storage minus headroom (conservative: a window's
+    images may co-locate on one node)."""
+    avg = self.config.avg_image_gb
+    node_gb = self.config.node_ephemeral_gb
+    if avg is None or node_gb is None:
+      return (avg, None)                      # usable=None -> recommend_window_* skips the disk cap
+    return (avg, node_gb * (1.0 - self.config.disk_headroom))
+
+  def recommended_window(self, *, pipelined: bool = False) -> int:
+    """Window size for sliding/pipelined: explicit ``window_size`` wins; otherwise
+    the concurrency-aware window, capped by node disk when disk hints are set."""
+    if self.config.window_size is not None:
+      return max(1, self.config.window_size)
+    counts = self.image_counts()
+    avg, usable = self._disk_spec()
+    per_task = self.config.warm_per_task
+    nodes = self.config.cluster_nodes or 1   # spread distinct images across the pool
+    if pipelined and per_task:
+      logger.warning(
+          "pipelined + warm_per_task: deep per-image replicas shrink the prefetch "
+          "window and can serialize images (underfilling max_concurrent). Prefer "
+          "strategy='naive' or 'sliding' with warm_per_task for RL rollouts.")
+    if pipelined:
+      return sizing.recommend_window_pipelined(
+          counts, self.config.max_concurrent, self.config.max_warmpool_size,
+          avg_image_gb=avg, usable_disk_gb=usable, per_task=per_task, nodes=nodes)
+    win = sizing.recommend_window(
+        counts, self.config.max_concurrent, self.config.max_warmpool_size,
+        per_task=per_task)
+    if avg is not None and usable is not None:
+      win = min(win, sizing.recommend_window_disk(
+          counts, self.config.max_concurrent, self.config.max_warmpool_size,
+          avg_image_gb=avg, usable_disk_gb=usable, pipeline_factor=1.0,
+          per_task=per_task, nodes=nodes))
+    return max(1, win)
+
+  # --- preflight / plan -------------------------------------------------- #
+  def preflight(self) -> dict:
+    """Run full per-cluster preflight (reachability, CRD versions, controller,
+    runtime class, pull secret, namespace). Raises `PreflightError` on any hard
+    failure; returns ``{cluster_name: PreflightReport}``."""
+    with self._obs.phase("preflight"):
+      return self._preflight()
+
+  def _ensure_run_namespaces(self) -> None:
+    """``run_isolation="namespace"``: create each cluster's per-run namespace on
+    first use (preflight or plan, whichever comes first). Idempotent. A namespace
+    that already existed is used but not owned, so teardown leaves it standing."""
+    if self.config.run_isolation != "namespace" or self._namespaces_ensured:
+      return
+    # plan() is reachable from concurrent warm threads (`self.plan_ or self.plan()`),
+    # so two callers can race here; the create/rollback sequence must not interleave.
+    with self._ns_lock:
+      if self._namespaces_ensured:
+        return
+      self._ensure_run_namespaces_locked()
+
+  def _ensure_run_namespaces_locked(self) -> None:
+    labels = {**self.config.labels, **self.config.run_namespace_labels}
+    # All-or-nothing per attempt: `run()` calls `plan()` before it enters its
+    # teardown scope, so a failure on the second cluster (or in the setup hook
+    # after a create) must not leave a namespace nobody will delete. Roll back
+    # what this attempt created and let the next attempt start clean.
+    created_now: list = []
+    try:
+      for c in self.registry:
+        try:
+          created = c.resources.ensure_namespace(c.namespace, labels=labels)
+        except Exception as exc:  # noqa: BLE001 — turn the API error into an actionable one
+          raise FleetError(
+              f"run_isolation='namespace': cannot create namespace '{c.namespace}' "
+              f"on cluster '{c.name}': {exc}. Grant this identity namespace "
+              "create/delete, pre-create the namespace, or use "
+              "run_isolation='names'.") from exc
+        key = (c.name, c.namespace)
+        if created:
+          created_now.append(c)
+          self._created_namespaces.add(key)
+          logger.info("run %s owns namespace '%s' on cluster %s",
+                      self.run_id, c.namespace, c.name)
+        # Only a namespace this run owns gets the hook, and only until it has
+        # succeeded once. "Already exists" is not "set up": a namespace kept after
+        # a failed rollback delete is still ours and still missing whatever the
+        # hook provides, so the hook must tolerate a re-run on a partly set-up
+        # namespace. With a shared run id every process runs it once, so a peer
+        # completes a setup the creator failed.
+        owned = key in self._created_namespaces or self._shared_run_id
+        if (not owned or key in self._namespaces_set_up
+            or self.config.run_namespace_setup is None):
+          continue
+        try:
+          self.config.run_namespace_setup(c, c.namespace)
+        except Exception as exc:  # noqa: BLE001
+          raise FleetError(
+              f"run_isolation='namespace': run_namespace_setup failed for "
+              f"namespace '{c.namespace}' on cluster '{c.name}': {exc}") from exc
+        self._namespaces_set_up.add(key)
+    except BaseException:
+      # A shared run id's namespace may hold peers' pools already: never roll it back.
+      for c in ([] if self._shared_run_id else created_now):
+        key = (c.name, c.namespace)
+        try:
+          c.resources.delete_namespace(c.namespace)
+        except Exception:  # noqa: BLE001 — best-effort rollback
+          # Still ours: keep the ownership record so a retry reuses it (and
+          # re-runs the hook if it has not succeeded) and an ordinary teardown
+          # still deletes it.
+          logger.warning("could not roll back namespace '%s' on cluster %s",
+                         c.namespace, c.name, exc_info=True)
+          continue
+        self._created_namespaces.discard(key)
+        self._namespaces_set_up.discard(key)
+      raise
+    self._namespaces_ensured = True
+
+  def _pool_ownership(self, c, pool: str) -> tuple[bool, dict | None]:
+    """``(owned, live_object)`` for a pool this run is about to delete by name.
+    ``owned`` is False if ``pool`` exists and carries another run's run-id label.
+    A read error propagates: "could not tell" is neither "ours" nor "theirs", and
+    the caller has to be able to undo its bookkeeping and retry.
+
+    Pools keep their creator's label (a 409 on create only patches replicas), so
+    the label is a reliable tell that an image-derived name collided with a
+    concurrent run in the same namespace. Deleting that pool would destroy
+    someone else's warm capacity. A missing pool (``live`` None) or an unlabelled
+    one (a pre-run-id leftover) counts as ours. The live object is returned so the
+    delete can be made conditional on exactly what was inspected (its uid)
+    instead of trusting this snapshot."""
+    obj = c.resources.get_warmpool(pool)
+    live = obj if isinstance(obj, dict) else None
+    labels = ((live or {}).get("metadata") or {}).get("labels") or {}
+    owner = labels.get(constants.RUN_ID_LABEL) if isinstance(labels, dict) else None
+    if isinstance(owner, str) and owner and owner != self.run_id:
+      logger.warning(
+          "pool '%s' on cluster '%s' belongs to run %s, not this run (%s); leaving "
+          "it alone. Concurrent runs sharing images in one namespace should use "
+          "run_isolation='names' (or a per-run namespace).",
+          pool, c.name, owner, self.run_id)
+      return False, live
+    return True, live
+
+  def _pool_collision_error(self, c, e) -> FleetError:
+    """The error for a warm whose image-derived pool name is taken by another
+    run. Failing here, rather than quietly consuming that pool, keeps the cause
+    next to the symptom: a borrowed pool has someone else's depth and lifetime,
+    and would surface later as a stalled wait or a claim on a pool that vanished."""
+    owner_id = None
+    try:
+      live = c.resources.get_warmpool(e.pool) or {}
+      found = ((live.get("metadata") or {}).get("labels") or {}).get(
+          constants.RUN_ID_LABEL)
+      if isinstance(found, str) and found:
+        owner_id = found
+    except Exception:  # noqa: BLE001 — diagnostics only
+      pass
+    return self._collision_error(e, "warm pool", e.pool, owner_id)
+
+  def _collision_error(self, e, kind: str, name: str,
+                       owner_id: str | None) -> FleetError:
+    owner = f"run {owner_id}" if owner_id else "another run"
+    return FleetError(
+        f"{kind} '{name}' on cluster '{e.cluster}' (image {e.image}) already "
+        f"exists and belongs to {owner}, not this run ({self.run_id}); refusing to "
+        "build on, resize or share it. Concurrent runs on the same image in one "
+        "namespace need run_isolation='names' (or 'namespace'); processes of one "
+        "job that should share pools can set the same FleetConfig.run_id; to "
+        "consume pools provisioned elsewhere on purpose, set adopt_existing=True; "
+        "if that run is dead, reap it with `python -m agent_sandbox_rl.reaper --run-id "
+        f"{owner_id or '<run id>'}`.")
+
+  def _delete_template_if_owned(self, c, template: str) -> None:
+    """Delete a template by name only if it is this run's, and only the object
+    inspected. The template twin of the pool guard in `_unwarm_entry`: another
+    run's template (image-derived names collide) is left standing, a missing one
+    gets no delete by name, and the uid precondition stops a template re-created
+    under this name after the read from being removed. A read error propagates."""
+    live = c.resources.get_template(template)
+    if not isinstance(live, dict):
+      return
+    meta = live.get("metadata") or {}
+    owner = (meta.get("labels") or {}).get(constants.RUN_ID_LABEL)
+    if isinstance(owner, str) and owner and owner != self.run_id:
+      logger.warning("template '%s' on cluster '%s' belongs to run %s, not this run "
+                     "(%s); leaving it alone", template, c.name, owner, self.run_id)
+      return
+    # Known gap: an on-demand acquire between the pool delete and this one can build
+    # a pool on this template; it times out, and the next acquire recreates it.
+    uid = meta.get("uid")
+    if isinstance(uid, str) and uid:
+      c.resources.delete_template(template, uid=uid)
+    else:
+      c.resources.delete_template(template)
+
+  def _preflight(self) -> dict:
+    from . import preflight as _pf
+    self._ensure_run_namespaces()
+    reports = {}
+    failed = {}
+    sample_image = next(iter(self.image_counts()), "busybox:latest")
+    for c in self.registry:
+      ts = c.template_spec(self.config.template)
+      unmanaged_labels = (c.resources.fleet_pod_labels()
+                          if ts.network_policy_management == "Unmanaged" else None)
+      rep = _pf.preflight_cluster(
+          c, require_runtime_class=ts.runtime_class,
+          image_pull_secret=ts.image_pull_secret, namespace=c.namespace,
+          validate_template=ts, sample_image=sample_image,
+          unmanaged_pod_labels=unmanaged_labels,
+          snapshots=getattr(c.config, "snapshots", False))
+      reports[c.name] = rep
+      for w in rep.warnings:
+        logger.warning("[%s] %s: %s", c.name, w.name, w.detail)
+      if not rep.ok:
+        failed[c.name] = rep
+    if failed:
+      detail = "; ".join(
+          f"{n}: " + ", ".join(f"{ch.name}({ch.detail})" for ch in r.failures)
+          for n, r in failed.items())
+      raise PreflightError(f"preflight failed — {detail}")
+    logger.info("Preflight OK on %d cluster(s): %s",
+                len(reports), ", ".join(reports))
+    return reports
+
+  def plan(self) -> FleetPlan:
+    """Assign each unique image to a cluster (placement) and size its pool."""
+    with self._obs.phase("plan"):
+      return self._plan()
+
+  def _plan(self) -> FleetPlan:
+    self._ensure_run_namespaces()
+    if self.config.adopt_existing:
+      return self._plan_adopt()
+    counts = self.image_counts()
+    # image -> cluster (each unique image placed once).
+    assigned: "collections.OrderedDict[str, Cluster]" = collections.OrderedDict()
+    for image in counts:
+      assigned[image] = self.placement.select(image, self.registry)
+    # per-cluster totals for proportional sizing.
+    cluster_totals: dict[str, int] = collections.defaultdict(int)
+    for image, c in assigned.items():
+      cluster_totals[c.name] += counts[image]
+
+    # Split the global concurrency budget across the clusters in use, by weight,
+    # so the total warm footprint stays ~max_concurrent rather than
+    # max_concurrent x n_clusters. Use largest-remainder allocation so the
+    # per-cluster budgets sum to *exactly* max_concurrent (no round()-induced
+    # overshoot). compute_replicas still floors each pool at 1, so a 0 budget
+    # never starves an image. (Single cluster → full budget, unchanged.)
+    used = [self.registry.get(n) for n in cluster_totals]
+    cluster_budget = _split_budget(self.config.max_concurrent,
+                                   {c.name: c.config.weight for c in used})
+
+    per_task = self.config.warm_per_task
+    entries: list[PlanEntry] = []
+    for image, c in assigned.items():
+      replicas = sizing.compute_replicas(
+          counts[image], cluster_totals[c.name],
+          cluster_budget[c.name], self.config.max_warmpool_size,
+          per_task=per_task)
+      if per_task and replicas < counts[image]:   # clamped by max_warmpool_size
+        logger.warning(
+            "warm_per_task: image %s has %d tasks but max_warmpool_size=%d; "
+            "warming only %d replicas (raise max_warmpool_size for one per task)",
+            image, counts[image], self.config.max_warmpool_size, replicas)
+      entries.append(PlanEntry(
+          cluster=c.name, image=image, template=self.config.template_name(image),
+          pool=self.config.pool_name(image), replicas=replicas,
+          tasks=counts[image]))
+    self.plan_ = FleetPlan(entries)
+    self._advise(self.plan_)                   # (#5) warn-only capacity/QPS advisory
+    logger.info("Plan: %d images across %d cluster(s), %d total warm replicas",
+                len(entries), len(self.plan_.by_cluster()),
+                self.plan_.total_replicas)
+    return self.plan_
+
+  def _plan_adopt(self) -> FleetPlan:
+    """``adopt_existing``: plan against the warm pools already in the namespace
+    instead of creating any.
+
+    Matching is by **image** — every pool's ``sandboxTemplateRef`` is resolved to
+    its template's container image — so it does not depend on the provisioner and
+    this SDK agreeing on a pool-naming scheme, which is exactly what they don't
+    do (this package writes ``pool-<template>``, the multi-cluster fleet layer
+    writes ``<template>-pool``).
+
+    Nothing here is ours, and the rest of the fleet honors that: no template is
+    created or relabelled, no pool is created, scaled or deleted, and teardown
+    skips both. An image nothing serves raises `PoolNotFoundError` rather than
+    falling through to a size-1 on-demand pool — a slow working run that quietly
+    ignored a warm fleet is the outcome this mode exists to prevent."""
+    counts = self.image_counts()
+    discovered: dict[str, dict] = {}
+    for c in self.registry:
+      try:
+        discovered[c.name] = c.resources.discover_pools()
+      except Exception as exc:  # noqa: BLE001 — adoption cannot proceed blind
+        raise FleetError(
+            f"adopt_existing: could not list warm pools on cluster "
+            f"'{c.name}': {exc}") from exc
+
+    entries: list[PlanEntry] = []
+    missing: list[str] = []
+    for image in counts:
+      hits = [(cname, found[image]) for cname, found in discovered.items()
+              if image in found]
+      if not hits:
+        missing.append(image)
+        continue
+      if len(hits) > 1:
+        # Deepest pool wins, cluster name breaks the tie — deterministic, so
+        # re-planning the same fleet does not shuffle images between clusters.
+        hits.sort(key=lambda h: (-h[1].replicas, h[0]))
+        logger.info("adopt: image %s is served on %d clusters (%s); using %s",
+                    image, len(hits), ", ".join(h[0] for h in hits), hits[0][0])
+      cname, dp = hits[0]
+      entries.append(PlanEntry(
+          cluster=cname, image=image, template=dp.template, pool=dp.pool,
+          replicas=dp.replicas, tasks=counts[image], adopted=True,
+          runtime_container=dp.runtime_container))
+    if missing:
+      raise PoolNotFoundError(self._adopt_miss_message(missing, discovered))
+
+    self.plan_ = FleetPlan(entries)
+    self._adopted_pools = {(e.cluster, e.pool) for e in entries}
+    self._adopted_templates = {(e.cluster, e.template) for e in entries}
+    logger.info("Adopted %d existing warm pool(s) across %d cluster(s), %d "
+                "replicas standing (created nothing)", len(entries),
+                len(self.plan_.by_cluster()), self.plan_.total_replicas)
+    return self.plan_
+
+  def _adopt_miss_message(self, missing: list[str], discovered: dict) -> str:
+    """The message an operator gets when adoption cannot cover the task set.
+
+    Deliberately long. The failure is "nothing here serves this image", and the
+    three things that actually cause it — wrong namespace, wrong cluster, pool
+    not filled yet — are indistinguishable from the exception type alone."""
+    shown = missing[:10]
+    lines = [
+        f"adopt_existing: {len(missing)} of {len(self.image_counts())} task "
+        f"image(s) have no warm pool in the fleet, and adopt mode does not "
+        f"create them:",
+    ]
+    lines += [f"  - {img}  (this SDK would have named its pool "
+              f"'{self.config.pool_name(img)}')" for img in shown]
+    if len(missing) > len(shown):
+      lines.append(f"  ... and {len(missing) - len(shown)} more")
+    lines.append("Pools found, by cluster:")
+    for c in self.registry:
+      found = discovered.get(c.name, {})
+      lines.append(f"  - {c.name} (namespace {c.namespace}): {len(found)} pool(s)")
+    lines.append(
+        "Check the namespace first — pools are namespaced and an empty count "
+        "above usually means the harness is pointed at the wrong one. If the "
+        "counts look right, the pools serve different images than the tasks "
+        "loaded. Set adopt_existing=False to provision on demand instead.")
+    return "\n".join(lines)
+
+  def _advise(self, plan: "FleetPlan") -> None:
+    """(#5) Warn — never refuse — when the plan's footprint or claim concurrency
+    looks beyond what the control plane comfortably absorbs. The customer owns
+    their cluster; this is a sign, not a gate."""
+    total = plan.total_replicas
+    nodes = self.config.cluster_nodes
+    if nodes:
+      slots = nodes * 200                      # rough usable pod slots/node
+      if total > slots:
+        plan.warnings.append(
+            f"warm footprint {total} exceeds ~{slots} schedulable slots "
+            f"({nodes} nodes × ~200) — expect Pending pods / capacity churn.")
+    if self.config.max_concurrent > 2000:
+      plan.warnings.append(
+          f"max_concurrent {self.config.max_concurrent} exceeds ~2000 the apiserver "
+          f"typically sustains for concurrent claims — expect 429s and possible "
+          f"over-creation; consider staging claims or a lower cap.")
+    if total > 20000:
+      plan.warnings.append(
+          f"warm footprint {total} is very large — stage the fill "
+          f"(warm_create_budget); on controllers <= v0.5.3 deep warm can also trip "
+          f"the warm-pool over-creation race (#1215, fixed in v0.5.4 by #1266) — "
+          f"there, keep --sandbox-warm-pool-concurrent-workers low (<=10).")
+    for msg in plan.warnings:
+      logger.warning("plan advisory: %s", msg)
+
+  # --- provisioning ------------------------------------------------------ #
+  def _ensure_pool(self, cluster: Cluster, image: str, replicas: int) -> str:
+    template = self.config.template_name(image)
+    pool = self.config.pool_name(image)
+    # The on-demand path reuses another run's pool on a 409, so it reuses their
+    # template the same way: relabelling it would hand it to this run, whose
+    # teardown/reap would then delete it (and force-delete the pods it goes on
+    # to create) while the owner's pool still uses it.
+    cluster.resources.ensure_template(
+        image, template, cluster.template_spec(self.config.template),
+        owner_run_id=self.run_id, share_foreign=True)
+    # Under a shared run id, mark the pool so the job's first warm takes it over.
+    cluster.resources.create_warmpool(
+        pool, template, replicas,
+        annotations=({constants.ON_DEMAND_ANNOTATION: "true"}
+                     if self._shared_run_id else None))
+    return pool
+
+  def ensure_templates(self) -> None:
+    plan = self.plan_ or self.plan()
+    if self.config.adopt_existing:
+      # Creating is the obvious half; the hazard is `ensure_template`'s label
+      # reconcile, which would stamp OUR run-id onto the provisioner's pod
+      # template and thereby onto every sandbox it goes on to create.
+      logger.info("adopt_existing: not touching templates (%d adopted)",
+                  len(plan.entries))
+      return
+    for e in plan.entries:
+      c = self.registry.get(e.cluster)
+      try:
+        # Owner-checked like the warm path: a relabel here would stamp this run's
+        # id onto another run's template and then pass the warm path's check.
+        c.resources.ensure_template(
+            e.image, e.template, c.template_spec(self.config.template),
+            owner_run_id=self.run_id)
+      except OwnedByAnotherRunError as exc:
+        raise self._collision_error(e, "template", e.template, exc.owner) from exc
+
+  def _warm_entry(self, e, wait: bool, replicas_override: int | None = None) -> None:
+    """Warm one plan entry's pool (create template+pool, reserve, optionally wait
+    for readiness). The single warm path shared by ``warm_image`` and
+    ``start_warmpools``. Safe to run concurrently **across distinct images** (how
+    start_warmpools/the windowed strategies call it): shared counters/observer use
+    atomic helpers and ``_warmed`` writes hold the lock. It is NOT safe to warm the
+    *same* image from two threads at once (the reuse check + record aren't atomic
+    across the released lock); the callers never do that — one entry per image."""
+    if self.config.adopt_existing:
+      self._adopt_entry(e, wait)
+      return
+    reps = replicas_override if replicas_override is not None else e.replicas
+    c = self.registry.get(e.cluster)
+    fam = repo_family(e.image)
+
+    def _await_ready():
+      with self._obs.phase("wait_pool_ready", cluster=e.cluster, family=fam):
+        if not c.resources.wait_for_pool_ready(
+            e.pool, reps, timeout=self.config.ready_timeout):
+          raise FleetError(
+              f"warm pool '{e.pool}' on cluster '{e.cluster}' did not become "
+              f"ready within {self.config.ready_timeout}s")
+
+    with self._lock:
+      already = self._warmed.get(e.image, 0)
+    if already >= reps:                       # already warm (cross-epoch / keep_warm reuse)
+      if wait:                                # still honor the readiness contract on reuse
+        _await_ready()
+      return
+    with self._obs.phase("create_warmpool", cluster=e.cluster, family=fam):
+      try:
+        c.resources.ensure_template(
+            e.image, e.template, c.template_spec(self.config.template),
+            owner_run_id=self.run_id)
+      except OwnedByAnotherRunError as exc:
+        # Their pool may be gone while their template remains (their unwarm
+        # deleted the pool; the template delete failed or is still coming). A
+        # create would then succeed with no 409, and this run's pool would be
+        # built on — and later delete — their template. Same answer as a pool
+        # collision: fail, write nothing.
+        raise self._collision_error(e, "template", e.template, exc.owner) from exc
+      if self._shared_run_id and not already:
+        # The label can't say which process owns the pool, so ask; an image already
+        # in `_warmed` is ours and grows through the ordinary reconcile below.
+        status = c.resources.warm_shared_pool(e.pool, e.template, reps,
+                                              run_id=self.run_id)
+        ours = status != "foreign"
+      else:
+        status = None
+        ours = c.resources.create_warmpool(e.pool, e.template, reps, reconcile=True,
+                                           owner_run_id=self.run_id)
+    if status == "borrowed":
+      # Another process's pool: use it, but record nothing, so we never resize or
+      # delete it. Readiness is >= 1, as for an adopted pool.
+      if wait and not c.resources.wait_for_pool_ready(
+          e.pool, 1, timeout=self.config.ready_timeout):
+        raise FleetError(
+            f"borrowed warm pool '{e.pool}' on cluster '{e.cluster}' had no ready "
+            f"replica within {self.config.ready_timeout}s")
+      return
+    if ours is False:
+      # The image-derived name is a concurrent run's pool (create_warmpool checks
+      # the owner at the 409). Nothing of theirs was written; nothing is recorded
+      # or reserved.
+      raise self._pool_collision_error(c, e)
+    # Reserve only the delta when scaling an already-warm pool (create_warmpool
+    # upserts replicas on 409 under reconcile), so reuse never double-counts.
+    delta = reps - already
+    c.reserve_replicas(delta)
+    with self._lock:
+      self._warmed[e.image] = reps
+    self._obs.warm_add(e.cluster, delta)
+    if wait:
+      _await_ready()
+
+  def _adopt_entry(self, e, wait: bool) -> None:
+    """The ``adopt_existing`` counterpart to `_warm_entry`: confirm the pool can
+    serve a claim, create/patch/reserve nothing.
+
+    Readiness is ``>= 1`` ready replica, not ``>= e.replicas``. The pool's depth
+    belongs to its provisioner and moves under us — a fleet member replenishing
+    after a claim burst, an operator rescaling — so blocking on the full observed
+    depth would make readiness a race against someone else's controller. One warm
+    replica is the claimable-now contract this SDK needs.
+
+    ``replicas_override`` has no counterpart here on purpose: overriding depth is
+    a write, and adopt mode does not write."""
+    c = self.registry.get(e.cluster)
+    if wait:
+      with self._obs.phase("wait_pool_ready", cluster=e.cluster,
+                           family=repo_family(e.image)):
+        if not c.resources.wait_for_pool_ready(
+            e.pool, 1, timeout=self.config.ready_timeout):
+          raise FleetError(
+              f"adopted warm pool '{e.pool}' on cluster '{e.cluster}' (image "
+              f"{e.image}) had no ready replica within "
+              f"{self.config.ready_timeout}s — it exists but is not serving")
+    # Recorded so the reuse short-circuit and the per-image bookkeeping behave as
+    # usual. No `reserve_replicas` / `warm_add`: the capacity counters track what
+    # this fleet created, and it created none of this.
+    with self._lock:
+      self._warmed[e.image] = e.replicas
+
+  def _warm_entries(self, entries, wait: bool,
+                    replicas_override: int | None = None) -> None:
+    """Warm a set of plan entries **concurrently** (bounded by ``max_concurrent``).
+    Each entry's ``wait_for_pool_ready`` blocks on the image pull, so serializing
+    them is O(#images) slow; this fans out across a thread pool and raises the first
+    error (teardown cleans up partial state). Shared by ``start_warmpools`` (all
+    pools) and ``warm_images`` (a window) — both warm one entry per distinct image,
+    which ``_warm_entry`` is safe for."""
+    if not entries:
+      return
+    workers = max(1, min(len(entries), self.config.max_concurrent))
+    if workers == 1 or len(entries) == 1:
+      err = None
+      for e in entries:
+        try:
+          self._warm_entry(e, wait, replicas_override=replicas_override)
+        except Exception as exc:
+          err = err or exc
+      if err is not None:
+        raise err
+      return
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+      futures = [ex.submit(self._warm_entry, e, wait, replicas_override)
+                 for e in entries]
+      err = None
+      for f in as_completed(futures):
+        try:
+          f.result()
+        except Exception as exc:
+          err = err or exc
+      if err is not None:
+        raise err
+
+  def start_warmpools(self, wait: bool = True,
+                      create_budget: int | None = None) -> None:
+    """Warm every planned pool, concurrently (bounded by ``max_concurrent``).
+
+    The budget (``create_budget`` if given, else ``config.warm_create_budget``)
+    caps how many sandbox creates are in flight per wave; pools are warmed in
+    **waves** whose summed replicas stay under it, waiting for each wave to reach
+    Ready before the next starts. This bounds the controller's concurrent
+    sandbox-create burst (Σ pools×replicas in flight), which avoids the
+    SandboxWarmPool over-creation race (#1215) at large/deep warm targets — the
+    burst that trips it is ``workers × replicas_per_pool``, and waiting between
+    waves lets the informer cache converge. Budget ``0`` warms all at once;
+    ``create_budget=None`` falls back to the config default.
+
+    Note: when staging is active (budget > 0), intermediate waves always block on
+    readiness regardless of ``wait`` — waiting between waves is what makes staging
+    work; only the final wave honors ``wait``. So ``wait=False`` is not fully
+    non-blocking under staging; pass ``create_budget=0`` for the old all-at-once,
+    ``wait``-honoring behavior."""
+    # None = fall back to the configured default; 0 = explicitly warm all at once.
+    budget = self.config.warm_create_budget if create_budget is None else create_budget
+    entries = (self.plan_ or self.plan()).entries
+    if self.config.adopt_existing:
+      # Staging exists to bound the controller's concurrent *create* burst. Adopt
+      # mode issues no creates, and its entries carry the provisioner's depth
+      # (often thousands), which would split every pool into its own wave.
+      self._warm_entries(entries, wait)
+      return
+    if not budget or budget <= 0:
+      self._warm_entries(entries, wait)
+      return
+    wave: list = []
+    wave_creates = 0
+    n_waves = 0
+    for e in entries:
+      # A pool is atomic: if one entry alone exceeds the budget, it warms solo.
+      if wave and wave_creates + e.replicas > budget:
+        n_waves += 1
+        logger.info("staged warm: wave %d — %d pools / %d creates (budget %d)",
+                    n_waves, len(wave), wave_creates, budget)
+        self._warm_entries(wave, wait=True)   # wait so the cache converges first
+        wave, wave_creates = [], 0
+      wave.append(e)
+      wave_creates += e.replicas
+    if wave:
+      n_waves += 1
+      logger.info("staged warm: wave %d — %d pools / %d creates (budget %d)",
+                  n_waves, len(wave), wave_creates, budget)
+      self._warm_entries(wave, wait=wait)
+
+  def warm_images(self, images, *, replicas_override: int | None = None,
+                  wait: bool = True) -> None:
+    """Warm a subset of images' pools **concurrently** (used by sliding/pipelined to
+    warm a whole window in parallel instead of one image at a time)."""
+    plan = self.plan_ or self.plan()
+    # Dedupe while preserving order: warming the same image from two threads at
+    # once is unsafe (see ``_warm_entry``), and this is a public helper.
+    images = list(dict.fromkeys(images))
+    resolved = [(img, plan.for_image(img)) for img in images]
+    entries = [e for _img, e in resolved if e is not None]
+    missing = [img for img, e in resolved if e is None]
+    if missing:                              # callers pass planned images; None = a bug
+      logger.warning("warm_images: %d image(s) not in the plan, skipped: %s",
+                     len(missing), missing[:5])
+    self._warm_entries(entries, wait, replicas_override=replicas_override)
+
+  def warm_image(self, image: str, *, replicas_override: int | None = None,
+                 wait: bool = True) -> None:
+    """Warm one image's pool (used by sliding/none to bound the footprint)."""
+    entry = (self.plan_ or self.plan()).for_image(image)
+    if entry is None:
+      raise KeyError(f"image not in plan: {image}")
+    self._warm_entry(entry, wait, replicas_override=replicas_override)
+
+  def unwarm_images(self, images) -> None:
+    """Tear down a subset of images' pools + templates concurrently."""
+    plan = self.plan_ or self.plan()
+    images = list(dict.fromkeys(images))
+    resolved = [(img, plan.for_image(img)) for img in images]
+    entries = [e for _img, e in resolved if e is not None]
+    if not entries:
+      return
+    workers = max(1, min(len(entries), self.config.max_concurrent))
+    if workers == 1 or len(entries) == 1:
+      err = None
+      for e in entries:
+        try:
+          self._unwarm_entry(e)
+        except Exception as exc:
+          logger.exception("Failed to unwarm entry: %s", exc)
+          err = err or exc
+      if err is not None:
+        raise err
+      return
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+      futures = [ex.submit(self._unwarm_entry, e) for e in entries]
+      err = None
+      for f in as_completed(futures):
+        try:
+          f.result()
+        except Exception as exc:
+          logger.exception("Failed to unwarm entry: %s", exc)
+          err = err or exc
+      if err is not None:
+        raise err
+
+  def _unwarm_entry(self, entry) -> None:
+    """Tear down a single plan entry's warm pool and template, releasing replicas."""
+    if self.config.adopt_existing:
+      # The windowed strategies sweep their window as it slides. Under adoption
+      # that would delete the provisioner's pools out from under every other
+      # consumer of the fleet.
+      logger.debug("adopt_existing: leaving pool '%s' on '%s' alone (adopted)",
+                   entry.pool, entry.cluster)
+      return
+    with self._lock:
+      if entry.image not in self._warmed:
+        return                                 # already unwarmed — don't double-release
+      reps = self._warmed.pop(entry.image)
+    c = self.registry.get(entry.cluster)
+    try:
+      owned, live = self._pool_ownership(c, entry.pool)
+    except Exception:
+      # Unverifiable is not "theirs": keep the image (and its reservation) so a
+      # retry can release it exactly once, as for a failed delete below.
+      with self._lock:
+        self._warmed[entry.image] = reps
+      raise
+    if not owned:
+      # Retire the image from this run's bookkeeping but leave the other run's
+      # pool and template standing; the reserved capacity reconciles at teardown.
+      return
+    pool_deleted = False
+    err = None
+    if live is None:
+      # Already gone. A delete by name alone could hit a pool another run has
+      # created under this name since the read, so issue none.
+      pool_deleted = True
+    else:
+      # Delete exactly the object we inspected: with its uid as a precondition, a
+      # pool re-created under this name between the read and the delete is not
+      # ours to remove and survives (409, tolerated by delete_warmpool).
+      uid = (live.get("metadata") or {}).get("uid")
+      try:
+        if isinstance(uid, str) and uid:
+          c.resources.delete_warmpool(entry.pool, uid=uid)
+        else:
+          c.resources.delete_warmpool(entry.pool)
+        pool_deleted = True
+      except Exception as exc:
+        err = exc
+
+    if pool_deleted:
+      c.release_replicas(reps)
+      self._obs.warm_remove(entry.cluster, reps)
+    else:
+      with self._lock:
+        self._warmed[entry.image] = reps
+
+    try:
+      self._delete_template_if_owned(c, entry.template)
+    except Exception as exc:
+      if err is None:
+        err = exc
+
+    if err is not None:
+      raise err
+
+  def unwarm_image(self, image: str) -> None:
+    """Tear down one image's pool + template. **Idempotent**: a no-op if the image
+    isn't currently warmed. Two callers can legitimately unwarm the same image —
+    `scale_on_hold` recycling drops a held sandbox's pool, and a windowed strategy
+    sweeps its window at the end — so releasing capacity / counting `warm_remove`
+    must happen exactly once. (`release_replicas` is not idempotent: a second call
+    would double-decrement `active_replicas`, freeing capacity that isn't free and
+    over-admitting later windows.)"""
+    entry = (self.plan_ or self.plan()).for_image(image)
+    if entry is None:
+      return                                   # locate the pool before mutating state
+    self._unwarm_entry(entry)
+
+  def set_pool_replicas(self, image: str, replicas: int) -> None:
+    """Patch an image's warm pool to ``replicas`` (scale up or down) without
+    deleting it. Used by **sharded** recycle to cancel the controller's
+    replenishment as held shards claim: keeping ``desired = K − held`` means
+    ``held + warm == K`` per image throughout, so 18K claims never over-provision
+    (unlike ``unwarm_image``, which drops the whole pool). Best-effort on the warm
+    capacity counter — the delta is reconciled at ``teardown`` (reset_counts)."""
+    entry = (self.plan_ or self.plan()).for_image(image)
+    if entry is None:
+      return
+    if self.config.adopt_existing:
+      # `run(recycle=True, scale_on_hold=True)` calls this per held shard. On an
+      # adopted pool that is a write to someone else's object, and it would fight
+      # the provisioner's own reconcile loop.
+      logger.warning("adopt_existing: not scaling adopted pool '%s' on '%s' to "
+                     "%d — its depth belongs to whoever provisioned it",
+                     entry.pool, entry.cluster, replicas)
+      return
+    if self._shared_run_id and image not in self._warmed:
+      # Not ours to resize; doing so would also record it, and teardown would delete it.
+      logger.info("not scaling pool '%s' on '%s': this fleet did not warm it",
+                  entry.pool, entry.cluster)
+      return
+    replicas = max(0, replicas)
+    c = self.registry.get(entry.cluster)
+    # create_warmpool inspects the pool at the 409 and patches with that object's
+    # resourceVersion, so another run's pool is never resized (False: skip, with
+    # its warning) and a read error propagates instead of silently dropping the
+    # scale change.
+    if c.resources.create_warmpool(entry.pool, entry.template, replicas,
+                                   reconcile=True, owner_run_id=self.run_id) is False:
+      return
+    with self._lock:
+      prev = self._warmed.get(image, entry.replicas)
+      self._warmed[image] = replicas
+    delta = replicas - prev
+    if delta > 0:
+      c.reserve_replicas(delta)
+    elif delta < 0:
+      c.release_replicas(-delta)
+
+  def prepull(self, wait: bool = True, **overrides) -> bool:
+    """Pre-pull each cluster's planned images via DaemonSets (optional).
+
+    Batching, pacing, cleanup and the page-cache drop come from the
+    ``prepull_*`` fields of `FleetConfig`; ``overrides`` are passed through to
+    `prepull.prepull` (``images_per_pod``, ``max_parallel``, ``delete_when_done``,
+    ``drop_caches``, ``timeout``, ...) and win over the template-derived values.
+    The pods inherit the template's node selector, runtime class, pull secret
+    and tolerations, so they land where the sandboxes do. Returns whether every
+    cluster finished within its budget.
+    """
+    from .prepull import prepull as _do_prepull
+    plan = self.plan_ or self.plan()
+    cfg = self.config
+    base = dict(images_per_pod=cfg.prepull_images_per_pod,
+                max_parallel=cfg.prepull_max_parallel,
+                delete_when_done=cfg.prepull_delete_when_done,
+                drop_caches=cfg.prepull_drop_caches)
+    ok = True
+    with self._obs.phase("prepull"):
+      for cname, entries in plan.by_cluster().items():
+        c = self.registry.get(cname)
+        ts = c.template_spec(cfg.template)
+        kwargs = dict(base, node_selector=ts.node_selector,
+                      tolerations=(ts.extra_pod_spec or {}).get("tolerations"),
+                      runtime_class=ts.runtime_class,
+                      image_pull_secret=ts.image_pull_secret, labels=cfg.labels)
+        kwargs.update(overrides)
+        done = _do_prepull(c, [e.image for e in entries], wait=wait, **kwargs)
+        ok = ok and bool(done)
+    return ok
+
+  def prepull_delete(self) -> None:
+    from .prepull import prepull_delete as _do_prepull_delete
+    for c in self.registry:
+      _do_prepull_delete(c, labels=self.config.labels)
+
+  def setup(self, prepull: bool = False,
+            create_budget: int | None = None) -> "SandboxFleet":
+    """preflight → plan → (optional pre-pull) → start (and wait for) warm pools.
+
+    ``create_budget`` (if set) stages the warm fill in waves to bound the
+    controller's concurrent create burst — see ``start_warmpools``."""
+    if self.config.install_teardown_hooks:
+      self._install_teardown_hooks()          # (#4) clean up even on kill/crash
+    self._torndown = False
+    self._deleted_namespaces.clear()          # this cycle recreates what it needs
+    with self._lock:
+      # A fresh cycle starts with a clean slate; a slot leaked by a crashed
+      # prior cycle must not pre-charge this one's max_live_sandboxes.
+      self._claims_reserved = 0
+    self.preflight()
+    self.plan()
+    if prepull and not self.prepull(wait=True):
+      logger.warning("pre-pull did not finish within its budget; the warm pools "
+                     "start anyway and pull what is missing")
+    self.start_warmpools(wait=True, create_budget=create_budget)
+    return self
+
+  # --- claims ------------------------------------------------------------ #
+  def acquire(self, task: Task, *, snapshot_uid: str | None = None,
+              pod_annotations: dict | None = None) -> SandboxHandle:
+    """Claim a sandbox for ``task`` and return a `SandboxHandle`.
+
+    ``pod_annotations`` are stamped onto the sandbox **pod** (the claim's
+    ``spec.additionalPodMetadata``). ``snapshot_uid`` is shorthand for the GKE
+    Pod Snapshot pin (``podsnapshot.gke.io/ps-name``): a pod created for this
+    claim boots restored from that snapshot instead of "latest Ready wins".
+    The pin applies at pod creation — a cold start (empty pool) honors it; an
+    adopted, already-running warm member does not until its next pod
+    (suspend → resume).
+
+    On any failure between claim creation and bookkeeping, the partially-created
+    sandbox is terminated and the on-demand replica bump is rolled back, so a
+    failed acquire leaks neither a remote sandbox nor capacity counters.
+
+    ``max_live_sandboxes`` is enforced HERE, synchronously, before anything
+    remote happens. The async pod-count breaker keys off this run's pod label,
+    which adopted pods do not carry, so in ``adopt_existing`` mode this
+    reservation is the only thing standing between the harness and an
+    unbounded claim count.
+    """
+    with self._lock:
+      hard = self.config.max_live_sandboxes
+      if hard and self._claims_reserved >= hard:
+        raise FleetOvercommitError(
+            f"max_live_sandboxes={hard} reached: {self._claims_reserved} claims "
+            "live or in flight on this fleet. Release handles before acquiring "
+            "more, or raise the limit.")
+      self._claims_reserved += 1
+    try:
+      return self._acquire_reserved(task, snapshot_uid=snapshot_uid,
+                                    pod_annotations=pod_annotations)
+    except Exception:
+      with self._lock:
+        self._claims_reserved = max(0, self._claims_reserved - 1)
+      raise
+
+  def _acquire_reserved(self, task: Task, *, snapshot_uid: str | None = None,
+                        pod_annotations: dict | None = None) -> SandboxHandle:
+    # Body of acquire(); the caller holds one slot in _claims_reserved and
+    # releases it if this raises.
+    annotations = dict(pod_annotations or {})
+    if snapshot_uid:
+      annotations[constants.PODSNAPSHOT_NAME_ANNOTATION] = snapshot_uid
+    extra = {"pod_annotations": annotations} if annotations else {}
+    entry = self.plan_.for_image(task.image) if self.plan_ else None
+    on_demand = entry is None
+    if not on_demand:
+      cluster = self.registry.get(entry.cluster)
+      pool = entry.pool
+    created_pool = False          # did THIS call create the on-demand pool?
+    if on_demand and self.config.adopt_existing:
+      # Reachable when tasks are added after planning (plan() itself already
+      # rejects an uncovered image). Adopt mode's contract is that a miss is an
+      # error, not a quiet size-1 pool.
+      raise PoolNotFoundError(
+          f"adopt_existing: no adopted warm pool for image '{task.image}', and "
+          f"adopt mode does not create one. The image is not in the current plan "
+          f"— reload tasks and re-run plan(), or point the fleet at a namespace "
+          f"that serves it.")
+    if on_demand:
+      cluster = self.placement.select(task.image, self.registry)
+      pool = self._ensure_pool(cluster, task.image, 1)
+      # Reserve the size-1 pool's replica only the first time we create it for
+      # this (cluster, image); repeated acquire()s reuse it (no unbounded growth).
+      key = (cluster.name, task.image)
+      with self._lock:
+        created_pool = key not in self._ondemand
+        if created_pool:
+          self._ondemand.add(key)
+      if created_pool:
+        # Once per (cluster, image), not per claim. This path used to be silent,
+        # which is the failure the warning is for: a harness pointed at a cluster
+        # whose warm pools are named differently finds none of them, provisions
+        # its own one replica at a time, and reports a healthy — but far slower —
+        # run over the top of a warm fleet it never touched.
+        logger.warning(
+            "image %s is not in the plan; creating an on-demand size-1 pool "
+            "'%s' on cluster %s. If this image IS already warm here, the pool is "
+            "named something other than %r — set pool_name_format to match, or "
+            "adopt_existing=True to fail instead of provisioning in parallel.",
+            task.image, pool, cluster.name, self.config.pool_name_format)
+        cluster.reserve_replicas(1)
+
+    fam = repo_family(task)
+    sandbox = None
+    # The claim is named here rather than by the SDK so the fail-fast watchdog
+    # can find its pod while the SDK's readiness wait is still blocking. The SDK
+    # does not roll back caller-named claims, so the except path deletes it.
+    claim_name = f"sandbox-claim-{uuid.uuid4().hex[:12]}"
+    watchdog = None
+    if self.config.fail_fast.enabled:
+      watchdog = ClaimWatchdog(cluster, claim_name, self.config.fail_fast)
+      watchdog.start()
+    try:
+      with self._obs.phase("claim", cluster=cluster.name, family=fam):
+        sandbox = cluster.sandbox_client.create_sandbox(
+            warmpool=pool, namespace=cluster.namespace,
+            sandbox_ready_timeout=self.config.effective_claim_timeout(),
+            labels=dict(self.config.labels), claim_name=claim_name, **extra)
+        if watchdog is not None and watchdog.stop() is not None:
+          # The watchdog committed a verdict (and deleted the claim) in the
+          # window where the SDK wait was already returning. The sandbox behind
+          # this handle is going away, so report the failed start instead.
+          v = watchdog.verdict
+          raise SandboxStartError(v.reason, v.message, claim_name=claim_name,
+                                  pod_name=v.pod_name, image=task.image)
+        pod = sandbox.get_pod_name()
+        try:
+          pod_ip = sandbox.get_pod_ip()
+        except Exception:  # noqa: BLE001
+          pod_ip = None
+    except Exception as exc:  # noqa: BLE001 — roll back partial state, then re-raise
+      verdict = watchdog.stop() if watchdog is not None else None
+      claim_gone = watchdog is not None and watchdog.deleted_claim
+      if sandbox is None and not claim_gone and not (
+          isinstance(exc, client.ApiException) and exc.status == 409):
+        # create_sandbox raised before returning a handle. The SDK leaves a
+        # caller-named claim in place, so delete it here unless the watchdog
+        # confirmed its own delete (a verdict alone is not confirmation). A 409
+        # means the name is someone else's claim: leave that one alone.
+        try:
+          cluster.resources.delete_claim(claim_name)
+        except Exception:  # noqa: BLE001
+          logger.warning("failed to delete claim %s after acquire error",
+                         claim_name, exc_info=True)
+      if sandbox is not None:
+        try:
+          sandbox.terminate()
+        except Exception:  # noqa: BLE001
+          logger.warning("failed to terminate sandbox after acquire error",
+                         exc_info=True)
+      # However the claim went (deleted here, by the watchdog, or never
+      # created), the SDK client still tracks its name and object: prune them.
+      forget_claim_in_client(cluster, claim_name)
+      # If this call created the on-demand pool, undo it fully (delete pool +
+      # template, release the replica, forget it) so a failed acquire leaves no
+      # trace. A reused pool is left for the next acquire.
+      # Under a shared run id another process may have created or taken over the
+      # pool, so delete nothing; leftovers are the reaper's.
+      if created_pool:
+        if not self._shared_run_id:
+          try:
+            # Guarded like `_unwarm_entry`: on a 409 the on-demand create reuses
+            # an existing pool, which may be another run's under the same name.
+            owned, live = self._pool_ownership(cluster, pool)
+            if owned and live is not None:
+              uid = (live.get("metadata") or {}).get("uid")
+              if isinstance(uid, str) and uid:
+                cluster.resources.delete_warmpool(pool, uid=uid)
+              else:
+                cluster.resources.delete_warmpool(pool)
+            self._delete_template_if_owned(
+                cluster, self.config.template_name(task.image))
+          except Exception:  # noqa: BLE001
+            logger.warning("failed to remove on-demand pool after acquire error",
+                           exc_info=True)
+        cluster.release_replicas(1)
+        with self._lock:
+          self._ondemand.discard(key)
+      if verdict is not None:
+        # The watchdog deleted the claim, which is what ended the SDK wait; the
+        # error the caller needs is the pod's, not "claim was deleted".
+        self._obs.claim(cluster.name, "start_failed")
+        if isinstance(exc, SandboxStartError):
+          raise
+        raise SandboxStartError(
+            verdict.reason, verdict.message, claim_name=claim_name,
+            pod_name=verdict.pod_name, image=task.image) from exc
+      self._obs.claim(cluster.name, "error")
+      raise
+    finally:
+      if watchdog is not None:
+        watchdog.stop()
+
+    handle = SandboxHandle(
+        task=task, cluster_name=cluster.name, claim_name=sandbox.claim_name,
+        sandbox_id=sandbox.sandbox_id, pod_name=pod, hostname=sandbox.sandbox_id,
+        pod_ip=pod_ip, sandbox=sandbox, _cluster=cluster,
+        runtime_container=((entry.runtime_container if entry is not None else None)
+                           or constants.RUNTIME_CONTAINER))
+    handle.record_pod_identity()
+    # The remote create ran outside the lock, and the breaker thread can tear
+    # the fleet down in that window. _teardown flips _torndown under this same
+    # lock before it sweeps, so exactly one of two things is true here: the
+    # append lands before the sweep's snapshot (and the sweep releases it), or
+    # _torndown is already visible (and this claim must not outlive the
+    # teardown it missed).
+    with self._lock:
+      torn = self._torndown
+      if not torn:
+        self._handles.append(handle)
+    if torn:
+      try:
+        sandbox.terminate()
+      except Exception:  # noqa: BLE001
+        logger.warning("failed to terminate sandbox created during teardown",
+                       exc_info=True)
+      forget_claim_in_client(cluster, claim_name)
+      self._obs.claim(cluster.name, "error")
+      raise FleetError(
+          "fleet was torn down while this claim was in flight; the claim has "
+          "been terminated. Call setup() before acquiring again.")
+    cluster.reserve_claim()
+    self._obs.claim(cluster.name, "ok")
+    if snapshot_uid:
+      # Warm adoption is the default plan path, and an adopted pod is already
+      # running, so the pin did nothing there. Say so once, and keep it visible
+      # on the handle so the caller can suspend + resume (or restore) to apply it.
+      status = pod_restore_status(cluster.core_api, pod, cluster.namespace)
+      if status.from_snapshot(snapshot_uid):
+        logger.info("claim %s: pod %s was restored from the pinned snapshot %s",
+                    handle.claim_name, pod, snapshot_uid)
+      else:
+        handle.pending_snapshot_uid = snapshot_uid
+        why = ("was adopted already running" if status.restored is False
+               else f"PodRestored could not be read ({status.message})")
+        logger.info("claim %s: pin to snapshot %s is not applied — pod %s %s; it "
+                    "applies to the sandbox's next pod (fleet.suspend + "
+                    "fleet.resume) or call fleet.restore(handle, %r); see "
+                    "handle.pending_snapshot_uid",
+                    handle.claim_name, snapshot_uid, pod, why, snapshot_uid)
+    return handle
+
+  def acquire_batch(self, tasks: list[Task]) -> list[SandboxHandle]:
+    return [self.acquire(t) for t in tasks]
+
+  def handles(self) -> list[SandboxHandle]:
+    return list(self._handles)
+
+  def hostnames(self) -> list[str]:
+    return [h.hostname for h in self._handles]
+
+  def endpoints(self, port: int = 8888) -> list[str]:
+    return [h.endpoint(port) for h in self._handles]
+
+  def release(self, handle: SandboxHandle, *, delete_snapshots: bool = False) -> None:
+    """Release ``handle`` (delete its claim). With ``delete_snapshots`` also
+    delete the sandbox's GKE Pod Snapshots, which outlive the claim (and cost
+    storage) otherwise. They are listed before the release and deleted only after
+    it succeeds, so a failed release leaves a live sandbox with its checkpoints
+    intact for the retry. Snapshot cleanup failures are logged, never raised."""
+    # Claim the handle under the lock first, so a concurrent double-release of the
+    # same handle issues the remote delete (and counter decrement) exactly once.
+    with self._lock:
+      if handle not in self._handles:
+        return
+      self._handles.remove(handle)
+      c = self.registry.get(handle.cluster_name)
+    snapshot_uids: list = []
+    delete_snapshot = None
+    if delete_snapshots:
+      # Only read here: deleting is irreversible, so it waits for the release.
+      # The list goes to the API server by label with a short timeout (see
+      # _snapshot_uids_by_label) so an eviction never waits on the sandbox it
+      # is evicting.
+      try:
+        snapshot_uids = self._snapshot_uids_by_label(handle, c)
+        delete_snapshot = handle.snapshot_deleter()
+      except Exception:  # noqa: BLE001 — best-effort hygiene, release must proceed
+        logger.warning("release: could not list snapshots of %s; they are kept",
+                       handle.sandbox_id, exc_info=True)
+    try:
+      with self._obs.phase("release", cluster=handle.cluster_name):
+        handle.release()
+    except Exception:
+      # The remote delete failed, so the sandbox is still live: the slot must
+      # stay occupied (freeing it would let acquire() exceed the cap over a
+      # sandbox that never died) and the handle must go back so the caller can
+      # retry the release.
+      with self._lock:
+        self._handles.append(handle)
+      raise
+    # A suspended handle gave its slot back at suspend time (see suspend()).
+    if not handle._slot_released:
+      c.release_claim()
+      with self._lock:
+        self._claims_reserved = max(0, self._claims_reserved - 1)
+    for uid in snapshot_uids:
+      try:
+        delete_snapshot(uid)
+      except Exception:  # noqa: BLE001 — the claim is gone; report and move on
+        logger.warning("release: could not delete snapshot %s of %s", uid,
+                       handle.sandbox_id, exc_info=True)
+
+  # --- GKE Pod Snapshots (opt-in: ClusterConfig(snapshots=True)) ----------- #
+  # Thin, timed wrappers over the SandboxHandle primitives so the run report
+  # (and metrics/spans) see snapshot work next to claim/process/release, plus
+  # the claim-slot bookkeeping a suspend/resume cycle needs.
+  _SNAPSHOT_LIST_TIMEOUT = (3, 10)      # (connect, read) seconds
+
+  def _snapshot_uids_by_label(self, handle: SandboxHandle, cluster) -> list[str]:
+    """The uids of ``handle``'s PodSnapshots, listed by the sandbox's name-hash
+    label with a short request timeout. The engine's own ``list()`` resolves the
+    sandbox through the SDK object with no timeout; this reads the Sandbox's
+    ``status.labelSelector`` and the PodSnapshots directly, both bounded, so a
+    release never waits on the sandbox it is releasing."""
+    sb = cluster.custom_api.get_namespaced_custom_object(
+        constants.SANDBOX_GROUP, constants.SANDBOX_VERSION, cluster.namespace,
+        constants.SANDBOXES_PLURAL, handle.sandbox_id,
+        _request_timeout=self._SNAPSHOT_LIST_TIMEOUT)
+    selector = ((sb or {}).get("status") or {}).get("labelSelector")
+    if not selector:
+      raise FleetError(f"sandbox {handle.sandbox_id!r} has no status.labelSelector "
+                       "yet; its snapshots cannot be listed by label")
+    resp = cluster.custom_api.list_namespaced_custom_object(
+        constants.PODSNAPSHOT_GROUP, constants.PODSNAPSHOT_VERSION, cluster.namespace,
+        constants.PODSNAPSHOTS_PLURAL, label_selector=selector,
+        _request_timeout=self._SNAPSHOT_LIST_TIMEOUT)
+    uids = []
+    for item in (resp or {}).get("items") or []:
+      name = (item.get("metadata") or {}).get("name")
+      if name:
+        uids.append(name)
+    return uids
+
+  def _free_slot_for_suspend(self, handle: SandboxHandle) -> None:
+    """A suspended sandbox has no pod: give its claim slot back to
+    ``max_live_sandboxes`` and the cluster's claim count. Idempotent per handle."""
+    with self._lock:
+      if handle._slot_released:
+        return
+      handle._slot_released = True
+      self._claims_reserved = max(0, self._claims_reserved - 1)
+    self.registry.get(handle.cluster_name).release_claim()
+
+  def _retake_slot_for_wake(self, handle: SandboxHandle) -> bool:
+    """Before a resume/restore brings the pod back: take a claim slot again, or
+    raise `FleetOvercommitError` without touching the sandbox. Returns whether a
+    slot was taken (False when the handle never gave one back)."""
+    with self._lock:
+      if not handle._slot_released:
+        return False
+      hard = self.config.max_live_sandboxes
+      if hard and self._claims_reserved >= hard:
+        raise FleetOvercommitError(
+            f"max_live_sandboxes={hard} reached: {self._claims_reserved} claims "
+            f"live or in flight on this fleet, so {handle.sandbox_id} stays "
+            "suspended. Release or suspend other handles first, or raise the limit.")
+      self._claims_reserved += 1
+      handle._slot_released = False
+    self.registry.get(handle.cluster_name).reserve_claim()
+    return True
+
+  def snapshot(self, handle: SandboxHandle, name: str | None = None, *,
+               timeout: int = 180) -> str:
+    """Snapshot ``handle``'s sandbox (memory + filesystem); returns the uid."""
+    with self._obs.phase("snapshot", cluster=handle.cluster_name,
+                         family=repo_family(handle.task)):
+      return handle.snapshot(name, timeout=timeout)
+
+  def suspend(self, handle: SandboxHandle, *, snapshot: bool = True,
+              timeout: int = 180) -> Optional[str]:
+    """Suspend ``handle``'s sandbox (pod deleted, claim kept); returns the
+    pre-suspend snapshot uid (None when ``snapshot=False``, in which case
+    ``resume`` restores the latest older snapshot if one exists; see
+    `SandboxHandle.suspend`).
+
+    The handle stays tracked, but its claim slot is given back: a suspended
+    sandbox has no pod, so it no longer counts toward ``max_live_sandboxes`` or
+    the cluster's claim count, and ``resume`` / ``restore`` take a slot again
+    (raising `FleetOvercommitError` at the cap before touching the sandbox).
+    What suspension does not create is warm capacity: the claim still holds its
+    sandbox, so the pool does not refill for it. Calling ``handle.suspend()``
+    directly skips this bookkeeping."""
+    with self._obs.phase("suspend", cluster=handle.cluster_name,
+                         family=repo_family(handle.task)):
+      uid = handle.suspend(snapshot=snapshot, timeout=timeout)
+    self._free_slot_for_suspend(handle)
+    return uid
+
+  def resume(self, handle: SandboxHandle, *, timeout: int = 180) -> bool:
+    """Resume ``handle``'s sandbox (latest snapshot if any); returns whether it
+    was restored from a snapshot. The handle is refreshed (new pod) and its
+    claim slot taken again (see `suspend`)."""
+    retaken = self._retake_slot_for_wake(handle)
+    try:
+      with self._obs.phase("resume", cluster=handle.cluster_name,
+                           family=repo_family(handle.task)):
+        restored = handle.resume(timeout=timeout)
+    except Exception:
+      if retaken:
+        self._free_slot_for_suspend(handle)    # still suspended: slot goes back
+      raise
+    self._obs.restored(handle.cluster_name, restored)
+    return restored
+
+  def restore(self, handle: SandboxHandle, snapshot_uid: str, *,
+              timeout: int = 180) -> None:
+    """Restore ``handle``'s (suspended) sandbox from ``snapshot_uid``; the SDK
+    verifies the pod's ``PodRestored`` condition. The handle is refreshed and
+    its claim slot taken again (see `suspend`)."""
+    retaken = self._retake_slot_for_wake(handle)
+    try:
+      with self._obs.phase("restore", cluster=handle.cluster_name,
+                           family=repo_family(handle.task)):
+        handle.restore(snapshot_uid, timeout=timeout)
+    except Exception:
+      if retaken:
+        self._free_slot_for_suspend(handle)
+      raise
+    self._obs.restored(handle.cluster_name, True)
+
+  def release_all(self) -> None:
+    for h in list(self._handles):
+      self.release(h)
+
+  # --- teardown ---------------------------------------------------------- #
+  def teardown(self, delete_namespace: bool = False, *,
+               verify: bool = False) -> "dict[str, dict] | None":
+    """Release all claims and delete every resource this fleet created. With a
+    shared `FleetConfig.run_id`, only the pools this fleet warmed are deleted.
+
+    ``verify`` follows the sweep with `verify_teardown`: the run-scoped reaper
+    runs on every cluster, deletes whatever of this run is still there, and the
+    per-cluster counts come back (all zero means the teardown was clean)."""
+    with self._obs.phase("teardown"):
+      self._teardown(delete_namespace)
+    if not verify:
+      return None
+    return self.verify_teardown()
+
+  def verify_teardown(self) -> "dict[str, dict]":
+    """Check (and finish) a teardown with the run-scoped reaper.
+
+    For every cluster: this run's pods are counted, then ``reap(run_id=<this
+    run>)`` lists and deletes this run's claims, pools and templates (Sandbox
+    CRs go with their claims) and force-deletes its pods by label, so a delete
+    that failed inside `teardown` or a pod the controller had not removed yet
+    is both reported and cleaned. Returns ``{cluster_name: counts}`` with
+    ``claims``, ``warmpools``, ``sandboxes``, ``templates`` and ``pods`` as
+    integers (what the reaper found; all zero means the teardown was clean) and
+    ``remaining``, the same kinds re-listed after the reaper with a short settle
+    (all zero means the namespace is verified clean; anything else is logged as
+    a warning, because the reaper counts what it listed, not what is gone).
+    Waits for a teardown sweep another thread is still running. Skipped, with a note in the result, for a shared
+    run id (the id spans other processes' resources), for ``adopt_existing``
+    (adopted pools may carry this run's label from an earlier run) and for a
+    namespace this teardown deleted. A reaper error is recorded under
+    ``"error"``, not raised.
+
+    Raises `FleetError` when called before `teardown`: the reaper deletes, so
+    it is not a mid-run inspection.
+    """
+    from .reaper import reap
+    if not self._torndown:
+      raise FleetError("verify_teardown() runs the run-scoped reaper, which deletes "
+                       "this run's resources; call teardown() first")
+    out: dict[str, dict] = {}
+    with self._sweep_lock:                    # an in-progress sweep finishes first
+      for c in self.registry:
+        out[c.name] = self._verify_cluster(c, reap)
+    return out
+
+  def _run_leftovers(self, c: "Cluster") -> dict[str, int]:
+    """What of this run is in the namespace right now, by kind."""
+    return {
+        "claims": len(c.resources.list_claims(label_selector=self.run_selector())),
+        "warmpools": len(c.resources.list_warmpools(label_selector=self.run_selector())),
+        "templates": len(c.resources.list_templates(label_selector=self.run_selector())),
+        "pods": int(c.resources.count_pods(label_selector=self.pod_run_selector())),
+    }
+
+  def _verify_cluster(self, c: "Cluster", reap) -> dict:
+    if self._shared_run_id:
+      return {"skipped": "shared run id: the reaper would reach other processes"}
+    if self.config.adopt_existing:
+      return {"skipped": "adopt_existing: adopted pools are not this run's to reap"}
+    if (c.name, c.namespace) in self._deleted_namespaces:
+      return {"skipped": f"namespace {c.namespace} was deleted"}
+    cfg = c.config
+    with self._obs.phase("verify_teardown", cluster=c.name):
+      try:
+        # Counted before the reaper's delete-collection, which does not count.
+        pods = int(c.resources.count_pods(label_selector=self.pod_run_selector()))
+        counts = reap(run_id=self.run_id, context=getattr(cfg, "context", None),
+                      namespace=c.namespace, kubeconfig=getattr(cfg, "kubeconfig", None),
+                      in_cluster=bool(getattr(cfg, "in_cluster", False)))
+        if "pods" not in counts:              # reap logs a failed delete-collection
+          counts["error"] = "pod delete-collection failed; see the reaper log"
+        counts["pods"] = pods
+        # The reaper counts what it listed, not what is gone: a delete can fail
+        # and a force-deleted pod takes a moment to leave. Re-list, with a short
+        # settle, and report what is still there separately.
+        remaining = self._run_leftovers(c)
+        for delay in _VERIFY_SETTLE_S:
+          if not any(remaining.values()):
+            break
+          time.sleep(delay)
+          remaining = self._run_leftovers(c)
+        counts["remaining"] = remaining
+      except Exception as exc:  # noqa: BLE001 — verification must not fail the caller
+        logger.warning("verify_teardown: reaper failed on cluster %s: %s", c.name, exc)
+        return {"error": f"{type(exc).__name__}: {exc}"}
+    found = {k: v for k, v in counts.items() if isinstance(v, int) and v > 0}
+    left = {k: v for k, v in counts["remaining"].items() if v > 0}
+    if left:
+      logger.warning("verify_teardown: cluster %s is NOT verified clean for run %s: "
+                     "still present after the reaper: %s", c.name, self.run_id, left)
+    elif found:
+      logger.warning("verify_teardown: cluster %s still had %s of run %s; reaped, "
+                     "now clean", c.name, found, self.run_id)
+    else:
+      logger.info("verify_teardown: cluster %s clean for run %s", c.name, self.run_id)
+    return counts
+
+  def _teardown(self, delete_namespace: bool) -> None:
+    # Idempotent/reentrant: the breaker thread, a strategy's teardown, __exit__,
+    # and signal handlers can all call this — only the first pass this cycle runs
+    # (setup() resets the flag). Deletes are 404-tolerant, but this avoids the
+    # redundant sweeps + the registry/handle race of concurrent teardowns.
+    with self._teardown_lock:
+      if self._torndown:
+        return
+      # Under _lock as well: acquire()'s check-then-append is atomic under
+      # _lock, so flipping the flag inside it guarantees an in-flight acquire
+      # either appended before this point (the sweep below sees the handle) or
+      # will see the flag and terminate its own claim.
+      with self._lock:
+        self._torndown = True
+    with self._sweep_lock:
+      self.release_all()
+      if self._shared_run_id:
+        # A sweep by a shared id would tear down the whole job; unwarm only what
+        # this fleet warmed and leave the rest for the reaper.
+        with self._lock:
+          warmed = list(self._warmed)
+        if warmed and self.plan_:
+          try:
+            self.unwarm_images(warmed)
+          except Exception as exc:  # noqa: BLE001 — best-effort, like the sweep
+            logger.exception("teardown: failed to unwarm this fleet's pools: %s", exc)
+      for c in self.registry:
+        # Run-scoped on purpose. Every claim, pool and template this fleet created
+        # carries this run's id label; the namespace-wide managed label also matches
+        # every OTHER agent-sandbox-rl run in the namespace, and sweeping by it once
+        # deleted a concurrent tenant's whole warm fleet. Leftovers of a run that
+        # crashed without tearing down are the reaper's job (`reap(run_id=…)`, or
+        # the explicit `all_managed=True` sweep).
+        sel = self.run_selector()
+        if self._shared_run_id:
+          claims, pools, tmpls = [], [], []
+        else:
+          logger.info("teardown: sweeping run %s on cluster %s (%s)",
+                      self.run_id, c.name, sel)
+          # Sweep any stray claims first (defensive: untracked/leaked claims keep
+          # their adopted sandbox alive even after the pool is gone).
+          try:
+            claims = c.resources.list_claims(label_selector=sel)
+            pools = c.resources.list_warmpools(label_selector=sel)
+            tmpls = c.resources.list_templates(label_selector=sel)
+          except Exception as exc:
+            logger.exception("Failed to list resources on cluster %s during teardown: %s", c.name, exc)
+            claims, pools, tmpls = [], [], []
+        # Adopted pools/templates are swept out of the delete set explicitly. They
+        # normally don't carry our managed label at all, but they can — adopting a
+        # pool an earlier run of this SDK left behind is a legitimate use — and
+        # deleting the fleet's warm pods on the way out is not a recoverable
+        # mistake. Claims stay in: those we created, and they must be released.
+        if self._adopted_pools or self._adopted_templates:
+          kept_p = [p for p in pools if (c.name, p) in self._adopted_pools]
+          kept_t = [t for t in tmpls if (c.name, t) in self._adopted_templates]
+          if kept_p or kept_t:
+            logger.info("teardown: leaving %d adopted pool(s) and %d adopted "
+                        "template(s) on cluster %s in place",
+                        len(kept_p), len(kept_t), c.name)
+          pools = [p for p in pools if (c.name, p) not in self._adopted_pools]
+          tmpls = [t for t in tmpls if (c.name, t) not in self._adopted_templates]
+        total_items = len(claims) + len(pools) + len(tmpls)
+        if total_items > 0:
+          workers = max(1, min(total_items, self.config.max_concurrent))
+          with ThreadPoolExecutor(max_workers=workers) as ex:
+            # Phase 1: Sweep stray claims first so adopted sandboxes aren't leaked.
+            if claims:
+              claim_futs = [ex.submit(c.resources.delete_claim, claim) for claim in claims]
+              for f in as_completed(claim_futs):
+                try:
+                  f.result()
+                except Exception as exc:
+                  logger.exception("Failed to delete claim during teardown: %s", exc)
+            # Phase 2: Delete pools and templates concurrently.
+            rest_futs = [ex.submit(c.resources.delete_warmpool, pool) for pool in pools]
+            rest_futs.extend(ex.submit(c.resources.delete_template, tmpl) for tmpl in tmpls)
+            if rest_futs:
+              for f in as_completed(rest_futs):
+                try:
+                  f.result()
+                except Exception as exc:
+                  logger.exception("Failed to delete pool/template during teardown: %s", exc)
+        c.reset_counts()
+        # A namespace this run created (run_isolation="namespace") goes with it;
+        # a pre-existing one, or a shared run id's, only when the caller asks.
+        key = (c.name, c.namespace)
+        if delete_namespace or (key in self._created_namespaces
+                                and not self._shared_run_id):
+          try:
+            c.resources.delete_namespace(c.namespace)
+            self._deleted_namespaces.add(key)
+          except Exception as exc:  # noqa: BLE001 — best-effort, like the sweeps above
+            # Keep the ownership record, as the rollback path does, so the next
+            # teardown cycle retries the delete instead of leaking the namespace.
+            logger.warning("teardown: failed to delete namespace '%s' on cluster %s: %s",
+                           c.namespace, c.name, exc)
+            continue
+          self._created_namespaces.discard(key)
+          self._namespaces_set_up.discard(key)
+      self._namespaces_ensured = False
+      self._obs.warm_reset()
+      with self._lock:
+        self._warmed.clear()
+        self._ondemand.clear()
+      self._adopted_pools.clear()
+      self._adopted_templates.clear()
+      self.plan_ = None
+      self._remove_teardown_hooks()
+
+  def __enter__(self) -> "SandboxFleet":
+    return self.setup()
+
+  def __exit__(self, *exc) -> None:
+    self.teardown()
+
+  # --- managed runner ---------------------------------------------------- #
+  @contextlib.contextmanager
+  def recording(self, label: str = "manual"):
+    """Record a `RunReport` around primitive calls made outside ``run()``
+    (acquire / snapshot / suspend / resume / restore / release …). Sets
+    ``fleet.report`` for the duration (and leaves it set); ``label`` fills the
+    report's ``strategy`` field. ``run()`` records on its own — don't nest."""
+    with self._obs.run(label) as report:
+      self.report = report
+      yield report
+
+  def run(self, process_fn: Callable[[Task, SandboxHandle], object],
+          strategy: str = "naive", concurrency: int | None = None,
+          *, epochs: int = 1, keep_warm: bool = False,
+          recycle: bool = False, reset=None, max_reuses: int = 32,
+          reset_timeout: float = 5.0, use_session: bool = True,
+          scale_on_hold: bool = True) -> list:
+    """Run all loaded tasks under ``strategy`` (none|naive|sliding|pipelined) with
+    up to ``concurrency`` parallel claim+exec (defaults to ``config.max_concurrent``).
+
+    ``epochs>1`` runs that many passes over all tasks, keeping warm pools resident
+    between epochs (so re-pulls hit the node layer cache) and tearing down once at
+    the end; it returns ``list[list]`` (one task-ordered list per pass). ``epochs==1``
+    returns the flat ``list`` (a per-task exception is captured, not raised).
+    ``keep_warm=True`` skips the final teardown so a caller's own loop can reuse the
+    warm pools; call ``fleet.teardown()`` when done.
+
+    ``recycle`` is an **orthogonal** modifier, not a strategy: with ``recycle=True``
+    the chosen ``strategy`` still governs warm-pool sizing/timing, but tasks sharing
+    an image reuse one claimed sandbox (git-restore reset between them) instead of a
+    fresh claim per task — see `recycle.reuse_git_restore_sandbox`. It only applies
+    to workloads with a resettable ``/testbed`` (multiple tasks per image, e.g. RL
+    rollouts); for 1:1 eval it is a no-op, so it is off by default. ``reset`` (a
+    ``GitRestoreReset``), ``max_reuses``, ``reset_timeout``, ``use_session`` and
+    ``scale_on_hold`` are forwarded to the recycle executor and ignored when
+    ``recycle=False``.
+    """
+    from .strategies import STRATEGIES, process_parallel
+    if strategy not in STRATEGIES:
+      raise ValueError(f"unknown strategy '{strategy}'; choose from {sorted(STRATEGIES)}")
+    if epochs < 1:
+      raise ValueError("epochs must be >= 1")
+    conc = concurrency or self.config.max_concurrent
+    fn = STRATEGIES[strategy]
+    executor = process_parallel
+    if recycle:                               # swap task→sandbox binding, keep warming
+      from .recycle import GitRestoreReset, reuse_git_restore_sandbox
+      _reset = reset or GitRestoreReset()
+
+      def executor(fleet, tasks, process_fn, concurrency):  # noqa: E306
+        return reuse_git_restore_sandbox(
+            fleet, tasks, process_fn, concurrency, reset=_reset,
+            max_reuses=max_reuses, reset_timeout=reset_timeout,
+            use_session=use_session, scale_on_hold=scale_on_hold)
+    if self.plan_ is None:
+      self.plan()                             # give the circuit breaker a footprint
+    expected = self.plan_.total_replicas if self.plan_ else None
+    with self.overcommit_guard(expected), self._obs.run(strategy) as report:
+      self.report = report
+      try:
+        report.environment = self.describe_environment()
+      except Exception:  # noqa: BLE001 — environment is best-effort
+        logger.debug("could not collect environment", exc_info=True)
+      if epochs == 1:
+        results = fn(self, process_fn, conc, teardown=not keep_warm,
+                     executor=executor)
+      else:
+        results = []
+        for e in range(epochs):
+          last = e == epochs - 1
+          logger.info("epoch %d/%d", e + 1, epochs)
+          try:
+            results.append(fn(self, process_fn, conc,
+                              teardown=last and not keep_warm, executor=executor))
+          except BaseException:               # a mid-run epoch never tore down
+            if not keep_warm and not last:
+              self.teardown()
+            raise
+    logger.info("\n%s", report.summary())
+    return results
+
+  def describe_environment(self) -> dict:
+    """Best-effort per-cluster details (context, namespace, k8s version, nodes,
+    node pools, instance types, region) for the RunReport. Never raises."""
+    def _lbl(node, key):
+      return (node.metadata.labels or {}).get(key)
+
+    env = {}
+    for c in self.registry:
+      info = {"context": c.config.context or "(ambient)", "namespace": c.namespace}
+      try:
+        info["k8s_version"] = client.VersionApi(c.api_client).get_code().git_version
+      except Exception:  # noqa: BLE001
+        pass
+      try:
+        nodes = c.core_api.list_node().items
+        info["nodes"] = len(nodes)
+        pools = sorted({_lbl(n, "cloud.google.com/gke-nodepool")
+                        for n in nodes if _lbl(n, "cloud.google.com/gke-nodepool")})
+        types = sorted({_lbl(n, "node.kubernetes.io/instance-type")
+                        for n in nodes if _lbl(n, "node.kubernetes.io/instance-type")})
+        regions = sorted({_lbl(n, "topology.kubernetes.io/region")
+                          for n in nodes if _lbl(n, "topology.kubernetes.io/region")})
+        if pools:
+          info["node_pools"] = pools
+        if types:
+          info["instance_types"] = types
+        if regions:
+          info["region"] = regions[0] if len(regions) == 1 else regions
+      except Exception:  # noqa: BLE001
+        pass
+      env[c.name] = info
+    return env

@@ -2,6 +2,34 @@ a {
   text-decoration: none;
 }
 
+.td-box--black,
+.td-cover-block.-bg-black,
+.td-section,
+.td-page,
+footer.bg-dark {
+  --bs-link-color: #{$link-color-dark};
+  --bs-link-color-rgb: #{to-rgb($link-color-dark)};
+  --bs-link-hover-color: #{$link-hover-color-dark};
+  --bs-link-hover-color-rgb: #{to-rgb($link-hover-color-dark)};
+
+  // Light components must not inherit the dark surface's link colors.
+  .alert,
+  .feature-state-notice {
+    --bs-link-color: #{$link-color};
+    --bs-link-color-rgb: #{to-rgb($link-color)};
+    --bs-link-hover-color: #{$link-hover-color};
+    --bs-link-hover-color-rgb: #{to-rgb($link-hover-color)};
+  }
+}
+
+// Docsy's cover links use a fixed hover color instead of Bootstrap variables.
+.td-cover-block.-bg-black p:not(.p-initial) > a {
+  &:hover,
+  &:focus {
+    color: $link-hover-color-dark;
+  }
+}
+
 // --------------------------------------------------
 // remove whitespace after footer
 // --------------------------------------------------
@@ -12,19 +40,18 @@ footer {
 // --------------------------------------------------
 // prevent overflow of long names in sidebar
 // --------------------------------------------------
-.td-sidebar-nav__section > ul {
+.td-sidebar-nav__section>ul {
   overflow-wrap: break-word;
 }
 
 .td-overlay--dark::after {
   background-color: #000000;
-  background-image: radial-gradient(
-      circle at 25% -50px,
+  background-image: radial-gradient(circle at 25% -50px,
       #8800d6 0%,
-      transparent 55%
-    ),
+      transparent 55%),
     radial-gradient(circle at 75% -40px, #cd0663 0%, transparent 55%),
-    radial-gradient(circle at 50% -30px, #af0eae 0%, transparent 30%);;
+    radial-gradient(circle at 50% -30px, #af0eae 0%, transparent 30%);
+  ;
 
   /* Ensure full coverage */
   min-height: 100vh;
@@ -44,11 +71,11 @@ footer {
   opacity: inherit;
 }
 
-.row > * {
+.row>* {
   flex-shrink: 1;
 }
 
-.row > .container {
+.row>.container {
   max-width: 1200px;
 }
 
@@ -63,8 +90,16 @@ footer {
     margin: 0 1rem;
     padding: 0;
 
-    .text-uppercase {
-      display: none;
+    // Docsy prints the site title next to the logo. The logo already carries
+    // the brand, so hide the text visually but keep it for screen readers,
+    // which would otherwise find an unlabelled link.
+    .navbar-brand__name {
+      position: absolute;
+      width: 1px;
+      height: 1px;
+      overflow: hidden;
+      clip-path: inset(50%);
+      white-space: nowrap;
     }
 
     svg {
@@ -72,9 +107,19 @@ footer {
     }
   }
 
+  .td-navbar-nav-scroll {
+    min-width: 0;
+  }
+
   .navbar-nav {
+    // Docsy stops scrolling at lg; wrap links without clipping dropdowns.
+    @include media-breakpoint-up(lg) {
+      flex-wrap: wrap;
+    }
+
     @include media-breakpoint-down(md) {
       font-size: 0.875rem;
+
       .dropdown {
         min-width: inherit;
       }
@@ -85,16 +130,14 @@ footer {
 .td-section,
 .td-page {
   background-color: $black;
-  background-image: radial-gradient(
-      circle at 25% -40%,
+  background-image: radial-gradient(circle at 25% -40%,
       #3c005f 0%,
-      transparent 45%
-    ),
+      transparent 45%),
     radial-gradient(circle at 75% -40%, #5e0032 0%, transparent 45%);
   background-attachment: fixed;
   color: $white;
 
-  .navbar {
+  .td-navbar {
     background-color: transparent;
   }
 
@@ -117,23 +160,65 @@ footer {
   }
 }
 
-// Fix sidebar nav link colors for dark background
+// Sidebar nav hierarchy (#1658): smaller type, spacing > wrap gap,
+// and weight/color distinction per Docsy nesting level (.ul-0/.ul-1/...).
 .td-sidebar-nav {
-  .td-sidebar-link__page:not(.active) {
-    color: rgba(255, 255, 255, 0.75) !important;
+  font-size: 0.875rem; // 14px
+  line-height: 1.35;
+
+  .td-sidebar-link {
+    // Docsy default 0.375rem is << 24px line-height, so wrapped lines
+    // look like separate entries. Keep item gap above the wrap gap.
+    padding-bottom: 0.65rem;
+    line-height: 1.35;
   }
 
-  .td-sidebar-nav__section-title a:not(.active) {
-    color: rgba(255, 255, 255, 0.9) !important;
+  // Each level is scoped with child combinators: Docsy 0.12 puts
+  // `.td-sidebar-nav__section-title` on every `li`, and nested links are
+  // `ul.ul-N > li > label > a`, so descendant selectors would leak into
+  // deeper levels. Weight/size rules skip only `.active` (so `a.active`
+  // keeps its bold); color rules also skip `:hover`/`:focus` so the white
+  // hover/focus color below still wins.
+
+  // Root entry: heaviest and brightest.
+  .ul-0 > li > .td-sidebar-link:not(.active) {
+    font-weight: 600;
   }
 
-  a:hover, a:focus {
+  .ul-0 > li > .td-sidebar-link:not(.active):not(:hover):not(:focus) {
+    color: rgba(255, 255, 255, 0.92) !important;
+  }
+
+  // First level under the root.
+  .ul-1 > li > label > .td-sidebar-link:not(.active) {
+    font-weight: 500;
+  }
+
+  .ul-1 > li > label > .td-sidebar-link:not(.active):not(:hover):not(:focus) {
+    color: rgba(255, 255, 255, 0.78) !important;
+  }
+
+  // Deeper nesting (.ul-2 and below): lighter weight and smaller type.
+  .ul-1 ul > li > label > .td-sidebar-link {
+    font-size: 0.8125rem; // 13px
+  }
+
+  .ul-1 ul > li > label > .td-sidebar-link:not(.active) {
+    font-weight: 400;
+  }
+
+  .ul-1 ul > li > label > .td-sidebar-link:not(.active):not(:hover):not(:focus) {
+    color: rgba(255, 255, 255, 0.68) !important;
+  }
+
+  a:hover,
+  a:focus {
     color: #fff !important;
   }
 
   a.active,
   a .td-sidebar-nav-active-item {
-    color: $primary !important;
+    color: $link-color-dark !important;
     font-weight: 700;
   }
 
@@ -156,7 +241,8 @@ footer {
     color: rgba(255, 255, 255, 0.65) !important;
   }
 
-  a:hover, a:focus {
+  a:hover,
+  a:focus {
     color: #fff !important;
   }
 }
@@ -233,8 +319,8 @@ figcaption {
   }
 }
 
-.td-content > ul li,
-.td-content > ol li.nav-item {
+.td-content>ul li,
+.td-content>ol li.nav-item {
   margin-bottom: 0px;
 }
 
@@ -252,11 +338,11 @@ figcaption {
   }
 }
 
-nav.foldable-nav .ul-1 .with-child > label:hover:before {
+nav.foldable-nav .ul-1 .with-child>label:hover:before {
   transform: none;
 }
 
-nav.foldable-nav .ul-1 .with-child > input:checked ~ label:hover:before {
+nav.foldable-nav .ul-1 .with-child>input:checked~label:hover:before {
   transform: rotate(90deg) !important;
 }
 
@@ -268,11 +354,12 @@ div.feature-state-notice {
 
   font-size: 1.2em;
 
-  > .feature-state-name::before {
+  >.feature-state-name::before {
     content: "ⓘ  ";
     color: #326ce5; // Kubernetes blue
   }
-  > .feature-state-name {
+
+  >.feature-state-name {
     display: inline-block;
     font-size: 0.95em;
     font-weight: bold;
@@ -289,7 +376,7 @@ div.feature-state-notice {
   max-width: 80%;
 
   &.feature-deprecated {
-    > .feature-state-name::before {
+    >.feature-state-name::before {
       color: #ed6a5a;
     }
 
@@ -313,7 +400,13 @@ div.feature-state-notice {
   padding-top: 8rem;
 }
 
-.mx-auto > .container {
+@include media-breakpoint-down(md) {
+  .td-cover-block--height-full {
+    padding-top: 2rem;
+  }
+}
+
+.mx-auto>.container {
   display: flex;
   flex-direction: row;
   justify-content: center;
@@ -332,7 +425,7 @@ div.feature-state-notice {
 }
 
 @media only screen and (max-width: 800px) {
-  .mx-auto > .container {
+  .mx-auto>.container {
     flex-direction: column;
     justify-content: unset;
   }
@@ -350,17 +443,23 @@ div.feature-state-notice {
   }
 }
 
-.link-card:hover {
+.link-card:hover,
+.link-card:focus-visible {
   cursor: pointer;
   background: rgba($primary, 0.2);
 }
 
-.link-card > .title {
+.link-card:focus-visible {
+  outline: 3px solid $primary;
+  outline-offset: 3px;
+}
+
+.link-card>.title {
   font-size: 1rem;
   font-weight: 600;
 }
 
-.link-card > .subtitle {
+.link-card>.subtitle {
   font-size: 0.76rem;
   font-weight: 300;
   opacity: 0.75;
@@ -393,12 +492,12 @@ h1.text-center {
   font-size: 1.75rem;
 }
 
-.info-card > .title {
+.info-card>.title {
   font-size: 1.75rem;
   font-weight: 400;
 }
 
-.info-card > .description {
+.info-card>.description {
   font-size: 1.05rem;
   font-weight: 100;
 }
@@ -447,31 +546,145 @@ h1.text-center {
     max-width: 100%;
   }
 
-  &:hover {
+  &:hover,
+  &:focus-visible {
     background: rgba($primary, 0.15);
     border-color: rgba($primary, 0.5);
   }
 
-  > .label {
+  &:focus-visible {
+    outline: 3px solid $primary;
+    outline-offset: 3px;
+  }
+
+  >.label {
     font-size: 0.75rem;
     font-weight: 600;
     text-transform: uppercase;
     letter-spacing: 0.05em;
-    color: $primary;
+    color: $link-color-dark;
     margin-bottom: 0.25rem;
   }
 
-  > .title {
+  >.title {
     font-size: 1.25rem;
     font-weight: 600;
     margin-bottom: 0.5rem;
   }
 
-  > .description {
+  >.description {
     font-size: 0.9rem;
     font-weight: 300;
     opacity: 0.8;
     margin: 0;
+  }
+}
+
+// --------------------------------------------------
+// Quickstart code block on homepage
+// --------------------------------------------------
+.quickstart-heading {
+  margin-top: 4rem;
+  margin-bottom: 0.75rem;
+  font-size: 2rem;
+  font-weight: 400;
+  text-align: center;
+}
+
+@include media-breakpoint-down(md) {
+  .quickstart-heading {
+    margin-top: 1rem;
+  }
+}
+
+.quickstart-subtitle {
+  text-align: center;
+  font-size: 1.05rem;
+  font-weight: 100;
+  margin-bottom: 1.5rem;
+}
+
+.quickstart-container {
+
+  // Hug the code: width grows with content instead of a fixed box that wraps.
+  width: fit-content;
+  max-width: 100%;
+  margin: 0 auto;
+  text-align: left;
+
+  // Tab bar sits flush on top of the code block.
+  .nav-tabs .nav-item .nav-link.active {
+    background: #0d1117;
+    border-bottom-color: #0d1117;
+  }
+
+  .highlight {
+    margin: 0;
+    padding: 0;
+
+    // Grow the box to the width of the code (up to the viewport).
+    width: max-content;
+    max-width: 100%;
+
+    // Square the top corners so the block connects flush to the tab bar above.
+    border-radius: 0 0 1rem 1rem;
+    border: 1px solid rgba(255, 255, 255, 0.12);
+    box-shadow: 0 1.5rem 3rem rgba(0, 0, 0, 0.45);
+    background-color: #0d1117;
+    overflow: hidden;
+  }
+
+  // Nested under .highlight so it outranks Prism's pre[class*="language-"],
+  // which otherwise wins on equal specificity and inherits the cover's 1.25rem.
+  .highlight pre {
+    margin: 0;
+    padding: 1.5rem 1.75rem;
+    border: 0;
+    border-radius: 0;
+    font-size: 0.9rem;
+    line-height: 1.55;
+    background-color: #0d1117;
+    color: #e6edf3;
+    max-height: none;
+
+    // Size to the code so the box resizes with it; scroll only if wider than the viewport.
+    width: max-content;
+    max-width: 100%;
+    overflow-x: auto;
+    overflow-y: hidden;
+    white-space: pre;
+  }
+
+  // Base color for any plain (non-tokenized) code text on the dark surface.
+  pre,
+  pre code,
+  .highlight code {
+    color: #e6edf3;
+  }
+
+  // Keep long lines on one line (no wrapping).
+  pre code,
+  .highlight code {
+    white-space: pre;
+    word-break: normal;
+  }
+
+  // Drop the cover's inherited text-shadow that "ghosts" the code, without
+  // touching the per-token colors from the Chroma theme.
+  pre,
+  pre *,
+  .highlight,
+  .highlight * {
+    text-shadow: none;
+  }
+}
+
+.quickstart-cta {
+  text-align: center;
+  margin-top: 1.5rem;
+
+  a {
+    font-weight: 600;
   }
 }
 
@@ -491,11 +704,9 @@ h1.text-center {
         The bottom naturally remains black where the gradients fade to transparent.
     */
   background-color: #000000;
-  background-image: radial-gradient(
-      circle at top left,
+  background-image: radial-gradient(circle at top left,
       #5d0193 0%,
-      transparent 65%
-    ),
+      transparent 65%),
     radial-gradient(circle at top right, #aa014c 0%, transparent 65%);
 
   /* Ensure full coverage */
@@ -518,19 +729,23 @@ h1.text-center {
 }
 
 @media (min-width: 768px) {
-    .td-section .td-navbar,
-    .td-page .td-navbar {
-        position: static;
-        top: 0;
-        width: 100%;
-    }
+
+  .td-section .td-navbar,
+  .td-page .td-navbar {
+    position: static;
+    top: 0;
+    width: 100%;
+  }
 }
 
 @media (min-width: 768px) {
-    .td-section .td-404 main, .td-section .td-main main,
-    .td-page .td-404 main, .td-page .td-main main {
-        padding-top: 1rem;
-    }
+
+  .td-section .td-404 main,
+  .td-section .td-main main,
+  .td-page .td-404 main,
+  .td-page .td-main main {
+    padding-top: 1rem;
+  }
 }
 
 
@@ -552,42 +767,48 @@ h1.text-center {
 }
 
 .td-content .highlight pre {
-    margin: 0;
-    background-color: #111 !important;
-    padding: 2rem 1rem;
-    border-radius: 1rem;
-    border: solid #222;
+  margin: 0;
+  background-color: #111 !important;
+  padding: 2rem 1rem;
+  border-radius: 1rem;
+  border: solid #222;
 }
 
 .td-content .tab-content .highlight pre {
-    border-radius: 0 1rem 1rem 1rem;
+  border-radius: 0 1rem 1rem 1rem;
 }
 
-.td-content pre > code {
-    background-color: inherit !important;
-    padding: 0;
-    margin: 0;
-    font-size: 100%;
-    text-shadow: none;
-    word-break: normal;
-    white-space: pre;
-    border: 0;
-    color: gold;
+.td-content pre>code {
+  background-color: inherit !important;
+  padding: 0;
+  margin: 0;
+  font-size: 100%;
+  text-shadow: none;
+  word-break: normal;
+  white-space: pre;
+  border: 0;
+  color: gold;
 }
 
-.language-css .token.string, .style .token.string, .token.entity, .token.operator, .token.url {
-    color: #9a6e3a;
-    background: inherit !important;
+.language-css .token.string,
+.style .token.string,
+.token.entity,
+.token.operator,
+.token.url {
+  color: #9a6e3a;
+  background: inherit !important;
 }
 
-.td-content p code, .td-content li > code, .td-content table code {
-    color: gold;
-    padding: 0.2em 0.4em;
-    margin: 0;
-    font-size: 85%;
-    word-break: normal;
-    background-color: #111;
-    border-radius: 0.375rem;
+.td-content p code,
+.td-content li>code,
+.td-content table code {
+  color: gold;
+  padding: 0.2em 0.4em;
+  margin: 0;
+  font-size: 85%;
+  word-break: normal;
+  background-color: #111;
+  border-radius: 0.375rem;
 }
 
 // --------------------------------------------------
@@ -600,13 +821,12 @@ h1.text-center {
   border-spacing: 0 !important;
   border: none !important;
   border-radius: 0 !important;
-  overflow: visible !important;
   margin: 1.5rem 0 !important;
 
-  > thead {
+  >thead {
     background-color: rgba(255, 255, 255, 0.08) !important;
 
-    > tr > th {
+    >tr>th {
       color: #fff !important;
       background-color: transparent !important;
       font-weight: 600 !important;
@@ -616,17 +836,17 @@ h1.text-center {
     }
   }
 
-  > tbody {
-    > tr {
+  >tbody {
+    >tr {
       &:hover {
         background-color: rgba(255, 255, 255, 0.04) !important;
       }
 
-      &:last-child > td {
+      &:last-child>td {
         border-bottom: none !important;
       }
 
-      > td {
+      >td {
         color: rgba(255, 255, 255, 0.85) !important;
         background-color: transparent !important;
         padding: 0.75rem 1rem !important;
@@ -637,7 +857,7 @@ h1.text-center {
   }
 
   // Remove Docsy's striped row coloring
-  &.table-striped > tbody > tr:nth-of-type(2n+1) > * {
+  &.table-striped>tbody>tr:nth-of-type(2n+1)>* {
     color: rgba(255, 255, 255, 0.85) !important;
     background-color: transparent !important;
     --bs-table-accent-bg: transparent !important;
@@ -707,7 +927,7 @@ h1.text-center {
 
 .section-index .list .entry .title {
   color: #bc3fff;
-  font-size: 0.84rem;
+  font-size: 1.25rem;
   font-weight: 700;
 }
 
@@ -720,13 +940,69 @@ h1.text-center {
 @media (min-width: 768px) {
   .section-index .list .entry .title {
     color: #bc3fff;
-    font-size: 1.12rem;
+    font-size: 1.5rem;
     font-weight: 700;
   }
 
   .section-index .list .entry .description {
     color: #eee;
-    font-size: 1.96rem;
+    font-size: 1.12rem;
   }
 
+}
+
+.migration-warning-banner {
+  background-color: #fff8e1;
+  border: 1px solid #ffe082;
+  border-radius: 12px;
+  padding: 1.25rem 1.5rem;
+  margin: 1.5rem 0 2rem 0;
+  display: flex;
+  align-items: flex-start;
+  gap: 1rem;
+  box-shadow: 0 4px 15px rgba(0, 0, 0, 0.2);
+
+  .warning-icon {
+    font-size: 1.5rem;
+    line-height: 1;
+    color: #b38f00;
+  }
+
+  .warning-content {
+    flex: 1;
+
+    .warning-title {
+      font-size: 1.15rem;
+      font-weight: 700;
+      color: #7f6000;
+      margin-bottom: 0.35rem;
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+    }
+
+    .warning-text {
+      font-size: 0.975rem;
+      line-height: 1.6;
+      color: #3e3200;
+      margin: 0;
+      font-weight: 500;
+
+      strong {
+        font-weight: 700;
+        color: #000;
+      }
+
+      a {
+        color: #b38f00;
+        text-decoration: underline;
+        font-weight: 700;
+        transition: color 0.15s ease;
+
+        &:hover {
+          color: #7f6000;
+        }
+      }
+    }
+  }
 }

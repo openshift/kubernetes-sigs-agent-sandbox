@@ -1,5 +1,6 @@
 starlette
 uvicorn
 httpx
+websockets
 pytest
 pytest-asyncio

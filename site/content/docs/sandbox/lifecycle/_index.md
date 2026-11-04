@@ -18,7 +18,7 @@ This guide uses `kubectl` directly and is compatible with any Kubernetes environ
 - A running Kubernetes cluster.
 - The [`kubectl`](https://kubernetes.io/docs/tasks/tools/#kubectl) CLI tool installed and configured to point to your cluster.
 - The [Agent Sandbox Controller]({{< ref "/docs/getting_started/overview" >}}) installed.
-- A `SandboxTemplate` named `simple-sandbox-template` applied to your cluster. See the [Python Runtime Sandbox]({{< ref "/docs/runtime-templates/python" >}}) guide for setup instructions.
+- A `SandboxWarmPool` named `simple-sandbox-pool` applied to your cluster. See the [Python Runtime Sandbox]({{< ref "/docs/runtime-templates/python" >}}) guide for setup instructions.
 - The [Python SDK]({{< ref "/docs/python-client" >}}) installed: `pip install k8s-agent-sandbox`.
 
 ### Scheduled Shutdown
@@ -27,7 +27,7 @@ Unlike manual termination, setting a `shutdownTime` provides a guaranteed, hard 
 
 #### Basic Workflow Example with kubectl
 
-The following example demonstrates how to define a sandbox claim with an explicit `shutdownTime`, apply it directly to your cluster using `kubectl`, and verify the scheduled cleanup.
+The following example demonstrates how to define a `Sandbox` with an explicit `shutdownTime`, apply it directly to your cluster using `kubectl`, and verify the scheduled cleanup.
 
 Define the shutdown time (in this example it's the current time plus 1 minute):
 
@@ -39,16 +39,17 @@ Apply an example sandbox with the `shutdownPolicy` and `shutdownTime`:
 
 ```bash
 cat <<EOF | kubectl apply -f -
-apiVersion: agents.x-k8s.io/v1alpha1
+apiVersion: agents.x-k8s.io/v1beta1
 kind: Sandbox
 metadata:
   name: dynamic-ephemeral-sandbox
 spec:
-  replicas: 1
+  operatingMode: Running
   shutdownPolicy: Delete
   shutdownTime: "${SHUTDOWN_TIME}"
   podTemplate:
     spec:
+      restartPolicy: Never
       containers:
       - name: workspace
         image: alpine:latest
@@ -69,11 +70,13 @@ kubectl get sandbox dynamic-ephemeral-sandbox
 When creating a new sandbox via the `k8s_agent_sandbox` SDK, you can customize its readiness checks and lifecycle behavior using optional parameters:
 
 * **`sandbox_ready_timeout`**: The maximum time (in seconds) the client will wait for the sandbox environment to become ready before timing out.
-* **`shutdown_after_seconds`**: A Time-To-Live (TTL) integer in seconds. Setting this parameter tells the SDK to automatically populate the underlying Kubernetes claim's `spec.lifecycle` with a `shutdownPolicy` of `"Delete"` and schedule the deletion for *now + shutdown_after_seconds* (UTC). 
+* **`shutdown_after_seconds`**: A Time-To-Live (TTL) integer in seconds. Setting this parameter tells the SDK to automatically populate the underlying Kubernetes claim's `spec.lifecycle` with a `shutdownPolicy` of `"Delete"` and schedule the deletion for *now + shutdown_after_seconds* (UTC).
 
 The following example demonstrates how to pass these parameters. Notice how the SDK handles the cluster cleanup policy for you:
 
-```python
+
+{{< blocks/tabs name="basic-workflow-example" >}}
+  {{< blocks/tab name="Python" codelang="python" >}}
 import time
 from k8s_agent_sandbox import SandboxClient
 
@@ -86,7 +89,7 @@ def verify_sandbox_lifecycle():
     # 1. Verify creation and sandbox_ready_timeout
     # If the sandbox doesn't become ready within 15 seconds, this will raise an error.
     sandbox = client.create_sandbox(
-        "simple-sandbox-template",
+        "simple-sandbox-pool",
         sandbox_ready_timeout=15,
         shutdown_after_seconds=ttl_seconds
     )
@@ -111,4 +114,169 @@ def verify_sandbox_lifecycle():
 
 if __name__ == "__main__":
     verify_sandbox_lifecycle()
+  {{< /blocks/tab >}}
+  {{< blocks/tab name="Go" codelang="go" >}}
+package main
+
+import (
+	"context"
+	"fmt"
+	"log"
+	"time"
+
+	"github.com/go-logr/logr"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+
+	"sigs.k8s.io/agent-sandbox/clients/go/sandbox"
+	extensionsv1beta1 "sigs.k8s.io/agent-sandbox/extensions/api/v1beta1"
+)
+
+// The SDK's CreateSandbox has no shutdown-TTL parameter yet, so build our
+// own K8sHelper and pass it into Options — this keeps a reference we can use
+// to patch the SandboxClaim's spec.lifecycle directly, the same field the
+// kubectl example above sets.
+func main() {
+	ctx := context.Background()
+	namespace := "default"
+	ttl := 5 * time.Second
+
+	helper, err := sandbox.NewK8sHelper(nil, logr.Discard())
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	client, err := sandbox.NewClient(ctx, sandbox.Options{
+		Namespace:           namespace,
+		K8sHelper:           helper,
+		SandboxReadyTimeout: 15 * time.Second,
+	})
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer client.DeleteAll(ctx)
+
+	fmt.Printf("Creating sandbox with a %s TTL...\n", ttl)
+	sb, err := client.CreateSandbox(ctx, "simple-sandbox-pool", namespace)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	// Schedule automatic cleanup by setting the claim's shutdownTime.
+	claim, err := helper.ExtensionsClient.SandboxClaims(namespace).Get(ctx, sb.ClaimName(), metav1.GetOptions{})
+	if err != nil {
+		log.Fatal(err)
+	}
+	shutdownAt := metav1.NewTime(time.Now().Add(ttl))
+	claim.Spec.Lifecycle = &extensionsv1beta1.Lifecycle{
+		ShutdownPolicy: extensionsv1beta1.ShutdownPolicyDelete,
+		ShutdownTime:   &shutdownAt,
+	}
+	if _, err := helper.ExtensionsClient.SandboxClaims(namespace).Update(ctx, claim, metav1.UpdateOptions{}); err != nil {
+		log.Fatal(err)
+	}
+
+	fmt.Println("Sandbox created successfully! Running initial command...")
+	result, err := sb.Run(ctx, "echo 'Sandbox is alive!'")
+	if err != nil {
+		log.Fatal(err)
+	}
+	if result.ExitCode != 0 {
+		log.Fatalf("command failed with exit code %d: %s", result.ExitCode, result.Stderr)
+	}
+	fmt.Printf("Output: %s\n\n", result.Stdout)
+
+	// Verify auto-deletion: wait past the TTL, then check the claim directly
+	// rather than inferring shutdown from a command error, which could also
+	// mean a transient/unrelated failure.
+	waitTime := ttl + 3*time.Second // buffer for Kubernetes controller sync
+	fmt.Printf("Waiting %s for the cluster to auto-delete the sandbox...\n", waitTime)
+	time.Sleep(waitTime)
+
+	fmt.Println("Checking whether the cluster cleaned up the claim...")
+	_, err = helper.ExtensionsClient.SandboxClaims(namespace).Get(ctx, sb.ClaimName(), metav1.GetOptions{})
+	switch {
+	case apierrors.IsNotFound(err):
+		fmt.Println("✅ SUCCESS: SandboxClaim is gone. The cluster enforced the shutdown policy.")
+	case err != nil:
+		log.Fatalf("unexpected error checking claim: %v", err)
+	default:
+		log.Fatal("❌ FAILED: SandboxClaim still exists! The shutdown policy did not trigger.")
+	}
+}
+  {{< /blocks/tab >}}
+{{< /blocks/tabs >}}
+
+## Opt-in recovery from Failed pods
+
+By default, when a Sandbox's backing Pod reaches `phase=Failed` (for example after node-pressure eviction), the controller surfaces `Finished=True` with reason `PodFailed` and does not create a replacement. This preserves existing behavior and keeps one-shot workloads compatible with Claim `ttlSecondsAfterFinished`.
+
+For long-running sandboxes that should recover while preserving Sandbox identity and PVCs, set:
+
+```yaml
+apiVersion: agents.x-k8s.io/v1beta1
+kind: Sandbox
+metadata:
+  name: resilient-sandbox
+spec:
+  failedPodPolicy: Recreate
+  operatingMode: Running
+  podTemplate:
+    spec:
+      containers:
+      - name: workspace
+        image: alpine:latest
+        command: ["sleep", "infinity"]
+```
+
+With `failedPodPolicy: Recreate`, the controller deletes the controller-owned Failed Pod and creates a new one from `podTemplate`. PVCs from `volumeClaimTemplates` stay owned by the Sandbox and are remounted. Because the policy is part of `SandboxBlueprint`, it can also be set on a `SandboxTemplate` for Sandboxes provisioned through a warm pool or claim.
+
+`PodSucceeded` is unchanged (still terminal). Combining `Recreate` with `restartPolicy: Never` and a container that always exits non-zero can recreate repeatedly; the controller applies Deployment-style in-memory exponential backoff (5s, doubling up to 5m) between replacement Creates so a crash loop cannot hot-loop the API server. Backoff resets after the controller has continuously observed the same replacement Pod UID in `Running` for 10 minutes; time spent Pending does not count. See [KEP-729](https://github.com/kubernetes-sigs/agent-sandbox/blob/main/docs/keps/729-opt-in-pod-recreation-on-failure/README.md).
+
+## Restart Policy and Cleanup Interaction
+
+The `restartPolicy` on a sandbox's pod template determines whether the container restarts after it exits. This directly affects which cleanup mechanisms work:
+
+| `restartPolicy` | Container behavior on exit | TTL fires? | `shutdownTime` fires? | Risk if no lifecycle set |
+|---|---|---|---|---|
+| `Never` | Container stays terminated | **Yes** — pod reaches `Failed` or `Succeeded` | Yes | Low — TTL handles cleanup |
+| `OnFailure` | Restarts on non-zero exit only | Only on clean exit (exit 0) | Yes | Medium — crashes don't trigger TTL |
+| `Always` (Kubernetes default) | Restarts on any exit | **Never** — container restarts indefinitely | Yes | **High — no cleanup without `shutdownTime`** |
+
+### Why this matters
+
+When `restartPolicy` is omitted, Kubernetes defaults to `Always`. If a pool operator relies on
+`ttlSecondsAfterFinished` (a SandboxClaim `spec.lifecycle` field in the extensions API) for cleanup, the sandbox never reaches a terminal state because the
+container is restarted each time it exits. The TTL never fires, and the sandbox runs indefinitely.
+
+This creates two failure modes:
+
+1. **Zombie sandboxes.** A batch workload finishes, the container exits, but `Always` restarts it. The sandbox sits idle consuming resources until manually deleted.
+
+2. **Unbounded CrashLoopBackOff.** A container that OOMs or panics on startup enters `CrashLoopBackOff` indefinitely. The pod is never terminal, TTL never fires, and the sandbox consumes resources in a crash loop with no escape.
+
+### Recommendations
+
+Always set `restartPolicy` explicitly in your `SandboxTemplate`:
+
+- **`Never`** for ephemeral, one-shot workloads (single script execution, Playwright scrapes, CI test runs). TTL cleanup works reliably because the pod reaches a terminal state on exit.
+
+- **`OnFailure`** for interactive or long-running workloads (MCP servers, Jupyter kernels, coding agents). The container restarts on crashes but stays terminated on clean exit. Pair with `shutdownTime` for a hard cleanup deadline.
+
+- **`Always`** only when you explicitly need indefinite restarts (rare). Always pair with `shutdownTime` — TTL-based cleanup will not work.
+
+```yaml
+apiVersion: extensions.agents.x-k8s.io/v1beta1
+kind: SandboxTemplate
+metadata:
+  name: batch-template
+spec:
+  podTemplate:
+    spec:
+      # Never: container stays terminated on exit, TTL cleanup works reliably.
+      restartPolicy: "Never"
+      containers:
+      - name: workspace
+        image: python:3.11-slim
+        command: ["/bin/sh", "-c", "python run_task.py"]
 ```

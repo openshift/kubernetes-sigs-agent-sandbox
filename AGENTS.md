@@ -1,5 +1,7 @@
 # AGENTS.md
 
+<!-- Last full repo audit: 2026-09-18 (commit 2d855f5f) -->
+
 Guidance for AI coding agents working in this repository. Human contributors should also read [CONTRIBUTING.md](CONTRIBUTING.md), [docs/development.md](docs/development.md), and [docs/testing.md](docs/testing.md), which are the source of truth.
 
 ## Project summary
@@ -14,83 +16,147 @@ Guidance for AI coding agents working in this repository. Human contributors sho
 
 | Path | What lives there |
 | --- | --- |
+| [**.agents/skills/**](.agents/skills/) | Specialized instructions for you (AI agents). See "Agent Skills" section below. |
 | [api/v1beta1/](api/v1beta1/) | Core `Sandbox` types and kubebuilder markers. |
 | [extensions/api/v1beta1/](extensions/api/v1beta1/) | `SandboxClaim`, `SandboxTemplate`, `SandboxWarmPool` types. |
 | [controllers/](controllers/) | Core `Sandbox` reconciler + tests. |
 | [extensions/controllers/](extensions/controllers/) | Reconcilers for the extension CRDs. |
-| [cmd/agent-sandbox-controller/](cmd/agent-sandbox-controller/) | Controller manager entrypoint. |
-| [internal/](internal/) | Shared internals: `lifecycle`, `metrics`, `version`. Not importable by external consumers. |
-| [k8s/](k8s/) | Generated CRDs ([k8s/crds/](k8s/crds/)), RBAC, controller manifests. |
+| [cmd/agent-sandbox-controller/](cmd/agent-sandbox-controller/), [cmd/metrics-docs-gen/](cmd/metrics-docs-gen/) | Controller manager entrypoint (`bin/manager`) and metrics reference generator. |
+| [internal/](internal/) | Shared internals (`lifecycle`, `metrics`, `metricsdocs`, `rawpatch`, `tlsutil`, `utils`, `version`). Not importable by external consumers. |
+| [sandbox-router/](sandbox-router/) | Go reverse-proxy router (`bin/sandbox-router`) for HTTP/gRPC routing, authz, and TLS to sandboxes. |
+| [packages/sandboxd/](packages/sandboxd/) | Go in-sandbox daemon (`bin/sandboxd`) providing gRPC process execution, filesystem, and health APIs inside sandbox pods. |
+| [k8s/](k8s/) | Generated CRDs ([k8s/crds/](k8s/crds/)), RBAC (`*.generated.yaml`), and controller manifests. |
+| [helm/](helm/), [olm/](olm/) | Helm chart (`helm/crds/`, `helm/templates/`) and OLM bundle/config. Generated CRDs and RBAC are synced here by `make fix-go-generate`. |
 | [clients/k8s/](clients/k8s/) | **Generated** Kubernetes-style clientset, listers, informers (output of `dev/tools/client-gen-go.sh`). Do not hand-edit. |
 | [clients/go/](clients/go/) | Hand-written high-level Go SDK that wraps the `SandboxClaim` lifecycle and exposes Gateway / port-forward / direct connectivity. Editable. |
 | [clients/python/agentic-sandbox-client/](clients/python/agentic-sandbox-client/) | Hand-written Python SDK. Directory is named `agentic-sandbox-client` but the package publishes to PyPI as **`k8s-agent-sandbox`** — that's the name to import in docs and examples. |
-| [examples/](examples/), [extensions/examples/](extensions/examples/) | Runnable sample manifests and demo apps. |
+| [clients/typescript/agentic-sandbox-client/](clients/typescript/agentic-sandbox-client/) | Hand-written TypeScript SDK (`Node >= 22`, ESM, `vitest`, Biome). |
+| [clients/integrations/](clients/integrations/) | Ecosystem adapters (`mcp-server`, `deepagents`, `gymnasium`, `nemo-gym`, `openhands`). |
+| [examples/](examples/) | Runnable sample manifests and demo apps. |
 | [test/e2e/](test/e2e/), [test/benchmarks/](test/benchmarks/) | End-to-end and benchmark suites (Go-driven; some scenarios shell out via the Python SDK). |
 | [dev/tools/](dev/tools/) | Repo tooling (lint, generate, deploy-kind, release scripts). Most `make` targets shell out here. |
 | [dev/ci/](dev/ci/) | Prow presubmit/periodic scripts. |
-| [docs/](docs/) | Development, testing, configuration docs and KEPs ([docs/keps/](docs/keps/)). |
+| [docs/](docs/) | Development, testing, configuration docs, generated reference docs, and KEPs ([docs/keps/](docs/keps/)). |
 | [site/](site/) | Hugo + Docsy source for https://agent-sandbox.sigs.k8s.io. Many pages are thin wrappers that `include-file` from the repo via mounts in [site/hugo.yaml](site/hugo.yaml) — see "Docs site mounts" below. Native page sources (lifecycle, snapshots, use-cases, runtime-templates, getting started, etc.) live only here. |
 
 When in doubt about ownership, check the nearest `OWNERS` file.
+
+## Agent Skills
+
+This repository provides specialized instructions for AI agents in [`.agents/skills/`](.agents/skills/), following the Agent Skills specification (`dev-rules`, `k8s-api-conventions`, `bump-go-version`, `fix-flakes`, `test-pyramid`, `triage-issues`). Note that [CLAUDE.md](CLAUDE.md) imports this file via `@AGENTS.md`.
 
 ## Build, test, lint
 
 All standard tasks go through the [Makefile](Makefile). Prefer `make` targets over invoking tools directly so CI and local runs stay consistent.
 
-- `make all` — runs `fix-go-generate`, `build`, `lint-go`, `lint-api`, `test-unit`, `toc-verify`. Run this before sending a PR.
-- `make build` — compiles `bin/manager` from `cmd/agent-sandbox-controller`.
-- `make test-unit` — runs Go unit tests with `-race` enabled and the Python unit test suites via `dev/tools/test-unit`.
+- `make all` — runs `fix-go-generate`, `fix-api-docs`, `build`, `lint-go`, `lint-api`, `test-unit`, `toc-verify`, `verify-olm`. Run this before sending a PR.
+- `make build` — compiles `bin/manager` (`build-controller`), `bin/sandbox-router` (`build-sandbox-router`), and `bin/sandboxd` (`build-sandboxd`).
+- `make test-unit` — runs Go unit tests (`-race`) across all Go modules in the repo, Python `pytest` suites + `mypy` type checks, TypeScript `vitest` unit tests, and the stress report's browser-script tests (`node --test`) via `dev/tools/test-unit`.
 - `make test-e2e` / `make test-e2e-race` — e2e suite against a kind cluster (much slower; e2e is not raced by default).
 - `make lint-go` / `make fix-go` — `golangci-lint` (config in [dev/tools/.golangci.yaml](dev/tools/.golangci.yaml)).
 - `make lint-api` / `make fix-api` — KAL API linter for kubebuilder tags and CRD conventions.
+- `make fix-api-docs` — regenerates reference docs (`docs/api.md`, `docs/go_sdk_reference.md`, `docs/python_sdk_reference.md`, `docs/metrics.md`).
 - `make toc-verify` / `make toc-update` — keep markdown TOCs in sync.
-- `make deploy-kind` — create a local kind cluster named `agent-sandbox`, build images, deploy the controller, and write the kubeconfig to `bin/KUBECONFIG` (which the e2e suite expects). `EXTENSIONS=true make deploy-kind` to include the extension controllers; `CONTROLLER_ARGS="..."` passes flags to the controller; `CONTROLLER_ONLY=true` builds/pushes only the controller image (skipping example sidecars). `make delete-kind` tears it down.
+- `make verify-chart-version` / `make bump-chart-version` — verify or bump `helm/Chart.yaml` when files under [helm/](helm/) change.
+- `make deploy-kind` — create a local kind cluster named `agent-sandbox`, build images, deploy the controller, and write the kubeconfig to `bin/KUBECONFIG` (which the e2e suite expects). `EXTENSIONS=true make deploy-kind` to include the extension controllers; `CONTROLLER_ARGS="..."` passes flags to the controller; `CONTROLLER_ONLY=true` (the default) builds/pushes only the controller image (skipping example sidecars; set `CONTROLLER_ONLY=false` to build them). `make delete-kind` tears it down.
 
-After editing anything in [api/](api/), [extensions/api/](extensions/api/), or kubebuilder markers in [controllers/](controllers/) / [extensions/controllers/](extensions/controllers/), run `make all` (or at least `make fix-go-generate`) to regenerate CRDs in [k8s/crds/](k8s/crds/), RBAC manifests in [k8s/](k8s/), deepcopy code, and the typed clients. The exact directives live in [codegen.go](codegen.go). Commit the regenerated output alongside the source change — never hand-edit `zz_generated_*.go`, `*.generated.yaml`, or files under [clients/k8s/](clients/k8s/).
+After editing anything in [api/](api/), [extensions/api/](extensions/api/), or kubebuilder markers in [controllers/](controllers/) / [extensions/controllers/](extensions/controllers/), run `make all` (or at least `make fix-go-generate`) to regenerate CRDs in [k8s/crds/](k8s/crds/) and [helm/crds/](helm/crds/), RBAC manifests in [k8s/](k8s/) and [helm/templates/](helm/templates/), deepcopy code, the typed clients in [clients/k8s/](clients/k8s/), and synced OLM config under [olm/config/](olm/config/). If [helm/](helm/) manifests change, run `make bump-chart-version`. The exact directives live in [codegen.go](codegen.go). Commit the regenerated output alongside the source change — never hand-edit `zz_generated_*.go`, `*.generated.yaml`, or files under [clients/k8s/](clients/k8s/).
 
 ## Docs site mounts
 
 The Hugo site at [site/](site/) mounts these repo paths into `assets/additional/` and surfaces them on https://agent-sandbox.sigs.k8s.io. **Edits to these files change the public docs site**, so treat them as documentation, not just internal READMEs:
 
-- [README.md](README.md) → `/docs/overview/`
+- [README.md](README.md) → `/docs/getting_started/overview/`
 - [CONTRIBUTING.md](CONTRIBUTING.md) → `/docs/contribution-guidelines/`
 - [docs/testing.md](docs/testing.md) → `/docs/contribution-guidelines/testing/`
+- [docs/api.md](docs/api.md) → `/docs/api/`
+- [docs/api-migration-guide.md](docs/api-migration-guide.md) → `/docs/getting_started/api-migration-guide/`
+- [docs/go_sdk_reference.md](docs/go_sdk_reference.md) → `/docs/getting_started/sdk_reference/go/`
+- [docs/python_sdk_reference.md](docs/python_sdk_reference.md) → `/docs/getting_started/sdk_reference/python/`
+- [docs/metrics.md](docs/metrics.md) → `/docs/metrics/`
+- [packages/sandboxd/USER_GUIDE.md](packages/sandboxd/USER_GUIDE.md) → `/docs/api/runtime/`
 - [clients/go/README.md](clients/go/README.md) → `/docs/go-client/`
 - [clients/python/agentic-sandbox-client/README.md](clients/python/agentic-sandbox-client/README.md) → `/docs/python-client/`
-- Many `examples/*/README.md` files (and some `extensions/examples/*/README.md` files) → pages under `/docs/use-cases/examples/` and `/docs/runtime-templates/`
+- [clients/typescript/agentic-sandbox-client/README.md](clients/typescript/agentic-sandbox-client/README.md) → `/docs/typescript-client/`
+- [clients/integrations/nemo-gym/README.md](clients/integrations/nemo-gym/README.md) → `/docs/use-cases/examples/nemo-gym/` (the only `clients/integrations/` README currently mounted in [site/hugo.yaml](site/hugo.yaml))
+- Many `examples/*/README.md` files → pages under `/docs/use-cases/examples/`, `/docs/runtime-templates/`, and `/docs/getting_started/`
 
 If you change one of these, preview the rendered output (`hugo server` from [site/](site/) — Hugo extended is required; check `module.hugoVersion` in [site/hugo.yaml](site/hugo.yaml) for the declared minimum, but in practice run a recent stable Hugo release). Do not edit the generated `site/public/` or `site/resources/` directories.
 
 ## Coding conventions
 
 - Idiomatic Go, controller-runtime patterns. Reconcile loops must be idempotent and safe under retries; do not assume single execution.
-- Comments explain **why**, not **what**. Identifier names should carry the "what."
+- Comments explain **why**, not **what**. Identifier names should carry the "what." See "Writing" below for style.
 - Keep changes scoped to the task. No drive-by refactors, speculative abstractions, or unrelated formatting churn — bundle one concern per PR.
 - Prefer extending existing files over adding new ones. Do not create new top-level directories without discussion.
 - Errors: wrap with context (`fmt.Errorf("...: %w", err)`); surface meaningful conditions on the resource status rather than swallowing.
 - Concurrency: respect `context.Context` cancellation; avoid goroutines without lifetime ownership; protect shared state.
-- Logging: use `logr.Logger` from controller-runtime (`log.FromContext(ctx)`); use structured key/value pairs, not `fmt.Sprintf`.
-- API changes are versioned (`v1beta1`). Treat any user-visible field, label, or annotation rename as a breaking change — discuss in an issue or KEP first [docs/keps/](docs/keps/).
-- Match existing kubebuilder marker style; required vs optional, default values, and validation belong on the type, not in the controller.
+- Spec immutability: the `spec` of the primary Custom Resource (CR) being reconciled is user-owned; never modify and save it back to the API server in the reconciler. Controllers may update `status` and lifecycle `metadata` (e.g., finalizers, annotations, labels) of the primary CR, or manage secondary/target objects.
+- Label values: do not use full resource names directly in label values (must stay within Kubernetes 63-character limit; implement safe truncation or hashing in controller logic).
+- Logging: use `logr.Logger` from controller-runtime (`log.FromContext(ctx)`) with structured key/value pairs (never `fmt.Sprintf`). In Reconcile loops, reserve `logger.Info` / `V(0)` for major state changes (e.g., resource created, claim adopted) and require `V(4)` for routine steady-state checks or cache lookups.
+- Metrics cardinality & normalization: never introduce high or unbounded cardinality labels (e.g., pod names, UIDs, timestamps, raw errors). When deriving label values from dynamic input or errors, apply metrics normalization (an allowlist switch or categorizer) to map strings into a small, fixed enum.
+- Helper impact & DRY: factor repeated setup or error handling into helpers. When modifying helper predicates or error returns, audit all call sites across reconcilers to prevent downstream side effects (e.g., unexpected cache drops or queue evictions).
+- API changes & breaking changes: API changes are versioned (`v1beta1`). Whenever proposing or reviewing changes that alter existing default runtime behaviors, API fields, labels, or annotations, flag them as breaking changes requiring deprecation cycles and migration paths — discuss in an issue or KEP first ([docs/keps/](docs/keps/)).
+- API design & schema minimization: do not use annotations for alpha/preview features (use API fields instead); avoid toggle proliferation (overlapping configuration mechanisms); keep tenant workload behaviors declarative in Custom Resources rather than global controller CLI flags.
+- Match existing kubebuilder marker style; required vs optional, default values, and validation belong on the type, not in the controller. Use pointers for optional fields where distinguishing between zero and unset is important; prefer `conditions` instead of a `phase` enum; avoid booleans for fields that might evolve to have more states in the future.
+- Status conditions: once set, a condition stays on the object and changes `status` (`True`/`False`/`Unknown`) rather than being removed, so `lastTransitionTime` keeps its history and `kubectl wait --for=condition=X=False` works. Don't copy the remove-when-not-applicable handling of `Finished` and `PodScheduled` in `controllers/sandbox_controller.go`; it predates this rule and is tracked in #2080.
+- When modifying CRDs, APIs, or controller logic that interacts with APIs, adhere to the guidelines in [.agents/skills/k8s-api-conventions/SKILL.md](.agents/skills/k8s-api-conventions/SKILL.md).
+
+## Writing
+
+Comments, docstrings, commit messages, PR descriptions, and docs should read clearly to someone new to the code. Aim to follow Google's [Technical Writing](https://developers.google.com/tech-writing/one) and, for details, the [Google developer documentation style guide](https://developers.google.com/style). For doc comments, see [Go doc comments](https://go.dev/doc/comment) and the docstring section of the [Google Python Style Guide](https://google.github.io/styleguide/pyguide.html#38-comments-and-docstrings).
+
+The rules that matter most here:
+
+- **Use active voice.** Say who does what: "the controller deletes the Pod when the claim expires", not "the Pod is deleted upon expiry of the claim".
+- **Write full sentences, one idea each.** Don't chain clauses with colons, semicolons, and parenthetical asides.
+- **Define a term before you use it,** and use the project's existing words (`SandboxClaim`, not "claim object"). Don't coin shorthand.
+- **Say what the code does and why,** not how it got that way. Don't narrate the implementation line by line; the reader has the code.
+- **Match the weight of the comment to the weight of the code.** A two-line helper does not need a docstring that lists every parameter and exception.
+
+For example, rewrite this:
+
+> The claim is awaited until readiness has been observed (the `Ready` condition being polled via the helper): should the timeout elapse, an exception is raised, the claim having been left in place.
+
+as this:
+
+> Wait until the SandboxClaim reports the `Ready` condition. Raise `TimeoutError` if that doesn't happen within `timeout` seconds, and leave the claim in place so the caller can inspect it.
+
+AI-drafted prose gets the same review as hand-written prose. Before sending a PR, read every new comment, docstring, and description and fix the common readability pitfalls: passive constructions with no actor, comments that restate the code, hedging ("this should typically ensure"), and stacked qualifiers.
+
+## Go SDK conventions
+
+The Go SDK lives at [clients/go/](clients/go/) and is a hand-written public SDK wrapping `SandboxClaim` lifecycle and connectivity (Gateway, port-forward, direct).
+
+- Maintain API stability and backward compatibility for exported types and methods.
+- Provide robust error handling and clear godoc comments and examples.
+- Do not confuse with [clients/k8s/](clients/k8s/), which contains **generated** typed clientsets and should not be hand-edited.
 
 ## Python SDK conventions
 
 The Python SDK lives at [clients/python/agentic-sandbox-client/](clients/python/agentic-sandbox-client/) and is the second supported client surface alongside the Go SDK. It has its own conventions; treat it as a Python project, not as appendage code.
 
 - **Three names, do not confuse them:** repo directory `agentic-sandbox-client`, importable package `k8s_agent_sandbox` (underscore), PyPI distribution `k8s-agent-sandbox` (hyphen). Examples and docs install with `pip install k8s-agent-sandbox` and import `from k8s_agent_sandbox import ...`.
-- **Supported Python:** `>=3.10` ([pyproject.toml](clients/python/agentic-sandbox-client/pyproject.toml)). Do not use syntax or stdlib features beyond 3.10 unless you also raise the floor deliberately.
+- **Supported Python:** `>=3.11` ([pyproject.toml](clients/python/agentic-sandbox-client/pyproject.toml)). Do not use syntax or stdlib features beyond 3.11 unless you also raise the floor deliberately.
 - **Sync/async parity:** every public sync module (`sandbox_client.py`, `sandbox.py`, `k8s_helper.py`, `connector.py`, `files/filesystem.py`, `commands/command_executor.py`) has a `async_*` sibling. When you change one, change the other — drift between sync and async is a real bug surface here. Async-only deps (`httpx`, `kubernetes_asyncio`) belong behind the `async` optional extra, not in the base `dependencies` list.
-- **Optional extras structure:** the project ships three extras — `async`, `test`, `tracing`. New optional functionality should follow the same pattern (extra in `[project.optional-dependencies]`, lazy import inside the relevant module) rather than adding to the base install footprint. The base deps are intentionally minimal: `kubernetes`, `requests`, `pydantic`.
+- **Optional extras structure:** the project ships four extras — `async`, `grpc` (`grpcio`/`protobuf` for `sandboxd`), `test`, `tracing`. New optional functionality should follow the same pattern (extra in `[project.optional-dependencies]`, lazy import inside the relevant module) rather than adding to the base install footprint. The base deps are intentionally minimal: `kubernetes`, `requests`, `pydantic`, `prometheus-client`.
 - **Use `pydantic` for data models.** Configuration and wire-format types belong in [k8s_agent_sandbox/models.py](clients/python/agentic-sandbox-client/k8s_agent_sandbox/models.py); extend those rather than passing free-form dicts.
 - **File headers and docstrings:** every `.py` file in the package starts with the Apache-2.0 boilerplate header followed by a module docstring (triple-quoted, one paragraph minimum). Match the existing style — `git show` an existing file if unsure.
-- **Tests:** unit tests live in [k8s_agent_sandbox/test/unit/](clients/python/agentic-sandbox-client/k8s_agent_sandbox/test/unit/) and run via pytest. They are wired into `make test-unit` — [dev/tools/test-unit](dev/tools/test-unit) creates an isolated venv, runs `pip install -e .[test]`, and writes JUnit XML to `bin/python-k8s-agent-sandbox-junit.xml`. Do not invent a different layout. New behavior needs a unit test in the existing suite.
-- **`sandbox-router/` is a separate app**, not part of the published wheel. `pyproject.toml` includes only `k8s_agent_sandbox*`. The router has its own `requirements.txt` and its own pytest run in CI. Don't import from the SDK package into the router or vice versa unless you mean it.
+- **Tests:** unit tests live in [k8s_agent_sandbox/test/unit/](clients/python/agentic-sandbox-client/k8s_agent_sandbox/test/unit/) and run via pytest. They are wired into `make test-unit` — [dev/tools/test-unit](dev/tools/test-unit) creates an isolated venv, runs `pip install -e .[test]`, runs `mypy` type checks on `k8s_agent_sandbox`, and writes JUnit XML to `$ARTIFACTS/junit_unit-python-k8s-agent-sandbox.xml` (falling back to `bin/` when `ARTIFACTS` is unset). Do not invent a different layout. New behavior needs a unit test in the existing suite.
+- **`clients/python/agentic-sandbox-client/sandbox-router/` is a separate legacy Python router app**, not part of the published wheel (and distinct from the root Go [sandbox-router/](sandbox-router/)). `pyproject.toml` includes only `k8s_agent_sandbox*`. Don't import from the SDK package into the router or vice versa unless you mean it.
 - **Versioning** is handled by `setuptools_scm` with `root = "../../.."` (the repo root). The generated `VERSION` file is gitignored — never commit it.
-- **No enforced formatter or linter** at the time of writing — there is no ruff/black/mypy config in the repo. **Match the style of the file you are editing**; do not reformat unrelated code, and do not add a tool config as part of an unrelated PR.
+- **Type checking & style:** `mypy` is configured in `[tool.mypy]` in [pyproject.toml](clients/python/agentic-sandbox-client/pyproject.toml) and enforced by `make test-unit`. There is no enforced formatter (`ruff`/`black`) — **match the style of the file you are editing** and do not reformat unrelated code.
+
+## TypeScript SDK conventions
+
+The TypeScript SDK lives at [clients/typescript/agentic-sandbox-client/](clients/typescript/agentic-sandbox-client/) (`Node >= 22`, ESM).
+
+- Uses [Biome](clients/typescript/agentic-sandbox-client/biome.json) (`npm run check` / `npm run lint:fix`) for linting and formatting, `tsc` (`npm run typecheck`) for type-checking, and `vitest` (`npm test`, wired into `make test-unit`) for unit tests.
+- Do not commit generated build output under `dist/`.
 
 ## Tests
 
-- Unit tests live next to the code they cover (`*_test.go`) and run under `make test-unit`. New behavior needs a unit test.
+- Unit tests live next to the code they cover (`*_test.go`) and run under `make test-unit`. New behavior in the controllers, SDKs, and shared packages needs a unit test. Tests and test fixtures do not themselves need tests. Be more lenient in `examples/`: test what is genuinely load-bearing there (protocol logic, security checks, tricky parsing), and don't demand coverage of example code for its own sake.
 - Reconciler tests use envtest-style fixtures in [controllers/](controllers/) and [extensions/controllers/](extensions/controllers/); follow the existing harness rather than inventing a new one.
 - E2E tests live in [test/e2e/](test/e2e/) and run against a kind cluster created by `make deploy-kind`. Use them for behavior that crosses the controller/apiserver boundary.
 - Benchmarks: [test/benchmarks/](test/benchmarks/), runnable via `make test-e2e-benchmarks`.
@@ -100,9 +166,10 @@ The Python SDK lives at [clients/python/agentic-sandbox-client/](clients/python/
 
 - This is a Kubernetes SIG project: contributors must have a signed [CNCF CLA](https://git.k8s.io/community/CLA.md). PRs without one are not reviewed.
 - CI runs through Prow (configured in [kubernetes/test-infra](https://github.com/kubernetes/test-infra)). The `k8s-ci-robot` merges PRs once they have `lgtm` + `approve` and presubmits pass. Default merge mode is squash; use `/label tide/merge-method-rebase` only when distinct commits matter.
-- A bot may auto-assign GitHub Copilot as a first-pass reviewer. **Never click "Commit suggestion" in the GitHub UI** — that adds Copilot as a co-author, and Copilot cannot sign the Kubernetes CLA, so the CLA check will fail and block the PR. Instead: read the suggestion, apply the change manually in your local checkout, and push it as a normal commit authored by you.
-- Inactive PRs go stale after 30 days and close after 15 more. Reopen freely if you return to the work.
+- CodeRabbit provides automated first-pass reviews on open PRs. **Never click "Commit suggestion" in the GitHub UI** — that adds the AI bot as a co-author, and AI bots cannot sign the Kubernetes CLA, so the CLA check will fail and block the PR. Instead: read the suggestion, apply the change manually in your local checkout, and push it as a normal commit authored by you.
+- Inactive PRs go stale after 15 days and close after 15 more. Reopen freely if you return to the work.
 - Keep PR titles short and conventional; the body should explain motivation and link any issue or KEP.
+- Commit messages must stand alone (and follow the "Writing" section above): a reader with only `git log` should understand what changed and why. Lead with the motivation — the problem or gap that prompted the change — rather than restating the diff, which the reader can see for themselves. Use the terminology already established in the code and docs; do not invent new names for existing concepts. Be clear and concise. Since the default merge mode is squash, the PR title and body usually become the commit message — write them to the same standard.
 
 ## Things to avoid
 
@@ -117,6 +184,6 @@ The Python SDK lives at [clients/python/agentic-sandbox-client/](clients/python/
 
 - Architecture overview, motivation, and install instructions: [README.md](README.md).
 - Roadmap: [roadmap.md](roadmap.md).
-- Configuration / scale tuning: [docs/configuration.md](docs/configuration.md).
+- Configuration / scale tuning: [docs/configuration.md](docs/configuration.md), [docs/performance-tuning.md](docs/performance-tuning.md), and [docs/apf-insulation.md](docs/apf-insulation.md).
 - Deep design proposals: [docs/keps/](docs/keps/) (template at [docs/keps/NNNN-template/](docs/keps/NNNN-template/)).
 - Slack: `#agent-sandbox` on Kubernetes Slack for project work; `#sig-apps` for broader SIG Apps discussion. Mailing list: [SIG Apps](https://groups.google.com/a/kubernetes.io/g/sig-apps). New to k8s Slack? Get an invite at https://slack.k8s.io/.

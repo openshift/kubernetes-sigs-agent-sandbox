@@ -14,13 +14,9 @@
 
 import unittest
 from unittest.mock import MagicMock, patch
-import time
-import socket
-import subprocess
 import prometheus_client
 from k8s_agent_sandbox.connector import GatewayConnectionStrategy, LocalTunnelConnectionStrategy, DirectConnectionStrategy
 from k8s_agent_sandbox.models import SandboxGatewayConnectionConfig, SandboxLocalTunnelConnectionConfig, SandboxDirectConnectionConfig
-from k8s_agent_sandbox.metrics import sandbox_client_discovery_latency_ms
 
 class TestMetrics(unittest.TestCase):
     def setUp(self):
@@ -102,6 +98,21 @@ class TestMetrics(unittest.TestCase):
         self.assertEqual(url, "http://preconfigured.com")
         self.assertEqual(after_count_port_forward, before_count_port_forward)
         self.assertEqual(after_count_gateway, before_count_gateway)
+
+    @patch('builtins.print')
+    def test_metrics_utils(self, mock_print):
+        from k8s_agent_sandbox.metrics_utils import get_metrics, print_metrics
+        
+        # Test get_metrics
+        metrics_output = get_metrics()
+        self.assertIsInstance(metrics_output, str)
+        self.assertIn("sandbox_client_discovery_latency_ms", metrics_output)
+        
+        # Test print_metrics with a stable mocked string using localized context patch
+        with patch('k8s_agent_sandbox.metrics_utils.get_metrics') as mock_get_metrics:
+            mock_get_metrics.return_value = "mocked_prometheus_metrics"
+            print_metrics()
+            mock_print.assert_called_once_with("mocked_prometheus_metrics")
 
 if __name__ == '__main__':
     unittest.main()

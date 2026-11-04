@@ -38,7 +38,7 @@ type ChromeSandboxClaimMetrics struct {
 }
 
 // BenchmarkChromeSandboxClaimStartup measures the time for Chrome to start in a sandbox claim.
-// Run with: go test -bench=BenchmarkChromeSandboxClaimStartup -benchtime=10x ./test/e2e/...
+// Run with: go test -v -run=^$ -bench=BenchmarkChromeSandboxClaimStartup -benchtime=10x ./test/e2e/...
 // To add parallelism, use the -cpu flag (e.g., -cpu=1,2,4).
 // Make sure that WARM_POOL_SIZE is set appropriately to account for the number of parallel
 // test iterations.
@@ -82,7 +82,8 @@ func BenchmarkChromeSandboxClaimStartup(b *testing.B) {
 	warmPool := &extensionsv1beta1.SandboxWarmPool{}
 	warmPool.Name = "chrome-warmpool"
 	warmPool.Namespace = ns.Name
-	warmPool.Spec.Replicas = int32(warmPoolSize)
+	replicas := int32(warmPoolSize)
+	warmPool.Spec.Replicas = &replicas
 	warmPool.Spec.TemplateRef.Name = template.Name
 	tc.MustCreateWithCleanup(warmPool)
 

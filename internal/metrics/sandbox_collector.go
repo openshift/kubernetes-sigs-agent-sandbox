@@ -23,8 +23,8 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+
 	sandboxv1beta1 "sigs.k8s.io/agent-sandbox/api/v1beta1"
-	extensionsv1beta1 "sigs.k8s.io/agent-sandbox/extensions/api/v1beta1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/metrics"
 )
@@ -41,6 +41,7 @@ type AgentSandboxesMetricKey struct {
 	LaunchType     string
 	Template       string
 	OwnedBy        string
+	CreatedBy      string
 }
 
 // NewAgentSandboxesConstMetric creates a new Prometheus ConstMetric for the agent_sandboxes gauge.
@@ -55,6 +56,7 @@ func NewAgentSandboxesConstMetric(count int, key AgentSandboxesMetricKey) promet
 		key.LaunchType,
 		key.Template,
 		key.OwnedBy,
+		key.CreatedBy,
 	)
 }
 
@@ -125,24 +127,12 @@ func (c *SandboxCollector) Collect(ch chan<- prometheus.Metric) {
 			launchTypeStr = LaunchTypeWarm
 		}
 
-		sandboxTemplateStr := "unknown"
-		// If a user manually creates a Sandbox without a SandboxClaim, it won't have the
-		// SandboxTemplateRefAnnotation. The collector correctly handles this by defaulting to "unknown".
-		if template, ok := sandbox.Annotations[sandboxv1beta1.SandboxTemplateRefAnnotation]; ok && template != "" {
-			sandboxTemplateStr = template
-		}
+		sandboxTemplateStr := SandboxTemplateLabel(&sandbox)
+		ownedByStr := SandboxOwnedByLabel(&sandbox)
 
-		apiVersion := extensionsv1beta1.GroupVersion.String()
-		ownedByStr := "None"
-		if controllerRef := metav1.GetControllerOf(&sandbox); controllerRef != nil {
-			if controllerRef.APIVersion == apiVersion {
-				switch controllerRef.Kind {
-				case "SandboxClaim":
-					ownedByStr = "SandboxClaim"
-				case "SandboxWarmPool":
-					ownedByStr = "SandboxWarmPool"
-				}
-			}
+		createdByStr := "unknown"
+		if val, ok := sandbox.Labels[sandboxv1beta1.CreatedByLabel]; ok {
+			createdByStr = NormalizeCreatedBy(val)
 		}
 
 		key := AgentSandboxesMetricKey{
@@ -152,6 +142,7 @@ func (c *SandboxCollector) Collect(ch chan<- prometheus.Metric) {
 			LaunchType:     launchTypeStr,
 			Template:       sandboxTemplateStr,
 			OwnedBy:        ownedByStr,
+			CreatedBy:      createdByStr,
 		}
 		counts[key]++
 	}

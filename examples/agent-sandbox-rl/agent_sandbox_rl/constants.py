@@ -1,0 +1,116 @@
+# Copyright 2026 The Kubernetes Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Agent Sandbox API constants (v1beta1 / "beta").
+
+The `k8s-agent-sandbox` SDK ships constants for SandboxClaim and Sandbox, but
+NOT for SandboxTemplate / SandboxWarmPool (it never creates them). This package
+adds those; they are candidates to upstream into the SDK later.
+"""
+
+# Extensions API group (SandboxTemplate / SandboxWarmPool / SandboxClaim).
+GROUP = "extensions.agents.x-k8s.io"
+VERSION = "v1beta1"
+TEMPLATES_PLURAL = "sandboxtemplates"
+WARMPOOLS_PLURAL = "sandboxwarmpools"
+CLAIMS_PLURAL = "sandboxclaims"
+
+# Core Sandbox API group.
+SANDBOX_GROUP = "agents.x-k8s.io"
+SANDBOX_VERSION = "v1beta1"
+SANDBOXES_PLURAL = "sandboxes"
+
+# Annotations / labels.
+SANDBOX_NAME_HASH_LABEL = "agents.x-k8s.io/sandbox-name-hash"
+
+# A warm sandbox pod must stay alive to be claimed and exec'd into. Task images
+# have their own entrypoint, so we override it to idle.
+KEEPALIVE_COMMAND = ["sleep", "infinity"]
+
+# Name of the container holding the task image in a SandboxTemplate's pod
+# template. Also the container `discover_pools` reads back to work out which
+# image an existing pool serves; a template written by something else (the fleet
+# layer, a platform team) may name it differently, in which case the first
+# container is used — but only when it is the ONLY container. A multi-container
+# template with no container by this name gives no way to tell the task image
+# from a sidecar, and is skipped for adoption rather than guessed at.
+RUNTIME_CONTAINER = "agent-runtime"
+# Image placeholder for extra containers in TemplateSpec.extra_pod_spec: a
+# container whose image is this string runs the template's own task image
+# (for example a fresh grading sidecar next to the runtime container).
+TASK_IMAGE_PLACEHOLDER = "{task_image}"
+
+# Default label applied to every resource this package creates (for listing +
+# scoped cleanup).
+MANAGED_BY_LABEL = "app"
+MANAGED_BY_VALUE = "agent-sandbox-rl"
+DEFAULT_LABELS = {MANAGED_BY_LABEL: MANAGED_BY_VALUE}
+# Per-run label stamped on every resource a fleet creates, so an orphaned run's
+# resources can always be swept by the reaper (`reap(run_id=…)`).
+RUN_ID_LABEL = "agents.x-k8s.io/asrl-run-id"
+# The same run id, on sandbox pods (via the pod template). The Sandbox controller
+# strips every `agents.x-k8s.io/*` key from a pod template before it reaches the
+# pod (system-reserved since #894), so RUN_ID_LABEL never lands on pods; the
+# circuit breaker's pod count and the reaper's pod sweep select on this key.
+POD_RUN_ID_LABEL = "agent-sandbox-rl/run-id"
+# Label prefixes the Sandbox controller drops from a pod template on its way to the
+# pod (hasSystemReservedPrefix); a key under them never reaches a pod.
+RESERVED_POD_LABEL_PREFIXES = ("agents.x-k8s.io/", "extensions.agents.x-k8s.io/")
+# Marks an on-demand pool under a shared run id; the job's first warm of the image
+# takes it over (see `Resources.warm_shared_pool`).
+ON_DEMAND_ANNOTATION = "agent-sandbox-rl/on-demand"
+# How a fleet keeps concurrent runs apart (`FleetConfig.run_isolation`):
+#   "none"      — historical behaviour: stable per-image names in the configured
+#                 namespace. Safe only when nothing else runs there.
+#   "names"     — shared namespace; the run id is baked into template and pool
+#                 names so runs on the same image never share (or delete) a pool.
+#   "namespace" — a per-run namespace `<namespace>-<run id>` is created on first
+#                 use and deleted at teardown; names stay stable per image.
+RUN_ISOLATION_MODES = ("none", "names", "namespace")
+# Placeholder accepted in `template_name_prefix` / `pool_name_format`; the fleet
+# substitutes its run id at construction.
+RUN_ID_PLACEHOLDER = "{run_id}"
+
+# GKE Pod Snapshots (podsnapshot.gke.io) — used only when a cluster opts in with
+# ClusterConfig(snapshots=True). Mirrors the SDK's gke_extensions constants.
+PODSNAPSHOT_GROUP = "podsnapshot.gke.io"
+PODSNAPSHOT_VERSION = "v1"
+PODSNAPSHOTS_PLURAL = "podsnapshots"
+PODSNAPSHOT_TRIGGERS_PLURAL = "podsnapshotmanualtriggers"
+PODSNAPSHOT_POLICIES_PLURAL = "podsnapshotpolicies"
+# Pod annotation pinning a pod to one snapshot (opts out of "latest Ready wins").
+PODSNAPSHOT_NAME_ANNOTATION = "podsnapshot.gke.io/ps-name"
+
+# Pod name of a Sandbox when it differs from the Sandbox name (annotation set by
+# the controller on the Sandbox object; mirrors the SDK's POD_NAME_ANNOTATION).
+POD_NAME_ANNOTATION = "agents.x-k8s.io/pod-name"
+
+# Fail-fast classification of a claimed sandbox's pod (see failfast.py).
+# Waiting reasons that never clear on their own: fail as soon as they are seen.
+TERMINAL_WAITING_REASONS = frozenset({
+    "InvalidImageName",
+    "ErrImageNeverPull",
+})
+# Waiting reasons that usually mean a misconfiguration but can be transient (a
+# registry blip, a Secret created a moment late): fail once they have persisted
+# for `FailFastPolicy.grace_s`.
+RETRYABLE_WAITING_REASONS = frozenset({
+    "ErrImagePull",
+    "ImagePullBackOff",
+    "CreateContainerConfigError",
+    "CreateContainerError",
+    "RunContainerError",
+    "CrashLoopBackOff",
+    "PostStartHookError",
+})

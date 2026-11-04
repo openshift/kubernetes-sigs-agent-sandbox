@@ -17,6 +17,7 @@ package v1beta1
 import (
 	networkingv1 "k8s.io/api/networking/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	sandboxv1beta1 "sigs.k8s.io/agent-sandbox/api/v1beta1"
 )
 
@@ -25,9 +26,11 @@ import (
 
 // NetworkPolicyManagement defines whether the controller automatically generates
 // and manages a shared NetworkPolicy for this template.
+// +kubebuilder:validation:Enum=Managed;Unmanaged
 type NetworkPolicyManagement string
 
 // EnvVarsInjectionPolicy defines whether a SandboxClaim is allowed to inject or override environment variables.
+// +kubebuilder:validation:Enum=Allowed;Overrides;Disallowed
 type EnvVarsInjectionPolicy string
 
 const (
@@ -35,6 +38,13 @@ const (
 	// The SandboxClaim controller injects this label into the Pod
 	// System-injected labels/annotations shouldn't be touched.
 	SandboxIDLabel = "agents.x-k8s.io/claim-uid"
+
+	// SandboxClaimNameAnnotation is the annotation key applied to the Pod to identify the
+	// owning Claim name. It is an annotation rather than a label because a claim name can
+	// exceed the 63 character label value limit. It is set only while a SandboxClaim owns
+	// the Sandbox, and users cannot set it through additionalPodMetadata. It is informational,
+	// not an authn signal: anyone with pods/patch can rewrite it until the next reconcile.
+	SandboxClaimNameAnnotation = "agents.x-k8s.io/claim-name"
 
 	// NetworkPolicyManagementManaged means the controller will ensure a shared NetworkPolicy exists.
 	// This shared NetworkPolicy will be a user provide one or a default controller created policy.
@@ -55,6 +65,21 @@ const (
 	EnvVarsInjectionPolicyDisallowed EnvVarsInjectionPolicy = "Disallowed"
 )
 
+// VolumeClaimTemplatesPolicy defines whether a SandboxClaim is allowed to inject or override volume claim templates.
+// +kubebuilder:validation:Enum=Disallowed;Allowed;Overrides
+type VolumeClaimTemplatesPolicy string
+
+const (
+	// VolumeClaimTemplatesPolicyDisallowed prevents a SandboxClaim from specifying any volume claim templates.
+	VolumeClaimTemplatesPolicyDisallowed VolumeClaimTemplatesPolicy = "Disallowed"
+
+	// VolumeClaimTemplatesPolicyAllowed allows a SandboxClaim to inject new volume claim templates, but not override existing ones.
+	VolumeClaimTemplatesPolicyAllowed VolumeClaimTemplatesPolicy = "Allowed"
+
+	// VolumeClaimTemplatesPolicyOverrides allows a SandboxClaim to inject new and override existing volume claim templates.
+	VolumeClaimTemplatesPolicyOverrides VolumeClaimTemplatesPolicy = "Overrides"
+)
+
 // NetworkPolicySpec defines the desired state of the NetworkPolicy.
 type NetworkPolicySpec struct {
 	// ingress is a list of ingress rules to be applied to the sandbox.
@@ -72,21 +97,11 @@ type NetworkPolicySpec struct {
 
 // SandboxTemplateSpec defines the desired state of Sandbox.
 type SandboxTemplateSpec struct {
-	// podTemplate defines the object template that describes the pod spec that will be used to create
-	// an agent sandbox.
-	// If AutomountServiceAccountToken is not specified in the PodSpec, it defaults to false
-	// to ensure a secure-by-default environment.
-	// +required
-	PodTemplate sandboxv1beta1.PodTemplate `json:"podTemplate"`
-
-	// volumeClaimTemplates is a list of claims that pods created from this template
-	// are allowed to reference. When a SandboxClaim or SandboxWarmPool creates a sandbox
-	// from this template, PVCs will be created from these templates.
-	// Every claim in this list must have at least one matching access mode with a provisioner volume.
-	// NOTE: This list is atomic. Updates to this field will replace the entire list rather than merging with existing entries.
-	// +optional
-	// +listType=atomic
-	VolumeClaimTemplates []sandboxv1beta1.PersistentVolumeClaimTemplate `json:"volumeClaimTemplates,omitempty"`
+	// SandboxBlueprint defines the workload configuration shared with SandboxSpec.
+	// NOTE: Once a field is added here, it is promoted to both Sandbox and SandboxTemplate.
+	// Since moving fields out is breaking, if unsure whether a new field should be shared,
+	// define it in SandboxTemplateSpec (or SandboxSpec) first and promote it here later.
+	sandboxv1beta1.SandboxBlueprint `json:",inline"`
 
 	// networkPolicy defines the network policy to be applied to the sandboxes
 	// created from this template. A single shared NetworkPolicy is created per Template.
@@ -115,32 +130,38 @@ type SandboxTemplateSpec struct {
 
 	// networkPolicyManagement defines whether the controller manages the NetworkPolicy.
 	// Valid values are "Managed" (default) or "Unmanaged".
-	// +kubebuilder:validation:Enum=Managed;Unmanaged
 	// +kubebuilder:default=Managed
 	// +optional
 	NetworkPolicyManagement NetworkPolicyManagement `json:"networkPolicyManagement,omitempty"`
 
-	// envVarsInjectionPolicy allows a SandboxClaim to inject or override environment variables defined in the template.
-	// If set to Disallowed, the SandboxClaim will be rejected if it specifies any environment variables.
-	// +kubebuilder:validation:Enum=Allowed;Overrides;Disallowed
+	// envVarsInjectionPolicy controls whether a SandboxClaim may set environment variables
+	// (spec.env) on sandboxes created from this template:
+	//   - Disallowed (default): claims may not set any environment variables; a claim that
+	//     specifies spec.env is rejected.
+	//   - Allowed: claims may add environment variables whose names are not already defined
+	//     in the template, but may not change the value of a name the template already defines.
+	//   - Overrides: claims may add new environment variables and override the values of names
+	//     the template already defines.
+	// Note: environment variables are baked into the Pod before it is created; they cannot be
+	// injected into an already-running warm pool Pod. Consequently, allowing injection here
+	// (Allowed or Overrides) only takes effect on a per-claim basis: any claim that actually
+	// sets spec.env is forced to cold-start a fresh Sandbox and cannot adopt a warm pool
+	// Sandbox. Claims that set no environment variables still use the warm pool normally.
 	// +kubebuilder:default=Disallowed
 	// +optional
 	EnvVarsInjectionPolicy EnvVarsInjectionPolicy `json:"envVarsInjectionPolicy,omitempty"`
 
-	// service controls whether the controller should automatically create a
-	// headless Service for Sandboxes created from this template.
-	// When unset, the controller preserves existing Services for backward
-	// compatibility but does not create new ones. Set to true to enable or false
-	// to explicitly disable and remove the Service.
-	//nolint:kubeapilinter
-	//nolint:nobools // Enum not used to avoid duplicating the Service API; field is not expected to extend (issue #746).
+	// volumeClaimTemplatesPolicy allows a SandboxClaim to inject or override volume claim templates defined in the template.
+	// If set to Disallowed, the SandboxClaim will be rejected if it specifies any volume claim templates.
+	// +kubebuilder:default=Disallowed
 	// +optional
-	Service *bool `json:"service,omitempty"`
+	VolumeClaimTemplatesPolicy VolumeClaimTemplatesPolicy `json:"volumeClaimTemplatesPolicy,omitempty"`
 }
 
 // +genclient
 // +kubebuilder:object:root=true
 // +kubebuilder:resource:scope=Namespaced,shortName=sandboxtemplate
+// +kubebuilder:storageversion
 // SandboxTemplate is the Schema for the sandbox template API.
 type SandboxTemplate struct {
 	metav1.TypeMeta `json:",inline"`
@@ -163,5 +184,8 @@ type SandboxTemplateList struct {
 }
 
 func init() {
-	SchemeBuilder.Register(&SandboxTemplate{}, &SandboxTemplateList{})
+	SchemeBuilder.Register(func(s *runtime.Scheme) error {
+		s.AddKnownTypes(GroupVersion, &SandboxTemplate{}, &SandboxTemplateList{})
+		return nil
+	})
 }

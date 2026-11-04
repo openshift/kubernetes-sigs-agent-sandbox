@@ -1,0 +1,11 @@
+# Patch for Prometheus ServiceMonitor to enable secure TLS configuration
+# using the OpenShift service-serving-cert CA bundle.
+- op: replace
+  path: /spec/endpoints/0/tlsConfig
+  value:
+    serverName: agent-sandbox-controller.agent-sandbox-system.svc
+    insecureSkipVerify: false
+    ca:
+      configMap:
+        name: agent-sandbox-serving-ca
+        key: service-ca.crt

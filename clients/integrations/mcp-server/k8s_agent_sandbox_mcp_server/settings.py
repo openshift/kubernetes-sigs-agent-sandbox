@@ -1,0 +1,69 @@
+# Copyright 2026 The Kubernetes Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+from typing import (
+    Literal,
+    Union,
+)
+
+from pydantic import Field
+from pydantic_settings import BaseSettings, SettingsConfigDict
+from k8s_agent_sandbox.models import (
+    SandboxGatewayConnectionConfig,
+    SandboxDirectConnectionConfig, 
+    SandboxInClusterConnectionConfig,
+    SandboxdInClusterConnectionConfig,
+)
+
+
+class GatewayConnectionConfig(SandboxGatewayConnectionConfig):
+    type: Literal["gateway"] = Field(default="gateway")
+
+
+class DirectConnectionConfig(SandboxDirectConnectionConfig):
+    type: Literal["direct"] = Field(default="direct")
+
+
+class InClusterConnectionConfig(SandboxInClusterConnectionConfig):
+    type: Literal["in-cluster"] = Field(default="in-cluster")
+
+
+class SandboxdConnectionConfig(SandboxdInClusterConnectionConfig):
+    type: Literal["sandboxd-in-cluster"] = Field(default="sandboxd-in-cluster")
+
+
+ConnectionType = Union[
+    GatewayConnectionConfig,
+    DirectConnectionConfig,
+    InClusterConnectionConfig,
+    SandboxdConnectionConfig,
+]
+
+class Settings(BaseSettings):
+    connection: ConnectionType = Field(default=..., discriminator='type')
+    session_id_label_key: str = Field(
+        default="mcp.k8s-agent-sandbox/session-id",
+    )
+    probe_namespace: str = Field(
+        default="default",
+        description="Namespace the /readyz probe lists SandboxClaims in to confirm "
+                    "the Kubernetes API is reachable. Must be a namespace the "
+                    "server's service account can list claims in.",
+    )
+
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_prefix="K8S_SANDBOX_",
+        env_nested_delimiter="__",
+    )

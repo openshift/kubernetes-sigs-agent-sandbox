@@ -16,6 +16,7 @@ package v1beta1
 
 import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	sandboxv1beta1 "sigs.k8s.io/agent-sandbox/api/v1beta1"
 )
 
@@ -115,7 +116,11 @@ type SandboxClaimSpec struct {
 	Lifecycle *Lifecycle `json:"lifecycle,omitempty"`
 
 	// additionalPodMetadata defines the labels and annotations to be propagated to the Sandbox Pod.
+	// Label keys must carry a domain prefix from the controller's label-domain allowlist
+	// (default: sandbox.users.io, including subdomains), configured via the
+	// allowed-label-domains key of the optional agent-sandbox-config ConfigMap.
 	// Label values are limited to 63 characters and must match Kubernetes label value patterns.
+	// Annotations in restricted system domains are rejected, except cluster-autoscaler.kubernetes.io/safe-to-evict.
 	// +optional
 	AdditionalPodMetadata sandboxv1beta1.PodMetadata `json:"additionalPodMetadata,omitempty"`
 
@@ -125,6 +130,16 @@ type SandboxClaimSpec struct {
 	// +listType=atomic
 	// +optional
 	Env []EnvVar `json:"env,omitempty"`
+
+	// volumeClaimTemplates is a list of persistent volume claims to be created for the sandbox.
+	// Specifying this field forces a cold start because warm pool pods will not have these volumes.
+	// Each entry must have a unique, non-empty metadata.name.
+	// At most 128 entries: the cap only bounds the CEL cost of the uniqueness rule.
+	// +kubebuilder:validation:MaxItems=128
+	// +kubebuilder:validation:XValidation:rule="self.all(a, !has(a.metadata) || !has(a.metadata.name) || self.exists_one(b, has(b.metadata) && has(b.metadata.name) && b.metadata.name == a.metadata.name))",message="volumeClaimTemplates names must be unique"
+	// +optional
+	// +listType=atomic
+	VolumeClaimTemplates []sandboxv1beta1.PersistentVolumeClaimTemplate `json:"volumeClaimTemplates,omitempty"`
 }
 
 // SandboxClaimStatus defines the observed state of Sandbox.
@@ -143,16 +158,32 @@ type SandboxStatus struct {
 	// +optional
 	Name string `json:"name,omitempty"`
 
-	// podIPs are the IP addresses of the underlying pod.
-	// A pod may have multiple IPs in dual-stack clusters.
+	// podIPs are the IP addresses of the underlying pod, mirrored from the backing
+	// Sandbox's status. A pod may have multiple IPs in dual-stack clusters.
+	// This is populated only while the backing Sandbox has a running pod with assigned
+	// IPs; it is cleared whenever the pod is absent (e.g. before the pod has been
+	// created or while the Sandbox is suspended).
 	// +optional
 	PodIPs []string `json:"podIPs,omitempty"`
+
+	// serviceFQDN is the in-cluster DNS name of the bound Sandbox's service,
+	// mirrored from the Sandbox's status.serviceFQDN so consumers can reach
+	// the sandbox from the claim alone. Like name and podIPs, it is eventually
+	// consistent: it may lag the Sandbox by a reconcile, and is cleared when
+	// the claim loses its sandbox.
+	// +optional
+	ServiceFQDN string `json:"serviceFQDN,omitempty"`
 }
 
 // +genclient
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
 // +kubebuilder:resource:scope=Namespaced,shortName=sandboxclaim
+// +kubebuilder:printcolumn:name="Ready",type="string",JSONPath=".status.conditions[?(@.type=='Ready')].status"
+// +kubebuilder:printcolumn:name="Sandbox",type="string",JSONPath=".status.sandbox.name"
+// +kubebuilder:printcolumn:name="Reason",type="string",JSONPath=".status.conditions[?(@.type=='Ready')].reason"
+// +kubebuilder:printcolumn:name="Age",type="date",JSONPath=".metadata.creationTimestamp"
+// +kubebuilder:storageversion
 // SandboxClaim is the Schema for the sandbox Claim API.
 type SandboxClaim struct {
 	metav1.TypeMeta `json:",inline"`
@@ -179,5 +210,8 @@ type SandboxClaimList struct {
 }
 
 func init() {
-	SchemeBuilder.Register(&SandboxClaim{}, &SandboxClaimList{})
+	SchemeBuilder.Register(func(s *runtime.Scheme) error {
+		s.AddKnownTypes(GroupVersion, &SandboxClaim{}, &SandboxClaimList{})
+		return nil
+	})
 }

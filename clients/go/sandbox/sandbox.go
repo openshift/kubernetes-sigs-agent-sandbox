@@ -16,15 +16,20 @@ package sandbox
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"maps"
+	"net/http"
 	"sync"
 	"time"
 
 	"github.com/go-logr/logr"
 	"go.opentelemetry.io/otel/trace"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
+
+	extv1beta1 "sigs.k8s.io/agent-sandbox/extensions/api/v1beta1"
 )
 
 // Sandbox manages the lifecycle of a single agent-sandbox instance.
@@ -34,6 +39,7 @@ type Sandbox struct {
 	connector *connector
 	commands  *Commands
 	files     *Files
+	watchers  *Watchers
 	opts      Options
 	log       logr.Logger
 
@@ -41,6 +47,7 @@ type Sandbox struct {
 	sandboxName string
 	podName     string
 	podIP       string
+	serviceFQDN string
 	annotations map[string]string
 
 	lifecycleSem chan struct{}
@@ -65,7 +72,7 @@ var (
 // Call Open() to create a sandbox and establish connectivity.
 func New(_ context.Context, opts Options) (*Sandbox, error) {
 	opts.setDefaults()
-	if err := opts.validate(); err != nil {
+	if err := opts.validateCommon(); err != nil {
 		return nil, err
 	}
 
@@ -85,6 +92,44 @@ func New(_ context.Context, opts Options) (*Sandbox, error) {
 	switch {
 	case opts.APIURL != "":
 		strategy = &DirectStrategy{URL: opts.APIURL}
+	case opts.Connectivity.isInCluster():
+		// Caller is on the pod network and has opted to dial
+		// the runtime on the pod IP.
+		ics := &inClusterStrategy{
+			httpPort:      opts.ServerPort,
+			useServiceDNS: opts.Connectivity == ConnectivityInClusterService,
+			log:           opts.Logger,
+			tracer:        tracer,
+			svcName:       svcName,
+		}
+		if opts.Runtime == RuntimeSandboxd {
+			ics.httpPort = opts.SandboxdRESTPort
+			ics.grpcPort = opts.SandboxdGRPCPort
+		}
+		strategy = ics
+	case opts.Connectivity == ConnectivityRouterPortForward:
+		// REST and gRPC both go through the sandbox-router.
+		strategy = newTunnelStrategy(k8s, opts, tracer, svcName, true)
+	case opts.Runtime == RuntimeSandboxd:
+		// sandboxd talks to the sandbox pod, not the sandbox-router, and the
+		// default transport reaches it without pod-network access: a
+		// port-forward directly to the pod (validated earlier: GatewayName is
+		// rejected with RuntimeSandboxd).
+		strategy = &podTunnelStrategy{
+			restPort: opts.SandboxdRESTPort,
+			grpcPort: opts.SandboxdGRPCPort,
+			log:      opts.Logger,
+			tracer:   tracer,
+			svcName:  svcName,
+			tunnel: &portForwardTunnel{
+				name:       "sandboxd pod port-forward",
+				coreClient: k8s.CoreClient,
+				restConfig: k8s.RestConfig,
+				namespace:  opts.Namespace,
+				pfTimeout:  opts.PortForwardReadyTimeout,
+				log:        opts.Logger,
+			},
+		}
 	case opts.GatewayName != "":
 		strategy = &gatewayStrategy{
 			dynamicClient:    k8s.DynamicClient,
@@ -97,33 +142,42 @@ func New(_ context.Context, opts Options) (*Sandbox, error) {
 			svcName:          svcName,
 		}
 	default:
-		strategy = &tunnelStrategy{
-			coreClient:      k8s.CoreClient,
-			discoveryClient: k8s.DiscoveryClient,
-			restConfig:      k8s.RestConfig,
-			namespace:       opts.Namespace,
-			pfTimeout:       opts.PortForwardReadyTimeout,
-			log:             opts.Logger,
-			tracer:          tracer,
-			svcName:         svcName,
-		}
+		strategy = newTunnelStrategy(k8s, opts, tracer, svcName, false)
 	}
 
+	serverPort := opts.ServerPort
+	routerHeaders := opts.Runtime != RuntimeSandboxd && !opts.Connectivity.isInCluster()
+	if opts.Connectivity == ConnectivityRouterPortForward && opts.Runtime == RuntimeSandboxd {
+		// X-Sandbox-Port selects sandboxd's REST listener.
+		routerHeaders = true
+		serverPort = opts.SandboxdRESTPort
+	}
 	conn := newConnector(connectorConfig{
-		Strategy:          strategy,
-		Namespace:         opts.Namespace,
-		ServerPort:        opts.ServerPort,
-		RequestTimeout:    opts.RequestTimeout,
-		PerAttemptTimeout: opts.PerAttemptTimeout,
-		HTTPTransport:     opts.HTTPTransport,
-		Log:               opts.Logger,
-		Tracer:            tracer,
-		TraceServiceName:  svcName,
+		Strategy:            strategy,
+		Namespace:           opts.Namespace,
+		ServerPort:          serverPort,
+		SandboxdGRPCPort:    opts.SandboxdGRPCPort,
+		RouterHeaders:       routerHeaders,
+		RequestTimeout:      opts.RequestTimeout,
+		PerAttemptTimeout:   opts.PerAttemptTimeout,
+		HTTPTransport:       opts.HTTPTransport,
+		DisablePodIPRouting: opts.DisablePodIPRouting,
+		Log:                 opts.Logger,
+		Tracer:              tracer,
+		TraceServiceName:    svcName,
 	})
 
-	// Wire tunnel's connector reference for death notifications.
+	// Wire strategy connector references for death notifications (and, for
+	// the pod tunnel, gRPC target publication).
 	if ts, ok := strategy.(*tunnelStrategy); ok {
-		ts.connector = conn
+		ts.tunnel.onDied = conn.SetLastError
+	}
+	if pts, ok := strategy.(*podTunnelStrategy); ok {
+		pts.connector = conn
+		pts.tunnel.onDied = conn.SetLastError
+	}
+	if ics, ok := strategy.(*inClusterStrategy); ok {
+		ics.connector = conn
 	}
 
 	s := &Sandbox{
@@ -139,14 +193,11 @@ func New(_ context.Context, opts Options) (*Sandbox, error) {
 
 	errPrefix := s.errPrefix
 	trackOp := s.trackOp
-	getLifecycleCtx := func() context.Context {
-		s.mu.Lock()
-		defer s.mu.Unlock()
-		return s.lifecycleCtx
-	}
+	getLifecycleCtx := s.currentLifecycleCtx
 
 	s.commands = &Commands{
 		connector:    conn,
+		runtime:      opts.Runtime,
 		tracer:       tracer,
 		svcName:      svcName,
 		log:          opts.Logger,
@@ -156,6 +207,7 @@ func New(_ context.Context, opts Options) (*Sandbox, error) {
 	}
 	s.files = &Files{
 		connector:    conn,
+		runtime:      opts.Runtime,
 		tracer:       tracer,
 		svcName:      svcName,
 		log:          opts.Logger,
@@ -165,14 +217,35 @@ func New(_ context.Context, opts Options) (*Sandbox, error) {
 		trackOp:      trackOp,
 		lifecycleCtx: getLifecycleCtx,
 	}
+	s.watchers = &Watchers{
+		connector:    conn,
+		runtime:      opts.Runtime,
+		tracer:       tracer,
+		svcName:      svcName,
+		log:          opts.Logger,
+		errPrefix:    errPrefix,
+		trackOp:      trackOp,
+		lifecycleCtx: getLifecycleCtx,
+	}
+
+	// The pod tunnel needs the resolved pod name at Connect time.
+	// The in-cluster strategy needs the pod IP.
+	if pts, ok := strategy.(*podTunnelStrategy); ok {
+		pts.getPodName = s.PodName
+	}
+	if ics, ok := strategy.(*inClusterStrategy); ok {
+		ics.getServiceFQDN = s.ServiceFQDN
+		ics.getPodIP = s.PodIP
+	}
 
 	return s, nil
 }
 
 // Open creates a SandboxClaim and waits for the sandbox to become ready,
 // then discovers the API URL based on the configured connection mode.
-// On failure after claim creation, the claim is automatically deleted;
-// if deletion also fails, call Close() to retry.
+// On failure after claim creation, a claim with a generated name is
+// automatically deleted; if deletion also fails, call Close() to retry.
+// A claim named by ClaimName is caller-owned and is left in place.
 func (s *Sandbox) Open(ctx context.Context) (retErr error) {
 	select {
 	case s.lifecycleSem <- struct{}{}:
@@ -237,18 +310,28 @@ func (s *Sandbox) Open(ctx context.Context) (retErr error) {
 		return s.reconnect(openCtx)
 	}
 
-	// Create claim.
-	claimName, err := s.k8s.createClaim(openCtx, s.opts.Namespace, s.opts.WarmPoolName, s.tracer, s.traceServiceName)
-	if err != nil {
+	if err := validateWarmPoolName(s.opts.WarmPoolName); err != nil {
 		return err
 	}
+
+	// Create claim, or adopt the existing one on conflict when asked to.
+	claim, err := s.k8s.createClaim(openCtx, newClaim(&s.opts, time.Now()), s.tracer, s.traceServiceName)
+	if err != nil {
+		if !s.opts.AdoptExisting || !k8serrors.IsAlreadyExists(err) {
+			return err
+		}
+		if claim, err = s.adoptClaim(openCtx); err != nil {
+			return err
+		}
+	}
+	claimName := claim.Name
 	s.mu.Lock()
 	s.claimName = claimName
 	s.mu.Unlock()
 
 	// Resolve sandbox name (may differ from claim name with warm pool).
 	resolveStart := time.Now()
-	sandboxName, err := s.k8s.resolveSandboxName(openCtx, claimName, s.opts.Namespace, s.opts.SandboxReadyTimeout, s.tracer, s.traceServiceName)
+	sandboxName, err := s.k8s.resolveSandboxName(openCtx, claimName, s.opts.Namespace, claim.UID, s.opts.SandboxReadyTimeout, s.tracer, s.traceServiceName)
 	if err != nil {
 		return s.rollbackOpen(err)
 	}
@@ -276,6 +359,25 @@ func (s *Sandbox) Open(ctx context.Context) (retErr error) {
 	return nil
 }
 
+// adoptClaim fetches the existing claim named by ClaimName after a create
+// conflict and checks that it is safe to attach to: it must not be
+// terminating and must reference exactly the requested warm pool.
+func (s *Sandbox) adoptClaim(ctx context.Context) (*extv1beta1.SandboxClaim, error) {
+	name, ns := s.opts.ClaimName, s.opts.Namespace
+	existing, err := s.k8s.getClaim(ctx, name, ns, s.tracer, s.traceServiceName)
+	if err != nil {
+		return nil, fmt.Errorf("%w: getting existing claim %s in %s after conflict: %w", ErrClaimFailed, name, ns, err)
+	}
+	if existing.DeletionTimestamp != nil {
+		return nil, fmt.Errorf("%w: existing claim %s in %s is terminating", ErrSandboxDeleted, name, ns)
+	}
+	if existing.Spec.WarmPoolRef.Name != s.opts.WarmPoolName {
+		return nil, fmt.Errorf("%w: existing claim %s in %s references warm pool %q, not %q", ErrClaimFailed, name, ns, existing.Spec.WarmPoolRef.Name, s.opts.WarmPoolName)
+	}
+	s.log.Info("claim adopted", "claim", name, "namespace", ns)
+	return existing, nil
+}
+
 func (s *Sandbox) reconnect(ctx context.Context) error {
 	ctx, span := startSpan(ctx, s.tracer, s.traceServiceName, "reconnect")
 	defer span.End()
@@ -297,6 +399,8 @@ func (s *Sandbox) reconnect(ctx context.Context) error {
 			s.claimName = ""
 			s.sandboxName = ""
 			s.podName = ""
+			s.podIP = ""
+			s.serviceFQDN = ""
 			s.annotations = nil
 			s.mu.Unlock()
 			retErr := fmt.Errorf("%w: %w", ErrSandboxDeleted, err)
@@ -305,6 +409,8 @@ func (s *Sandbox) reconnect(ctx context.Context) error {
 		}
 		s.sandboxName = ""
 		s.podName = ""
+		s.podIP = ""
+		s.serviceFQDN = ""
 		s.annotations = nil
 		s.mu.Unlock()
 		recordError(span, err)
@@ -317,6 +423,8 @@ func (s *Sandbox) reconnect(ctx context.Context) error {
 		if k8serrors.IsNotFound(err) {
 			s.sandboxName = ""
 			s.podName = ""
+			s.podIP = ""
+			s.serviceFQDN = ""
 			s.annotations = nil
 		}
 		// Non-NotFound: sandboxName preserved so the next Open() can re-verify
@@ -338,6 +446,8 @@ func (s *Sandbox) reconnect(ctx context.Context) error {
 	return nil
 }
 
+// rollbackOpen undoes a failed Open. Only a claim with a generated name is
+// deleted: another Open on the same ClaimName may have adopted a named claim.
 func (s *Sandbox) rollbackOpen(originalErr error) error {
 	_ = s.connector.Close()
 
@@ -345,15 +455,19 @@ func (s *Sandbox) rollbackOpen(originalErr error) error {
 	name := s.claimName
 	s.mu.Unlock()
 
-	cleanupCtx, cancel := context.WithTimeout(context.Background(), s.opts.CleanupTimeout)
-	defer cancel()
+	var cleanupErr error
+	if s.opts.ClaimName == "" {
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), s.opts.CleanupTimeout)
+		defer cancel()
 
-	cleanupErr := s.k8s.deleteClaim(cleanupCtx, name, s.opts.Namespace)
+		cleanupErr = s.k8s.deleteClaim(cleanupCtx, name, s.opts.Namespace)
+	}
 
 	s.mu.Lock()
 	s.sandboxName = ""
 	s.podName = ""
 	s.podIP = ""
+	s.serviceFQDN = ""
 	s.annotations = nil
 	if cleanupErr == nil {
 		s.claimName = ""
@@ -441,6 +555,7 @@ func (s *Sandbox) Close(ctx context.Context) error {
 	s.sandboxName = ""
 	s.podName = ""
 	s.podIP = ""
+	s.serviceFQDN = ""
 	s.annotations = nil
 	if err != nil && s.claimName != "" {
 		s.log.Error(err, "orphaned claim during Close, could not delete; retry Close() to clean up", "claim", s.claimName)
@@ -518,6 +633,10 @@ func (s *Sandbox) Commands() *Commands { return s.commands }
 // Files returns the file operations sub-object.
 func (s *Sandbox) Files() *Files { return s.files }
 
+// Watchers returns the filesystem event streaming sub-object. Requires the
+// sandboxd runtime; WatchDir calls return an error on the legacy runtime.
+func (s *Sandbox) Watchers() *Watchers { return s.watchers }
+
 // Convenience aliases that delegate to sub-objects.
 
 func (s *Sandbox) Run(ctx context.Context, command string, opts ...CallOption) (*ExecutionResult, error) {
@@ -526,14 +645,119 @@ func (s *Sandbox) Run(ctx context.Context, command string, opts ...CallOption) (
 func (s *Sandbox) Write(ctx context.Context, path string, content []byte, opts ...CallOption) error {
 	return s.files.Write(ctx, path, content, opts...)
 }
+
+// WriteReader streams content from an io.Reader without buffering the entire
+// payload. Streaming uploads use a single request attempt because a generic
+// reader cannot be replayed safely. Passing WithMaxAttempts with a value
+// greater than 1 returns an error; it is not silently reduced to one attempt.
+func (s *Sandbox) WriteReader(ctx context.Context, path string, content io.Reader, opts ...CallOption) error {
+	return s.files.WriteReader(ctx, path, content, opts...)
+}
+
 func (s *Sandbox) Read(ctx context.Context, path string, opts ...CallOption) ([]byte, error) {
 	return s.files.Read(ctx, path, opts...)
 }
+
+// ReadTo streams a file into a caller-owned io.Writer without buffering the
+// complete response. The destination is never closed.
+func (s *Sandbox) ReadTo(ctx context.Context, path string, destination io.Writer, opts ...CallOption) (int64, error) {
+	return s.files.ReadTo(ctx, path, destination, opts...)
+}
+
 func (s *Sandbox) List(ctx context.Context, path string, opts ...CallOption) ([]FileEntry, error) {
 	return s.files.List(ctx, path, opts...)
 }
 func (s *Sandbox) Exists(ctx context.Context, path string, opts ...CallOption) (bool, error) {
 	return s.files.Exists(ctx, path, opts...)
+}
+
+// Delete removes a file or directory (sandboxd runtime only; the legacy
+// python-runtime returns ErrUnsupportedByRuntime). Not part of the Handle
+// interface to avoid breaking existing implementers.
+func (s *Sandbox) Delete(ctx context.Context, path string, recursive bool, opts ...CallOption) error {
+	return s.files.Delete(ctx, path, recursive, opts...)
+}
+
+// Mkdir creates a directory, and its missing parents when parents is true
+// (sandboxd runtime only). See Files.Mkdir.
+func (s *Sandbox) Mkdir(ctx context.Context, path string, parents bool, opts ...CallOption) error {
+	return s.files.Mkdir(ctx, path, parents, opts...)
+}
+
+// Move renames a file or directory (sandboxd runtime only). See Files.Move.
+func (s *Sandbox) Move(ctx context.Context, source, destination string, overwrite bool, opts ...CallOption) error {
+	return s.files.Move(ctx, source, destination, overwrite, opts...)
+}
+
+// Copy copies a file or directory (sandboxd runtime only). See Files.Copy.
+func (s *Sandbox) Copy(ctx context.Context, source, destination string, overwrite bool, opts ...CallOption) error {
+	return s.files.Copy(ctx, source, destination, overwrite, opts...)
+}
+
+// Health returns sandboxd's report from GET /v1/health. It returns an
+// HTTPError while sandboxd is shutting down, and ErrUnsupportedByRuntime on
+// the legacy python-runtime. It does not retry unless WithMaxAttempts is set.
+// Not part of the Handle interface to avoid breaking existing implementers.
+func (s *Sandbox) Health(ctx context.Context, opts ...CallOption) (*Health, error) {
+	return getSandboxdJSON[Health](ctx, s, "health", opts)
+}
+
+// Metadata returns the workload-scoped configuration sandboxd serves from
+// GET /v1/metadata (sandboxd runtime only; the legacy python-runtime returns
+// ErrUnsupportedByRuntime). It does not retry unless WithMaxAttempts is set.
+// Not part of the Handle interface to avoid breaking existing implementers.
+func (s *Sandbox) Metadata(ctx context.Context, opts ...CallOption) (*Metadata, error) {
+	md, err := getSandboxdJSON[Metadata](ctx, s, "metadata", opts)
+	if err != nil {
+		return nil, err
+	}
+	if md.Env == nil {
+		md.Env = map[string]string{}
+	}
+	return md, nil
+}
+
+// getSandboxdJSON GETs the sandboxd REST endpoint /v1/<op> and decodes its
+// JSON body into a T. op doubles as the span and error-message operation name.
+func getSandboxdJSON[T any](ctx context.Context, s *Sandbox, op string, opts []CallOption) (*T, error) {
+	defer s.trackOp()()
+	ctx, callCancel, maxAttempts := applyCallOptsNoRetry(ctx, opts)
+	defer callCancel()
+	ctx, span := startSpan(withLifecycleSpan(ctx, s.currentLifecycleCtx()), s.tracer, s.traceServiceName, op)
+	defer span.End()
+
+	fail := func(err error) (*T, error) {
+		recordError(span, err)
+		return nil, err
+	}
+
+	if s.opts.Runtime != RuntimeSandboxd {
+		return fail(fmt.Errorf("%s: %s: %w: the legacy python-runtime has no %s endpoint", s.errPrefix(), op, ErrUnsupportedByRuntime, op))
+	}
+	resp, err := s.connector.SendRequest(ctx, http.MethodGet, "v1/"+op, nil, "", maxAttempts)
+	if err != nil {
+		return fail(fmt.Errorf("%s: %s failed: %w", s.errPrefix(), op, err))
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fail(fmt.Errorf("%s: %s: %w", s.errPrefix(), op, newHTTPError(resp, op, RuntimeSandboxd)))
+	}
+	defer func() { _, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, maxDrainBytes)) }()
+
+	var out T
+	if err := json.NewDecoder(io.LimitReader(resp.Body, maxMetadataResponseSize)).Decode(&out); err != nil {
+		return fail(fmt.Errorf("%s: failed to decode %s response: %w", s.errPrefix(), op, err))
+	}
+	return &out, nil
+}
+
+// WatchDir streams filesystem events for a sandbox-relative directory path.
+// When recursive is true, subdirectories are watched too. The returned
+// channel is closed when ctx is cancelled or the watch ends.
+// Requires the sandboxd runtime. Convenience alias for Watchers().WatchDir.
+func (s *Sandbox) WatchDir(ctx context.Context, path string, recursive bool, opts ...CallOption) (<-chan FileEvent, error) {
+	return s.watchers.WatchDir(ctx, path, recursive, opts...)
 }
 
 // Info accessors.
@@ -562,6 +786,15 @@ func (s *Sandbox) PodIP() string {
 	return s.podIP
 }
 
+// ServiceFQDN returns the in-cluster DNS name of the Sandbox's headless
+// Service, or "" when it has none (spec.service unset or false). Not part of
+// the Info interface, which is frozen for backward compatibility.
+func (s *Sandbox) ServiceFQDN() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.serviceFQDN
+}
+
 func (s *Sandbox) Annotations() map[string]string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -571,6 +804,12 @@ func (s *Sandbox) Annotations() map[string]string {
 	cp := make(map[string]string, len(s.annotations))
 	maps.Copy(cp, s.annotations)
 	return cp
+}
+
+func (s *Sandbox) currentLifecycleCtx() context.Context {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.lifecycleCtx
 }
 
 func (s *Sandbox) errPrefix() string {
@@ -605,5 +844,6 @@ func (s *Sandbox) setState(state *sandboxState) {
 	s.sandboxName = state.SandboxName
 	s.podName = state.PodName
 	s.podIP = state.PodIP
+	s.serviceFQDN = state.ServiceFQDN
 	s.annotations = state.Annotations
 }

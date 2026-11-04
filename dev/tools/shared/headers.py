@@ -18,6 +18,7 @@ import os
 import fnmatch
 import argparse
 import datetime
+import subprocess
 
 # The license header to apply
 APACHE_HEADER = """Copyright {year} The Kubernetes Authors.
@@ -200,25 +201,46 @@ def apply_license_header(file_path, header_text, dry_run=False):
 
 
 def _match_path_parts(path_parts, pattern_parts):
-    """Recursively matches path components against pattern components."""
+    """Matches path components against pattern components.
+
+    Uses dynamic programming in O(N*M) time and O(M) space, where ``**``
+    matches zero or more path components and an empty pattern component
+    (produced by leading/trailing/duplicate slashes, e.g. ``foo/``) matches
+    zero path components.
+    """
     if not pattern_parts:
         return not path_parts
-    if not path_parts:
-        return pattern_parts == ['**'] or all(p == '' for p in pattern_parts)
 
-    p_part = pattern_parts[0]
-    if p_part == '**':
-        if len(pattern_parts) == 1:
-            return True  # `/**` at the end matches everything remaining
-        # `/**/` can match zero or more directories.
-        for i in range(len(path_parts) + 1):
-            if _match_path_parts(path_parts[i:], pattern_parts[1:]):
-                return True
-        return False
-    else:
-        if fnmatch.fnmatch(path_parts[0], p_part):
-            return _match_path_parts(path_parts[1:], pattern_parts[1:])
-        return False
+    n = len(path_parts)
+    m = len(pattern_parts)
+
+    # prev[j] is True iff the first (i-1) path parts match the first j pattern
+    # parts. Only one row is kept at a time since row i depends only on row i-1.
+    # Initialize for i == 0 (no path parts consumed): a pattern can match zero
+    # path parts only while every component so far is '**' or empty.
+    prev = [False] * (m + 1)
+    prev[0] = True
+    for j in range(1, m + 1):
+        if pattern_parts[j-1] in ('**', ''):
+            prev[j] = prev[j-1]
+        else:
+            break
+
+    for i in range(1, n + 1):
+        # curr[0] stays False: a non-empty path can't match an empty pattern.
+        curr = [False] * (m + 1)
+        for j in range(1, m + 1):
+            if pattern_parts[j-1] == '**':
+                # '**' matches this path part (prev[j]) or zero parts (curr[j-1]).
+                curr[j] = prev[j] or curr[j-1]
+            elif pattern_parts[j-1] == '':
+                # Empty component is an epsilon transition (matches zero parts).
+                curr[j] = curr[j-1]
+            else:
+                curr[j] = prev[j-1] and fnmatch.fnmatch(path_parts[i-1], pattern_parts[j-1])
+        prev = curr
+
+    return prev[m]
 
 def is_path_excluded(relative_path, exclude_patterns):
     """Checks if a relative path matches any of the .gitignore-style exclude patterns."""
@@ -239,9 +261,18 @@ def is_path_excluded(relative_path, exclude_patterns):
     return False
 
 
+def _list_files(root_dir):
+    """Lists tracked and untracked files under root_dir, skipping git-ignored ones."""
+    output = subprocess.check_output(
+        ["git", "-C", root_dir, "ls-files", "-z", "--cached", "--others", "--exclude-standard"])
+    return [path for path in os.fsdecode(output).split("\0") if path]
+
+
 def apply_headers_to_tree(root_dir, excludes=None, dry_run=False):
     """
-    Applies headers to all files in a repository, respecting excludes.
+    Applies headers to the tracked and untracked files of a git repository,
+    skipping git-ignored files and respecting excludes. Excludes are matched
+    against file paths; to exclude a directory, end the pattern with "/**".
     """
     year = datetime.datetime.now().year
     header_text = APACHE_HEADER.format(year=year)
@@ -249,18 +280,16 @@ def apply_headers_to_tree(root_dir, excludes=None, dry_run=False):
     all_excludes = DEFAULT_EXCLUDES + (excludes or [])
     print(f"Excluding patterns: {all_excludes}")
 
-    for root, dirs, files in os.walk(root_dir, topdown=True):
-        rel_root = os.path.relpath(root, root_dir)
-        if rel_root == '.':
-            rel_root = ''
+    real_root = os.path.realpath(root_dir)
+    for rel_path in _list_files(root_dir):
+        if is_path_excluded(rel_path, all_excludes):
+            continue
 
-        # Filter dirs in-place so os.walk doesn't recurse into them
-        dirs[:] = [d for d in dirs if not is_path_excluded(os.path.join(rel_root, d), all_excludes)]
-
-        for file in files:
-            rel_path = os.path.join(rel_root, file)
-            if is_path_excluded(rel_path, all_excludes):
-                continue
-
-            full_path = os.path.join(root, file)
-            apply_license_header(full_path, header_text, dry_run)
+        full_path = os.path.join(real_root, rel_path)
+        # git lists symlinks (e.g. .github/skills), paths under a directory
+        # replaced by a symlink, and tracked files deleted from the working
+        # tree; writing through a symlink would modify its target, which may
+        # be outside the repo.
+        if os.path.realpath(full_path) != full_path or not os.path.isfile(full_path):
+            continue
+        apply_license_header(full_path, header_text, dry_run)

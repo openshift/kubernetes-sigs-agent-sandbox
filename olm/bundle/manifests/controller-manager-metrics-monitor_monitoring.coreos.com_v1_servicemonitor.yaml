@@ -1,0 +1,23 @@
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  labels:
+    app: agent-sandbox-controller
+    app.kubernetes.io/managed-by: kustomize
+  name: controller-manager-metrics-monitor
+spec:
+  endpoints:
+  - bearerTokenFile: /var/run/secrets/kubernetes.io/serviceaccount/token
+    path: /metrics
+    port: metrics
+    scheme: https
+    tlsConfig:
+      ca:
+        configMap:
+          key: service-ca.crt
+          name: agent-sandbox-serving-ca
+      insecureSkipVerify: false
+      serverName: agent-sandbox-controller.agent-sandbox-system.svc
+  selector:
+    matchLabels:
+      app: agent-sandbox-controller

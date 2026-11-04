@@ -1,16 +1,24 @@
 # Compile our golang binaries in a separate stage to keep the final image small.
-FROM golang:1.26.4 AS builder
+# Pin the builder to the build platform and cross-compile to the target arch so the
+# Go toolchain always runs natively instead of under QEMU emulation. Running `go build`
+# under emulation can crash the Go runtime/GC ("found pointer to free object").
+# See https://github.com/golang/go/issues/69255#issuecomment-2523276831
+FROM --platform=$BUILDPLATFORM golang:1.27.3 AS builder
+
+# Declare TARGETARCH/TARGETOS to make them available in this build stage.
+ARG TARGETARCH
+ARG TARGETOS=linux
 
 WORKDIR /src
 
 COPY go.mod go.sum ./
 COPY cmd ./cmd
 
-RUN CGO_ENABLED=0 go build -o /chrome-sandbox-entrypoint ./cmd/chrome-sandbox-entrypoint
+RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -o /chrome-sandbox-entrypoint ./cmd/chrome-sandbox-entrypoint
 
 #----------------------
 # Use a base image with a minimal set of packages.
-FROM debian:13-slim
+FROM debian:13-slim@sha256:f6b08b09a05725f9431502d3b5714f5c4576e82c1a84fa1debe0c24a7e0c3ec4
 
 #----------------------
 # Install general prerequisite packages.
