@@ -417,7 +417,7 @@ spec:
                 - --proxy-timeout=180s
                 - --upstream-max-retries=3
                 - --cache-enabled=true
-                image: registry.redhat.io/agent-sandbox/agent-sandbox-router@sha256:495eb55543da89110bcb49bb7f78ea9b8dcb99b0b7e759164b641dfabc888eed
+                image: registry.redhat.io/agent-sandbox/agent-sandbox-router@sha256:e19a6f5646593b4d746e91a68be1ffee943114aa4b1f3d7108c4cc13e45cdcd9
                 imagePullPolicy: IfNotPresent
                 livenessProbe:
                   failureThreshold: 3
