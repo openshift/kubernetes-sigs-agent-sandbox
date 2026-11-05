@@ -62,9 +62,12 @@ func main() {
 	// Apply config-file values BEFORE flag.Parse so CLI flags take precedence.
 	// The file path is pulled from --config / SANDBOX_ROUTER_CONFIG without
 	// touching flag.Parse, so the rest of the args are still available below.
+	var fileChanges []config.ConfigChange
 	if path := config.FileFromArgsAndEnv(os.Args[1:], os.Getenv); path != "" {
 		cfg.ConfigFile = path
-		if err := config.LoadFromFile(path, flag.CommandLine); err != nil {
+		var err error
+		fileChanges, err = config.LoadFromFile(path, flag.CommandLine)
+		if err != nil {
 			fmt.Fprintf(os.Stderr, "config: %v\n", err)
 			os.Exit(2)
 		}
@@ -85,6 +88,22 @@ func main() {
 
 	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&zapOpts)))
 	log := ctrl.Log.WithName("sandbox-router")
+
+	// The config file is applied before the logger exists, so report it here:
+	// one line confirming the file (usually a mounted ConfigMap) was honored,
+	// listing only the settings it actually changed. Values it restates are
+	// not changes; CLI flags parsed above may still override what follows.
+	if cfg.ConfigFile != "" {
+		if len(fileChanges) == 0 {
+			log.Info("config file loaded; no settings changed", "path", cfg.ConfigFile)
+		} else {
+			changes := make([]string, 0, len(fileChanges))
+			for _, ch := range fileChanges {
+				changes = append(changes, ch.String())
+			}
+			log.Info("config file loaded", "path", cfg.ConfigFile, "changes", changes)
+		}
+	}
 
 	if err := cfg.Validate(); err != nil {
 		log.Error(err, "invalid configuration")

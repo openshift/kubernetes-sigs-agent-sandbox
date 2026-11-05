@@ -18,6 +18,7 @@ import (
 	"flag"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -41,7 +42,7 @@ func TestGRPCProxyTimeoutConfig(t *testing.T) {
 			cfg := Defaults()
 			fs := flag.NewFlagSet("test", flag.ContinueOnError)
 			RegisterFlags(fs, &cfg, nil)
-			if err := LoadFromFile(writeYAML(t, "grpc-proxy-timeout: "+tc.value+"\n"), fs); err != nil {
+			if _, err := LoadFromFile(writeYAML(t, "grpc-proxy-timeout: "+tc.value+"\n"), fs); err != nil {
 				t.Fatal(err)
 			}
 			if err := fs.Parse(nil); err != nil {
@@ -56,7 +57,7 @@ func TestGRPCProxyTimeoutConfig(t *testing.T) {
 	cfg := Defaults()
 	fs := flag.NewFlagSet("test", flag.ContinueOnError)
 	RegisterFlags(fs, &cfg, nil)
-	if err := LoadFromFile(writeYAML(t, "grpc-proxy-timeout: 1s\n"), fs); err != nil {
+	if _, err := LoadFromFile(writeYAML(t, "grpc-proxy-timeout: 1s\n"), fs); err != nil {
 		t.Fatal(err)
 	}
 	if err := fs.Parse([]string{"--grpc-proxy-timeout=2s"}); err != nil {
@@ -112,7 +113,7 @@ mtls-mode: "optional"
 access-log: false
 enable-tracing: true
 `)
-	if err := LoadFromFile(path, fs); err != nil {
+	if _, err := LoadFromFile(path, fs); err != nil {
 		t.Fatalf("LoadFromFile: %v", err)
 	}
 
@@ -146,7 +147,7 @@ func TestLoadFromFile_CLIOverridesFile(t *testing.T) {
 	RegisterFlags(fs, &cfg, func(string) (string, bool) { return "", false })
 
 	path := writeYAML(t, `cluster-domain: "file.local"`)
-	if err := LoadFromFile(path, fs); err != nil {
+	if _, err := LoadFromFile(path, fs); err != nil {
 		t.Fatalf("LoadFromFile: %v", err)
 	}
 	// Now simulate CLI flag parsing that overrides the file's value.
@@ -165,7 +166,7 @@ func TestLoadFromFile_UnknownKeyRejected(t *testing.T) {
 	RegisterFlags(fs, &cfg, func(string) (string, bool) { return "", false })
 
 	path := writeYAML(t, `bogus-key: "x"`)
-	err := LoadFromFile(path, fs)
+	_, err := LoadFromFile(path, fs)
 	if err == nil || !strings.Contains(err.Error(), "unknown config key") {
 		t.Fatalf("expected unknown-key error, got: %v", err)
 	}
@@ -178,7 +179,7 @@ func TestLoadFromFile_BadYAML(t *testing.T) {
 	RegisterFlags(fs, &cfg, func(string) (string, bool) { return "", false })
 
 	path := writeYAML(t, `cluster-domain: [not, a, scalar]`)
-	err := LoadFromFile(path, fs)
+	_, err := LoadFromFile(path, fs)
 	if err == nil || !strings.Contains(err.Error(), "scalar") {
 		t.Fatalf("expected composite-value error, got: %v", err)
 	}
@@ -190,8 +191,30 @@ func TestLoadFromFile_MissingFile(t *testing.T) {
 	cfg := Defaults()
 	RegisterFlags(fs, &cfg, func(string) (string, bool) { return "", false })
 
-	err := LoadFromFile("/no/such/file.yaml", fs)
+	_, err := LoadFromFile("/no/such/file.yaml", fs)
 	if err == nil {
 		t.Fatalf("expected error for missing file")
+	}
+}
+
+func TestLoadFromFile_ReportsChanges(t *testing.T) {
+	cfg := Defaults()
+	fs := flag.NewFlagSet("test", flag.ContinueOnError)
+	fs.SetOutput(&strings.Builder{})
+	RegisterFlags(fs, &cfg, func(string) (string, bool) { return "", false })
+
+	// cluster-domain differs from the default; proxy-timeout restates the
+	// default (180s == 3m0s), so only cluster-domain is reported.
+	path := writeYAML(t, `
+cluster-domain: "prod.local"
+proxy-timeout: "180s"
+`)
+	changes, err := LoadFromFile(path, fs)
+	if err != nil {
+		t.Fatalf("LoadFromFile: %v", err)
+	}
+	want := []ConfigChange{{Key: "cluster-domain", Old: "cluster.local", New: "prod.local"}}
+	if !reflect.DeepEqual(changes, want) {
+		t.Fatalf("changes = %v, want %v", changes, want)
 	}
 }
