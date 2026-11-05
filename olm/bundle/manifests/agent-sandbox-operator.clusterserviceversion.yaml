@@ -78,7 +78,16 @@ metadata:
     categories: AI/Machine Learning
     containerImage: registry.redhat.io/agent-sandbox/agent-sandbox-rhel9-operator@sha256:f68546b1b0d45cb643569dd8da8b1a64a7210006c8749f095ef36630e783a02d
     createdAt: "2026-11-02T12:30:38Z"
+    features.operators.openshift.io/disconnected: "true"
+    features.operators.openshift.io/fips-compliant: "false"
+    features.operators.openshift.io/proxy-aware: "false"
+    features.operators.openshift.io/tls-profiles: "true"
+    features.operators.openshift.io/token-auth-aws: "false"
+    features.operators.openshift.io/token-auth-azure: "false"
+    features.operators.openshift.io/token-auth-gcp: "false"
     operatorframework.io/suggested-namespace: agent-sandbox-system
+    operators.openshift.io/valid-subscription: '["OpenShift Container Platform", "OpenShift
+      Platform Plus"]'
     operators.operatorframework.io/builder: operator-sdk-v1.42.2
     operators.operatorframework.io/project_layout: go.kubebuilder.io/v4
     repository: https://github.com/kubernetes-sigs/agent-sandbox
