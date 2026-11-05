@@ -2,7 +2,7 @@
 # MUST be the repo root because the binary imports internal/ from the shared
 # Go module — dev/tools/push-images is patched to pass `--context .` for
 # this Dockerfile.
-FROM --platform=$BUILDPLATFORM registry.access.redhat.com/ubi9/go-toolset:1.26.7-1791479310 AS builder
+FROM --platform=$BUILDPLATFORM registry.access.redhat.com/ubi9/go-toolset:1.26.10-1793294290 AS builder
 
 LABEL name="agent-sandbox/agent-sandbox-router"
 LABEL com.redhat.component="agent-sandbox-router-container"
