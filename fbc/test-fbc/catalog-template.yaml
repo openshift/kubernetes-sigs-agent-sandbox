@@ -7,8 +7,8 @@ entries:
     name: agent-sandbox-operator
     schema: olm.package
   - entries:
-      - name: agent-sandbox-operator.v0.9.0
-        skipRange: <0.9.0
+      - name: agent-sandbox-operator.v1.0.9
+        skipRange: <1.0.9
     name: preview-0.9
     package: agent-sandbox-operator
     schema: olm.channel
