@@ -16,12 +16,14 @@ package main
 
 import (
 	"context"
+	"flag"
 	"fmt"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -29,6 +31,49 @@ import (
 
 	"sigs.k8s.io/agent-sandbox/sandbox-router/config"
 )
+
+// TestLoadOptionalConfig pins the optional-ConfigMap contract: a missing file
+// is tolerated (the router keeps running without it), while a present but
+// broken file still fails startup.
+func TestLoadOptionalConfig(t *testing.T) {
+	cfg := config.Defaults()
+	flagSet := flag.NewFlagSet("test", flag.ContinueOnError)
+	flagSet.SetOutput(&strings.Builder{})
+	config.RegisterFlags(flagSet, &cfg, func(string) (string, bool) { return "", false })
+
+	// Missing file: reported as missing, not an error.
+	_, missing, err := loadOptionalConfig("/no/such/file.yaml", flagSet)
+	if err != nil {
+		t.Fatalf("missing file should not error, got: %v", err)
+	}
+	if !missing {
+		t.Fatal("missing file should report missing=true")
+	}
+
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	write := func(content string) {
+		t.Helper()
+		if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+			t.Fatalf("write config: %v", err)
+		}
+	}
+
+	// Present file: applied and not reported missing.
+	write("cluster-domain: prod.local\n")
+	changes, missing, err := loadOptionalConfig(path, flagSet)
+	if err != nil || missing {
+		t.Fatalf("present file: missing=%v err=%v", missing, err)
+	}
+	if len(changes) != 1 || changes[0].Key != "cluster-domain" {
+		t.Fatalf("changes = %v, want one cluster-domain entry", changes)
+	}
+
+	// Present but invalid file: an error, never silently ignored.
+	write("bogus-key: x\n")
+	if _, _, err := loadOptionalConfig(path, flagSet); err == nil {
+		t.Fatal("invalid file should error")
+	}
+}
 
 // freeAddr returns a loopback address with a port nothing is listening on.
 func freeAddr(t *testing.T) string {

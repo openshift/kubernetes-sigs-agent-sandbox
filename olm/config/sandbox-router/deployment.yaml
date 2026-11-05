@@ -63,6 +63,7 @@ spec:
         image: registry.k8s.io/agent-sandbox/sandbox-router-go:latest
         imagePullPolicy: IfNotPresent
         args:
+        - --config=/etc/sandbox-router/config.yaml
         - --http-bind-address=
         # Uncomment to enable TLS:
         - --https-bind-address=:8443
@@ -99,6 +100,9 @@ spec:
         # client-go's in-cluster configuration reads this standard path.
         - name: kubernetes-api-access
           mountPath: /var/run/secrets/kubernetes.io/serviceaccount
+          readOnly: true
+        - name: router-config
+          mountPath: /etc/sandbox-router
           readOnly: true
         - name: tls-certs
           mountPath: /etc/tls
@@ -155,6 +159,10 @@ spec:
                   apiVersion: v1
                   fieldPath: metadata.namespace
                 path: namespace
+      - name: router-config
+        configMap:
+          name: sandbox-router-config
+          optional: true
       - name: tls-certs
         secret:
           secretName: sandbox-router-tls

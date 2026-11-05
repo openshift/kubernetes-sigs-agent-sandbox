@@ -25,6 +25,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io/fs"
 	"net/http"
 	"os"
 	"os/signal"
@@ -63,10 +64,11 @@ func main() {
 	// The file path is pulled from --config / SANDBOX_ROUTER_CONFIG without
 	// touching flag.Parse, so the rest of the args are still available below.
 	var fileChanges []config.ConfigChange
+	var configFileMissing bool
 	if path := config.FileFromArgsAndEnv(os.Args[1:], os.Getenv); path != "" {
 		cfg.ConfigFile = path
 		var err error
-		fileChanges, err = config.LoadFromFile(path, flag.CommandLine)
+		fileChanges, configFileMissing, err = loadOptionalConfig(path, flag.CommandLine)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "config: %v\n", err)
 			os.Exit(2)
@@ -94,9 +96,12 @@ func main() {
 	// listing only the settings it actually changed. Values it restates are
 	// not changes; CLI flags parsed above may still override what follows.
 	if cfg.ConfigFile != "" {
-		if len(fileChanges) == 0 {
+		switch {
+		case configFileMissing:
+			log.Info("config file not found; continuing without it", "path", cfg.ConfigFile)
+		case len(fileChanges) == 0:
 			log.Info("config file loaded; no settings changed", "path", cfg.ConfigFile)
-		} else {
+		default:
 			changes := make([]string, 0, len(fileChanges))
 			for _, ch := range fileChanges {
 				changes = append(changes, ch.String())
@@ -116,6 +121,20 @@ func main() {
 		log.Error(err, "exited with error")
 		os.Exit(1)
 	}
+}
+
+// loadOptionalConfig applies the config file at path when it exists. A missing
+// file is reported via missing=true instead of an error: deployments mount the
+// sandbox-router-config ConfigMap with optional: true, so the path is
+// legitimately absent until someone creates that ConfigMap. Every other
+// failure — an unreadable file, malformed YAML, an unknown key — is returned
+// as an error and aborts startup, so a broken ConfigMap still fails loud.
+func loadOptionalConfig(path string, flagSet *flag.FlagSet) (changes []config.ConfigChange, missing bool, err error) {
+	changes, err = config.LoadFromFile(path, flagSet)
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil, true, nil
+	}
+	return changes, false, err
 }
 
 // cacheSyncTimeout bounds the initial pod LIST. A slow API server should not
