@@ -30,6 +30,22 @@ do
     # Add the icon data.
     yq -i ".entries[0].icon.base64data = \"$(cat ../$ICON_BASE64)\"" "$TEMPLATE_NAME"
 
+    # test-fbc tracks the newest bundle image, and every release renames the
+    # CSV. The Konflux nudge only rewrites the image digest in this template,
+    # so derive the channel entry from the bundle itself. Otherwise `opm serve`
+    # rejects the catalog with "bundle ... not found in any channel entries"
+    # once the CSV name changes.
+    if [ "$OCP_VERSION" = "test-fbc" ]; then
+        BUNDLE_NAME=$(opm render "$BUILD_IMAGE" | yq -r 'select(.schema == "olm.bundle") | .name')
+        BUNDLE_VERSION=${BUNDLE_NAME##*.v}
+        if [ -z "$BUNDLE_NAME" ] || [ "$BUNDLE_VERSION" = "$BUNDLE_NAME" ]; then
+            echo "Unable to read the bundle name from $BUILD_IMAGE" >&2
+            exit 1
+        fi
+        yq -i "(.entries[] | select(.schema == \"olm.channel\") | .entries[0].name) = \"$BUNDLE_NAME\"" "$TEMPLATE_NAME"
+        yq -i "(.entries[] | select(.schema == \"olm.channel\") | .entries[0].skipRange) = \"<$BUNDLE_VERSION\"" "$TEMPLATE_NAME"
+    fi
+
     # enable migrate params for OCP 4.17 and onwards
     # skip the check for test-fbc, assuming it is always using the latest version
     MIGRATE_PARAM="--migrate-level bundle-object-to-csv-metadata"
