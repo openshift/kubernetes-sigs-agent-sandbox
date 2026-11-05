@@ -76,7 +76,7 @@ metadata:
       ]
     capabilities: Basic Install
     categories: AI/Machine Learning
-    containerImage: registry.redhat.io/agent-sandbox/agent-sandbox-rhel9-operator@sha256:be9aef828a860a4c006ffa7e538635eec81745645dfb4b5b51bfcfbc81afcb33
+    containerImage: registry.redhat.io/agent-sandbox/agent-sandbox-rhel9-operator@sha256:f900c9fcbc136c68707a12bbc249ac9425e4394a30a7a37dc566fc14ca45a878
     createdAt: "2026-11-02T12:30:38Z"
     features.operators.openshift.io/disconnected: "true"
     features.operators.openshift.io/fips-compliant: "false"
@@ -354,7 +354,7 @@ spec:
                 - --metrics-secure-serving
                 - --metrics-bind-address=:8443
                 - --metrics-cert-dir=/etc/metrics-certs
-                image: registry.redhat.io/agent-sandbox/agent-sandbox-rhel9-operator@sha256:be9aef828a860a4c006ffa7e538635eec81745645dfb4b5b51bfcfbc81afcb33
+                image: registry.redhat.io/agent-sandbox/agent-sandbox-rhel9-operator@sha256:f900c9fcbc136c68707a12bbc249ac9425e4394a30a7a37dc566fc14ca45a878
                 name: agent-sandbox-controller
                 ports:
                 - containerPort: 8443
