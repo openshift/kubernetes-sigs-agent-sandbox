@@ -147,12 +147,6 @@ spec:
     * **SandboxClaim:** Request Sandboxes from a SandboxWarmPool, abstracting away configuration details.
     * **SandboxWarmPool:** Manage a pool of pre-warmed Sandboxes for fast allocation.
 
-    ## Prerequisites
-
-    * A Kubernetes cluster (v1.26+)
-    * `kubectl` configured with cluster access
-    * Cluster-admin privileges (the operator installs cluster-scoped CRDs)
-
     ## Configuration
 
     Because the OLM ClusterServiceVersion owns the controller Deployment,
