@@ -16,7 +16,7 @@ LABEL vendor="Red Hat, Inc."
 LABEL url="https://access.redhat.com/"
 LABEL distribution-scope=public
 LABEL io.openshift.tags=""
-LABEL cpe="cpe:/a:redhat:confidential_compute_attestation:1.130::el9"
+LABEL cpe="cpe:/a:redhat:confidential_compute_attestation:1.140::el9"
 
 WORKDIR /app
 
