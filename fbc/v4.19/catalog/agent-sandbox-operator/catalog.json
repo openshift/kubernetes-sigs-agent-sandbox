@@ -13,16 +13,16 @@
     "package": "agent-sandbox-operator",
     "entries": [
         {
-            "name": "agent-sandbox-operator.v0.9.0",
-            "skipRange": "<0.9.0"
+            "name": "agent-sandbox-operator.v1.0.9",
+            "skipRange": "<1.0.9"
         }
     ]
 }
 {
     "schema": "olm.bundle",
-    "name": "agent-sandbox-operator.v0.9.0",
+    "name": "agent-sandbox-operator.v1.0.9",
     "package": "agent-sandbox-operator",
-    "image": "registry.redhat.io/agent-sandbox/agent-sandbox-operator-bundle@sha256:01f8fbf2cda6e5cbac5c53f9037a8142a1139000f947627404d4c95ee2a2fe2d",
+    "image": "registry.redhat.io/agent-sandbox/agent-sandbox-operator-bundle@sha256:47b7a7a29f511d6c5501f4dcff159dde8860b6e337bdfed78ab8069ab549a745",
     "properties": [
         {
             "type": "olm.gvk",
@@ -60,21 +60,22 @@
             "type": "olm.package",
             "value": {
                 "packageName": "agent-sandbox-operator",
-                "version": "0.9.0"
+                "version": "1.0.9"
             }
         },
         {
             "type": "olm.csv.metadata",
             "value": {
                 "annotations": {
-                    "alm-examples": "[]",
+                    "alm-examples": "[\n  {\n    \"apiVersion\": \"agents.x-k8s.io/v1beta1\",\n    \"kind\": \"Sandbox\",\n    \"metadata\": {\n      \"name\": \"hello-world\",\n      \"namespace\": \"default\"\n    },\n    \"spec\": {\n      \"podTemplate\": {\n        \"spec\": {\n          \"containers\": [\n            {\n              \"image\": \"busybox:1.37.0\",\n              \"name\": \"my-container\"\n            }\n          ],\n          \"restartPolicy\": \"Never\"\n        }\n      }\n    }\n  },\n  {\n    \"apiVersion\": \"extensions.agents.x-k8s.io/v1beta1\",\n    \"kind\": \"SandboxClaim\",\n    \"metadata\": {\n      \"name\": \"example-claim\",\n      \"namespace\": \"default\"\n    },\n    \"spec\": {\n      \"warmPoolRef\": {\n        \"name\": \"example-warmpool\"\n      }\n    }\n  },\n  {\n    \"apiVersion\": \"extensions.agents.x-k8s.io/v1beta1\",\n    \"kind\": \"SandboxTemplate\",\n    \"metadata\": {\n      \"name\": \"example-template\",\n      \"namespace\": \"default\"\n    },\n    \"spec\": {\n      \"podTemplate\": {\n        \"spec\": {\n          \"containers\": [\n            {\n              \"image\": \"busybox:1.37.0\",\n              \"name\": \"my-container\"\n            }\n          ],\n          \"restartPolicy\": \"Never\"\n        }\n      }\n    }\n  },\n  {\n    \"apiVersion\": \"extensions.agents.x-k8s.io/v1beta1\",\n    \"kind\": \"SandboxWarmPool\",\n    \"metadata\": {\n      \"name\": \"example-warmpool\",\n      \"namespace\": \"default\"\n    },\n    \"spec\": {\n      \"replicas\": 1,\n      \"sandboxTemplateRef\": {\n        \"name\": \"example-template\"\n      }\n    }\n  }\n]",
                     "capabilities": "Basic Install",
                     "categories": "AI/Machine Learning",
-                    "createdAt": "2026-06-18T14:34:08Z",
+                    "containerImage": "registry.redhat.io/agent-sandbox/agent-sandbox-rhel9-operator@sha256:c08c0d4d9a094adf1d7681798fda3ef96bd37b230fc2aae47ea3a24d9b06102e",
+                    "createdAt": "2026-11-02T12:30:38Z",
                     "features.operators.openshift.io/disconnected": "true",
                     "features.operators.openshift.io/fips-compliant": "false",
                     "features.operators.openshift.io/proxy-aware": "false",
-                    "features.operators.openshift.io/tls-profiles": "false",
+                    "features.operators.openshift.io/tls-profiles": "true",
                     "features.operators.openshift.io/token-auth-aws": "false",
                     "features.operators.openshift.io/token-auth-azure": "false",
                     "features.operators.openshift.io/token-auth-gcp": "false",
@@ -118,7 +119,7 @@
                         }
                     ]
                 },
-                "description": "Agent-sandbox enables easy management of isolated, stateful, singleton workloads, ideal for use cases like AI agent runtimes.",
+                "description": "## About\n\nAgent Sandbox provides a `Sandbox` Custom Resource Definition (CRD) and controller\nfor Kubernetes, developed under [SIG Apps](https://github.com/kubernetes/community/tree/master/sig-apps).\nIt offers a declarative, standardized API for managing isolated, stateful, singleton\nworkloads, ideal for use cases like AI agent runtimes.\n\nFor more information, visit the [project website](https://agent-sandbox.sigs.k8s.io/)\nand the [documentation](https://agent-sandbox.sigs.k8s.io/docs/).\n\n## Features and Capabilities\n\n**Core: Sandbox CRD**\n* **Stable Identity:** Each Sandbox has a stable hostname and network identity.\n* **Persistent Storage:** Sandboxes can be configured with persistent storage that survives restarts.\n* **Lifecycle Management:** The controller manages pod lifecycle, including creation, scheduled deletion, pausing and resuming.\n\n**Extensions:**\n* **SandboxTemplate:** Define reusable templates for creating Sandboxes.\n* **SandboxClaim:** Request Sandboxes from a SandboxWarmPool, abstracting away configuration details.\n* **SandboxWarmPool:** Manage a pool of pre-warmed Sandboxes for fast allocation.\n\n## Prerequisites\n\n* A Kubernetes cluster (v1.26+)\n* `kubectl` configured with cluster access\n* Cluster-admin privileges (the operator installs cluster-scoped CRDs)\n\n## Configuration\n\nBecause the OLM ClusterServiceVersion owns the controller Deployment,\nediting its args directly is impractical. Instead, create an\n`agent-sandbox-config` ConfigMap in the controller namespace to override\ntunable flags (concurrency, API QPS/burst, etc.) without\ntouching the CSV. See\n[docs/configuration.md](https://github.com/kubernetes-sigs/agent-sandbox/blob/main/docs/configuration.md)\nfor the full list of tunable keys and precedence rules.\n",
                 "displayName": "Red Hat build of Agent Sandbox",
                 "installModes": [
                     {
@@ -170,15 +171,15 @@
     "relatedImages": [
         {
             "name": "",
-            "image": "registry.redhat.io/agent-sandbox/agent-sandbox-operator-bundle@sha256:01f8fbf2cda6e5cbac5c53f9037a8142a1139000f947627404d4c95ee2a2fe2d"
+            "image": "registry.redhat.io/agent-sandbox/agent-sandbox-operator-bundle@sha256:47b7a7a29f511d6c5501f4dcff159dde8860b6e337bdfed78ab8069ab549a745"
         },
         {
             "name": "",
-            "image": "registry.redhat.io/agent-sandbox/agent-sandbox-rhel9-operator@sha256:554102df4c721bd27be7129c910c206ed1329be14df68906a588959b0e7d9309"
+            "image": "registry.redhat.io/agent-sandbox/agent-sandbox-rhel9-operator@sha256:c08c0d4d9a094adf1d7681798fda3ef96bd37b230fc2aae47ea3a24d9b06102e"
         },
         {
             "name": "",
-            "image": "registry.redhat.io/agent-sandbox/agent-sandbox-router@sha256:d7d745b9ad8143282a1356d13a9b351faf6aa1955ee6b02f100fc282dbbd91d3"
+            "image": "registry.redhat.io/agent-sandbox/agent-sandbox-router@sha256:a9e9a0982acc37630ec30de4370ec51db5b32a99fc0d90e9726f96e1665576c5"
         }
     ]
 }
