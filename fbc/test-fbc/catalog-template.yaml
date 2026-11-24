@@ -1,6 +1,6 @@
 ---
 entries:
-  - defaultChannel: preview-0.9
+  - defaultChannel: stable
     icon:
       base64data: ""
       mediatype: image/png
@@ -9,7 +9,7 @@ entries:
   - entries:
       - name: agent-sandbox-operator.v1.0.9
         skipRange: <1.0.9
-    name: preview-0.9
+    name: stable
     package: agent-sandbox-operator
     schema: olm.channel
   - image: registry.redhat.io/agent-sandbox/agent-sandbox-operator-bundle@sha256:47b7a7a29f511d6c5501f4dcff159dde8860b6e337bdfed78ab8069ab549a745
