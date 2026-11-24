@@ -1,6 +1,6 @@
 ---
 entries:
-  - defaultChannel: preview-0.9
+  - defaultChannel: stable
     icon:
       base64data: ""
       mediatype: image/png
@@ -12,6 +12,22 @@ entries:
     name: preview-0.9
     package: agent-sandbox-operator
     schema: olm.channel
+  - entries:
+      - name: agent-sandbox-operator.v1.0.9
+        skipRange: <1.0.9
+    name: stable
+    package: agent-sandbox-operator
+    schema: olm.channel
   - image: registry.redhat.io/agent-sandbox/agent-sandbox-operator-bundle@sha256:01f8fbf2cda6e5cbac5c53f9037a8142a1139000f947627404d4c95ee2a2fe2d
     schema: olm.bundle
+  - image: registry.redhat.io/agent-sandbox/agent-sandbox-operator-bundle@sha256:47b7a7a29f511d6c5501f4dcff159dde8860b6e337bdfed78ab8069ab549a745
+    schema: olm.bundle
+  - schema: olm.deprecations
+    package: agent-sandbox-operator
+    entries:
+      - reference:
+          schema: olm.channel
+          name: preview-0.9
+        message: |
+          The preview-0.9 channel is deprecated. Please use the 'stable' channel for the latest supported version.
 schema: olm.template.basic
