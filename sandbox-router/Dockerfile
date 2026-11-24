@@ -4,21 +4,6 @@
 # this Dockerfile.
 FROM --platform=$BUILDPLATFORM registry.access.redhat.com/ubi9/go-toolset:1.26.10-1793294290 AS builder
 
-LABEL name="agent-sandbox/agent-sandbox-router"
-LABEL com.redhat.component="agent-sandbox-router-container"
-LABEL io.k8s.display-name="Agent Sandbox router"
-LABEL io.k8s.description="Request router for agent sandbox workloads"
-LABEL description="Request router for agent sandbox workloads"
-LABEL summary="Request router for agent sandbox workloads"
-LABEL maintainer="Red Hat"
-LABEL version="1.0.9"
-LABEL release="1"
-LABEL vendor="Red Hat, Inc."
-LABEL url="https://access.redhat.com/"
-LABEL distribution-scope=public
-LABEL io.openshift.tags=""
-LABEL cpe="cpe:/a:redhat:confidential_compute_attestation:1.140::el9"
-
 # Declare TARGETARCH to make it available in this build stage.
 ARG TARGETARCH
 
@@ -52,6 +37,21 @@ RUN CGO_ENABLED=1 GOOS=linux GOARCH=${TARGETARCH} go build \
 
 # Final image: distroless static so we ship only the binary plus minimal runtime.
 FROM registry.redhat.io/ubi9/ubi-minimal-pqc:9.8-1790840388
+
+LABEL name="agent-sandbox/agent-sandbox-router"
+LABEL com.redhat.component="agent-sandbox-router-container"
+LABEL io.k8s.display-name="Agent Sandbox router"
+LABEL io.k8s.description="Request router for agent sandbox workloads"
+LABEL description="Request router for agent sandbox workloads"
+LABEL summary="Request router for agent sandbox workloads"
+LABEL maintainer="Red Hat"
+LABEL version="1.0.9"
+LABEL release="1"
+LABEL vendor="Red Hat, Inc."
+LABEL url="https://access.redhat.com/"
+LABEL distribution-scope=public
+LABEL io.openshift.tags=""
+LABEL cpe="cpe:/a:redhat:confidential_compute_attestation:1.140::el9"
 
 COPY --from=builder /tmp/sandbox-router /sandbox-router
 
