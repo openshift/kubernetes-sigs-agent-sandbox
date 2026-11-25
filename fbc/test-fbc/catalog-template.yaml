@@ -12,6 +12,6 @@ entries:
     name: stable
     package: agent-sandbox-operator
     schema: olm.channel
-  - image: registry.redhat.io/agent-sandbox/agent-sandbox-operator-bundle@sha256:830c7ec0f8bae9d81ba619c635f145352037fc7559c8f7b15b29f6367996228e
+  - image: registry.redhat.io/agent-sandbox/agent-sandbox-operator-bundle@sha256:75bb36e6b69a8f442fa4a8be2c84bfd7ec8ef6a659dfbf2eda432eaaca2b2037
     schema: olm.bundle
 schema: olm.template.basic
